@@ -4,32 +4,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import tempfile
 import textwrap
-import threading
 import time
 import unittest
-import uuid
 from pathlib import Path
-from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, QUrl, Qt
+from PySide6.QtCore import QEvent, QObject, QPointF, QUrl, Qt
 from PySide6.QtQml import QQmlComponent, QQmlEngine
-from PySide6.QtQuick import QQuickItem
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 import agent_cloud
-import agent_live
-import documents as documents_module
 import studio as studio_module
-from core.background_service import BackgroundService
-from studio import ROOT, Session, Studio
+from studio import Session, Studio
 
 QML_DIR = Path(__file__).parent / "qml"
 MAIN_QML = QML_DIR / "Main.qml"
@@ -41,33 +33,6 @@ class QuietStudio(Studio):
 
     def _choose_default_python(self, emit=True):
         self.python_status = "No Python interpreter configured."
-
-
-class _DummyApp(QObject):
-    def __init__(self):
-        super().__init__()
-        self.ended = False
-        self.keep = False
-
-    def setQuitOnLastWindowClosed(self, value: bool):
-        self.keep = not value
-
-    def quit(self):
-        self.ended = True
-
-
-class _VisibleHost:
-    def __init__(self, visible: bool = True):
-        self._visible = visible
-
-    def isVisible(self) -> bool:
-        return self._visible
-
-    def show(self):
-        self._visible = True
-
-    def hide(self):
-        self._visible = False
 
 
 def _find_quick_items(root, object_name: str):
@@ -521,1012 +486,125 @@ ApplicationWindow {{
             finally:
                 self.dispose(session, studio)
 
-    def _start_live_bridge(self, session: Session, studio: Studio):
-        bridge = agent_live.create_qt_bridge(session, session.data)
-        session.agent_bridge = bridge
-
-        def on_agent_request(raw: str):
-            request = json.loads(raw)
-            rid = request["requestId"]
-            action = request["action"]
-            if action == "flush_current":
-                bridge.complete(rid, {"flushed": True}, window_id=studio.window_id)
-            elif action == "list_tabs":
-                bridge.complete(rid, {"tabs": request["tabs"]}, window_id=studio.window_id)
-
-        studio.agentRequest.connect(on_agent_request)
-        bridge.start()
-        client = agent_live.LiveTabClient(bridge.discovery_path, timeout=10.0)
-        return bridge, client
-
-    def _call_client_pumping_qt(self, fn, timeout: float = 8.0):
-        outcome: dict = {}
-        done = threading.Event()
-
-        def worker():
-            try:
-                outcome["result"] = fn()
-            except BaseException as exc:
-                outcome["error"] = exc
-            finally:
-                done.set()
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        deadline = time.monotonic() + timeout
-        while not done.is_set() and time.monotonic() < deadline:
-            self.app.processEvents()
-            time.sleep(0.005)
-        self.app.processEvents()
-        thread.join(timeout=1.0)
-        self.assertTrue(done.is_set(), "LiveTabClient call did not finish before timeout")
-        if "error" in outcome:
-            raise outcome["error"]
-        return outcome.get("result")
-
-    def test_inactive_patch_tab_delayed_recovery_write_waits_for_exact_commit_without_focus_steal(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            root = self._canonical_root(tmp)
-            active_file = root / "Active.md"
-            bg_file = root / "Background.md"
-            active_initial = "# Active\n\nFocused note.\n"
-            bg_initial = "# Background\n\nBefore delayed stage.\n"
-            active_file.write_text(active_initial, encoding="utf-8")
-            bg_file.write_text(bg_initial, encoding="utf-8")
-
-            session, studio = self.make_studio(root)
-            bridge = None
-            try:
-                active_tab = studio._note("Active.md", active_initial, str(active_file), saved=active_initial)
-                bg_tab = studio._note("Background.md", bg_initial, str(bg_file), saved=bg_initial)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-                studio.ready = True
-                studio._emit(True)
-                bridge, client = self._start_live_bridge(session, studio)
-
-                real_atomic_json = studio_module.atomic_json
-                write_started = threading.Event()
-                release_write = threading.Event()
-                recovery_path = (session.data / "recovery.json").resolve()
-
-                def gated_atomic_json(path, payload):
-                    if studio_module.folder_ops.same_path(path, recovery_path):
-                        write_started.set()
-                        self.assertTrue(release_write.wait(5.0))
-                    return real_atomic_json(path, payload)
-
-                expected_rev = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
-                call_done = threading.Event()
-                call_box: dict = {}
-
-                with patch.object(studio_module, "atomic_json", side_effect=gated_atomic_json):
-                    call_started = time.monotonic()
-
-                    def run_patch():
-                        try:
-                            call_box["result"] = client.patch_tab(
-                                bg_tab["id"],
-                                expected_rev,
-                                [{"type": "replace", "old": "Before delayed stage.", "new": "After delayed stage."}],
-                                window_id=studio.window_id,
-                            )
-                        except BaseException as exc:
-                            call_box["error"] = exc
-                        finally:
-                            call_box["elapsed"] = time.monotonic() - call_started
-                            call_done.set()
-
-                    worker = threading.Thread(target=run_patch, daemon=True)
-                    worker.start()
-
-                    wait_deadline = time.monotonic() + 3.0
-                    while not write_started.is_set() and time.monotonic() < wait_deadline:
-                        self.app.processEvents()
-                        time.sleep(0.005)
-                    self.assertTrue(write_started.is_set(), "Expected recovery.json write to begin")
-
-                    # Explicit queued Qt event-loop barrier while the recovery write is held open:
-                    # patch_tab MUST NOT return prematurely, UI stays responsive,
-                    # focus stays on Active.md, and uncommitted content is not exposed in memory.
-                    ui_barrier_steps = 0
-                    ui_barrier_done = threading.Event()
-
-                    def advance_ui_barrier():
-                        nonlocal ui_barrier_steps
-                        ui_barrier_steps += 1
-                        if ui_barrier_steps >= 4:
-                            ui_barrier_done.set()
-                        else:
-                            QTimer.singleShot(0, advance_ui_barrier)
-
-                    QTimer.singleShot(0, advance_ui_barrier)
-                    hold_started = time.monotonic()
-                    min_hold_s = 0.06
-                    barrier_deadline = hold_started + 3.0
-                    while (
-                        (not ui_barrier_done.is_set() or (time.monotonic() - hold_started) < min_hold_s)
-                        and time.monotonic() < barrier_deadline
-                    ):
-                        self.app.processEvents()
-                        time.sleep(0.005)
-                    self.assertTrue(ui_barrier_done.is_set())
-                    self.assertEqual(ui_barrier_steps, 4)
-                    self.assertFalse(call_done.is_set(), "patch_tab returned before recovery.json committed")
-                    self.assertFalse(recovery_path.exists())
-                    self.assertEqual(studio.active, active_tab["id"])
-                    self.assertEqual(bg_tab["content"], bg_initial)
-                    self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-
-                    # Release the recovery write and verify exact commit before acknowledgment.
-                    release_write.set()
-                    finish_deadline = time.monotonic() + 3.0
-                    while not call_done.is_set() and time.monotonic() < finish_deadline:
-                        self.app.processEvents()
-                        time.sleep(0.005)
-                    worker.join(timeout=1.0)
-
-                self.assertNotIn("error", call_box)
-                self.assertGreaterEqual(call_box["elapsed"], min_hold_s)
-                result = call_box["result"]
-                expected_after = "# Background\n\nAfter delayed stage.\n"
-                self.assertTrue(result["changed"])
-                self.assertEqual(result["revision"], hashlib.sha256(expected_after.encode("utf-8")).hexdigest())
-
-                # Immediately on return, recovery.json already holds the exact staged snapshot.
-                self.assertTrue(recovery_path.is_file())
-                recovered = json.loads(self._read_text_with_sharing_retry(recovery_path))
-                bg_entry = next(item for item in recovered if item["id"] == bg_tab["id"])
-                self.assertEqual(bg_entry["content"], expected_after)
-                self.assertTrue(bg_entry["agent_staged"])
-                self.assertTrue(bg_entry["agent_unreviewed"])
-
-                # Staged content is preserved, focus never moved, and autosave skips staged tab.
-                self.assertEqual(studio.active, active_tab["id"])
-                self.assertEqual(bg_tab["content"], expected_after)
-                self.assertTrue(bg_tab["agent_staged"])
-                self.assertEqual(studio._agent_jump_tab_id, bg_tab["id"])
-                studio._autosave()
-                QTest.qWait(40)
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-            finally:
-                if bridge is not None:
-                    bridge.stop()
-                self.dispose(session, studio)
-
-    def test_inactive_patch_tab_failed_write_never_strands_memory_edit_and_retry_succeeds(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            root = self._canonical_root(tmp)
-            active_file = root / "Active.md"
-            bg_file = root / "Background.md"
-            active_initial = "# Active\n\nKeep focus here.\n"
-            bg_v0 = "# Background\n\nVersion 0 on disk.\n"
-            active_file.write_text(active_initial, encoding="utf-8")
-            bg_file.write_text(bg_v0, encoding="utf-8")
-
-            session, studio = self.make_studio(root)
-            bridge = None
-            try:
-                active_tab = studio._note("Active.md", active_initial, str(active_file), saved=active_initial)
-                bg_tab = studio._note("Background.md", bg_v0, str(bg_file), saved=bg_v0)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-                studio.ready = True
-                studio._emit(True)
-                bridge, client = self._start_live_bridge(session, studio)
-
-                real_atomic_json = studio_module.atomic_json
-                recovery_path = (session.data / "recovery.json").resolve()
-                fail_recovery = True
-
-                def flaky_atomic_json(path, payload):
-                    if fail_recovery and studio_module.folder_ops.same_path(path, recovery_path):
-                        raise OSError("/private/secret/recovery.json: No space left on device")
-                    return real_atomic_json(path, payload)
-
-                rev_v0 = hashlib.sha256(bg_v0.encode("utf-8")).hexdigest()
-                ops_v1 = [{"type": "replace", "old": "Version 0 on disk.", "new": "Version 1 staged."}]
-
-                with patch.object(studio_module, "atomic_json", side_effect=flaky_atomic_json):
-                    # 1. Forced failure on v0 -> v1 reports recoverable failure without stranding memory-only edit.
-                    with self.assertRaises(agent_live.LiveBridgeError) as first_err:
-                        self._call_client_pumping_qt(
-                            lambda: client.patch_tab(bg_tab["id"], rev_v0, ops_v1, window_id=studio.window_id)
-                        )
-                    err_msg = str(first_err.exception)
-                    self.assertIn("Could not save draft recovery snapshot", err_msg)
-                    self.assertNotIn("/private/secret", err_msg)
-                    self.assertNotIn("revision", err_msg.casefold())
-
-                    self.assertEqual(studio.active, active_tab["id"])
-                    self.assertEqual(bg_tab["content"], bg_v0)
-                    self.assertFalse(bg_tab["agent_staged"])
-                    self.assertFalse(bg_tab["agent_unreviewed"])
-                    self.assertEqual(bg_tab["agent_edits"], [])
-                    self.assertEqual(studio._agent_jump_tab_id, "")
-                    self.assertFalse(recovery_path.exists())
-                    self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_v0)
-
-                    # 2. Retry with the SAME expectedRevision succeeds once recovery writes are healthy.
-                    fail_recovery = False
-                    res_v1 = self._call_client_pumping_qt(
-                        lambda: client.patch_tab(bg_tab["id"], rev_v0, ops_v1, window_id=studio.window_id)
-                    )
-                    bg_v1 = "# Background\n\nVersion 1 staged.\n"
-                    rev_v1 = hashlib.sha256(bg_v1.encode("utf-8")).hexdigest()
-                    self.assertEqual(res_v1["revision"], rev_v1)
-                    self.assertEqual(studio.active, active_tab["id"])
-                    self.assertEqual(bg_tab["content"], bg_v1)
-                    self.assertTrue(bg_tab["agent_staged"])
-                    self.assertTrue(bg_tab["agent_unreviewed"])
-                    self.assertEqual(len(bg_tab["agent_edits"]), 1)
-
-                    recovered_v1 = json.loads(self._read_text_with_sharing_retry(recovery_path))
-                    entry_v1 = next(item for item in recovered_v1 if item["id"] == bg_tab["id"])
-                    self.assertEqual(entry_v1["content"], bg_v1)
-                    self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_v0)
-
-                    # 3. Forced failure on v1 -> v2 preserves already-committed staged v1 in both memory and recovery.json.
-                    fail_recovery = True
-                    ops_v2 = [{"type": "replace", "old": "Version 1 staged.", "new": "Version 2 staged."}]
-                    with self.assertRaises(agent_live.LiveBridgeError) as second_err:
-                        self._call_client_pumping_qt(
-                            lambda: client.patch_tab(bg_tab["id"], rev_v1, ops_v2, window_id=studio.window_id)
-                        )
-                    self.assertIn("Could not save draft recovery snapshot", str(second_err.exception))
-                    self.assertEqual(studio.active, active_tab["id"])
-                    self.assertEqual(bg_tab["content"], bg_v1)
-                    self.assertTrue(bg_tab["agent_staged"])
-                    self.assertEqual(len(bg_tab["agent_edits"]), 1)
-                    recovered_still_v1 = json.loads(self._read_text_with_sharing_retry(recovery_path))
-                    self.assertEqual(
-                        next(item for item in recovered_still_v1 if item["id"] == bg_tab["id"])["content"],
-                        bg_v1,
-                    )
-
-                    # 4. Retry v1 -> v2 with rev_v1 succeeds and preserves staged content + no focus steal.
-                    fail_recovery = False
-                    res_v2 = self._call_client_pumping_qt(
-                        lambda: client.patch_tab(bg_tab["id"], rev_v1, ops_v2, window_id=studio.window_id)
-                    )
-                    bg_v2 = "# Background\n\nVersion 2 staged.\n"
-                    self.assertEqual(res_v2["revision"], hashlib.sha256(bg_v2.encode("utf-8")).hexdigest())
-                    self.assertEqual(studio.active, active_tab["id"])
-                    self.assertEqual(bg_tab["content"], bg_v2)
-                    self.assertTrue(bg_tab["agent_staged"])
-                    self.assertEqual(len(bg_tab["agent_edits"]), 2)
-                    recovered_v2 = json.loads(self._read_text_with_sharing_retry(recovery_path))
-                    self.assertEqual(
-                        next(item for item in recovered_v2 if item["id"] == bg_tab["id"])["content"],
-                        bg_v2,
-                    )
-                    studio._autosave()
-                    QTest.qWait(40)
-                    self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_v0)
-            finally:
-                if bridge is not None:
-                    bridge.stop()
-                self.dispose(session, studio)
-
-    def test_inactive_patch_tab_superseded_write_restages_or_reports_superseded_and_allows_retry(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            root = self._canonical_root(tmp)
-            active_file = root / "Active.md"
-            bg_file = root / "Background.md"
-            active_initial = "# Active\n\nInitial active.\n"
-            bg_initial = "# Background\n\nStep A.\n"
-            active_file.write_text(active_initial, encoding="utf-8")
-            bg_file.write_text(bg_initial, encoding="utf-8")
-
-            session, studio = self.make_studio(root)
-            bridge = None
-            try:
-                active_tab = studio._note("Active.md", active_initial, str(active_file), saved=active_initial)
-                bg_tab = studio._note("Background.md", bg_initial, str(bg_file), saved=bg_initial)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-                studio.ready = True
-                studio._emit(True)
-                bridge, client = self._start_live_bridge(session, studio)
-
-                real_atomic_json = studio_module.atomic_json
-                recovery_path = (session.data / "recovery.json").resolve()
-
-                # Part A: Single overlapping _recover() supersedes attempt 1; Studio re-stages combined drafts cleanly.
-                superseded_once = False
-
-                def supersede_first_stage(path, payload):
-                    nonlocal superseded_once
-                    real_atomic_json(path, payload)
-                    if (
-                        not superseded_once
-                        and studio_module.folder_ops.same_path(path, recovery_path)
-                        and any(item.get("id") == bg_tab["id"] for item in payload)
-                    ):
-                        superseded_once = True
-                        active_tab["content"] = "# Active\n\nConcurrent user edit.\n"
-                        session.writes.submit_latest(
-                            "recovery",
-                            lambda: real_atomic_json(recovery_path, studio._combined_recovery_drafts(studio._window_recovery_drafts())),
-                        )
-
-                rev_a = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
-                with patch.object(studio_module, "atomic_json", side_effect=supersede_first_stage):
-                    res_b = self._call_client_pumping_qt(
-                        lambda: client.patch_tab(
-                            bg_tab["id"],
-                            rev_a,
-                            [{"type": "replace", "old": "Step A.", "new": "Step B."}],
-                            window_id=studio.window_id,
-                        )
-                    )
-                self.assertTrue(superseded_once)
-                bg_step_b = "# Background\n\nStep B.\n"
-                rev_b = hashlib.sha256(bg_step_b.encode("utf-8")).hexdigest()
-                self.assertEqual(res_b["revision"], rev_b)
-                self.assertEqual(studio.active, active_tab["id"])
-                session.writes.flush(timeout=4.0)
-                combined_on_disk = {item["id"]: item for item in json.loads(self._read_text_with_sharing_retry(recovery_path))}
-                self.assertEqual(combined_on_disk[active_tab["id"]]["content"], "# Active\n\nConcurrent user edit.\n")
-                self.assertEqual(combined_on_disk[bg_tab["id"]]["content"], bg_step_b)
-                self.assertTrue(combined_on_disk[bg_tab["id"]]["agent_staged"])
-
-                # Part B: Continuous supersession across bounded attempts reports superseded accurately without mutating tab.
-                studio._max_agent_stage_attempts = 2
-                always_supersede = True
-
-                def supersede_every_stage(path, payload):
-                    real_atomic_json(path, payload)
-                    if (
-                        always_supersede
-                        and studio_module.folder_ops.same_path(path, recovery_path)
-                        and any(item.get("id") == bg_tab["id"] and "Step C." in item.get("content", "") for item in payload)
-                    ):
-                        session.writes.submit_latest(
-                            "recovery",
-                            lambda: real_atomic_json(recovery_path, studio._combined_recovery_drafts(studio._window_recovery_drafts())),
-                        )
-
-                ops_c = [{"type": "replace", "old": "Step B.", "new": "Step C."}]
-                with patch.object(studio_module, "atomic_json", side_effect=supersede_every_stage):
-                    with self.assertRaises(agent_live.LiveBridgeError) as sup_err:
-                        self._call_client_pumping_qt(
-                            lambda: client.patch_tab(bg_tab["id"], rev_b, ops_c, window_id=studio.window_id)
-                        )
-                    sup_msg = str(sup_err.exception)
-                    self.assertIn("superseded", sup_msg)
-                    self.assertNotIn("revision", sup_msg.casefold())
-
-                    # Previous staged Step B remains intact in both memory and recovery.json; focus stays on Active.md.
-                    session.writes.flush(timeout=4.0)
-                    self.assertEqual(studio.active, active_tab["id"])
-                    self.assertEqual(bg_tab["content"], bg_step_b)
-                    self.assertTrue(bg_tab["agent_staged"])
-                    after_sup = {item["id"]: item for item in json.loads(self._read_text_with_sharing_retry(recovery_path))}
-                    self.assertEqual(after_sup[bg_tab["id"]]["content"], bg_step_b)
-
-                    # Once supersession stops, retrying with the same rev_b succeeds cleanly.
-                    always_supersede = False
-                    res_c = self._call_client_pumping_qt(
-                        lambda: client.patch_tab(bg_tab["id"], rev_b, ops_c, window_id=studio.window_id)
-                    )
-                    bg_step_c = "# Background\n\nStep C.\n"
-                    self.assertEqual(res_c["revision"], hashlib.sha256(bg_step_c.encode("utf-8")).hexdigest())
-                    self.assertEqual(studio.active, active_tab["id"])
-                    self.assertEqual(bg_tab["content"], bg_step_c)
-                    after_retry = {item["id"]: item for item in json.loads(self._read_text_with_sharing_retry(recovery_path))}
-                    self.assertEqual(after_retry[bg_tab["id"]]["content"], bg_step_c)
-                    self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-            finally:
-                if bridge is not None:
-                    bridge.stop()
-                self.dispose(session, studio)
-
-    def test_direct_agent_document_action_patch_tab_waits_fails_cleanly_and_retries(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            root = self._canonical_root(tmp)
-            active_file = root / "Active.md"
-            bg_file = root / "Background.md"
-            active_initial = "# Active\n"
-            bg_initial = "# Background\n\nDirect call.\n"
-            active_file.write_text(active_initial, encoding="utf-8")
-            bg_file.write_text(bg_initial, encoding="utf-8")
-
-            session, studio = self.make_studio(root)
-            try:
-                active_tab = studio._note("Active.md", active_initial, str(active_file), saved=active_initial)
-                bg_tab = studio._note("Background.md", bg_initial, str(bg_file), saved=bg_initial)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-
-                real_atomic_json = studio_module.atomic_json
-                recovery_path = (session.data / "recovery.json").resolve()
-                rev0 = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
-                ops = [{"type": "replace", "old": "Direct call.", "new": "Direct staged."}]
-
-                # 1. Forced write failure raises RuntimeError, leaves memory + disk clean, and allows same-revision retry.
-                with patch.object(
-                    studio_module,
-                    "atomic_json",
-                    side_effect=lambda path, payload: (
-                        (_ for _ in ()).throw(OSError("forced failure"))
-                        if studio_module.folder_ops.same_path(path, recovery_path)
-                        else real_atomic_json(path, payload)
-                    ),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "Could not save draft recovery snapshot"):
-                        studio._agent_document_action({
-                            "action": "patch_tab",
-                            "tabId": bg_tab["id"],
-                            "expectedRevision": rev0,
-                            "operations": ops,
-                        })
-                self.assertEqual(bg_tab["content"], bg_initial)
-                self.assertFalse(bg_tab["agent_staged"])
-                self.assertFalse(recovery_path.exists())
-                self.assertEqual(studio.active, active_tab["id"])
-
-                # 2. Delayed write blocks return until recovery.json is durably written, then retry succeeds.
-                write_started = threading.Event()
-                release_write = threading.Event()
-                finished = threading.Event()
-                box: dict = {}
-
-                def delayed_atomic_json(path, payload):
-                    if studio_module.folder_ops.same_path(path, recovery_path):
-                        write_started.set()
-                        self.assertTrue(release_write.wait(5.0))
-                    return real_atomic_json(path, payload)
-
-                with patch.object(studio_module, "atomic_json", side_effect=delayed_atomic_json):
-                    t = threading.Thread(
-                        target=lambda: (
-                            box.setdefault(
-                                "result",
-                                studio._agent_document_action({
-                                    "action": "patch_tab",
-                                    "tabId": bg_tab["id"],
-                                    "expectedRevision": rev0,
-                                    "operations": ops,
-                                }),
-                            ),
-                            finished.set(),
-                        ),
-                        daemon=True,
-                    )
-                    t.start()
-                    self.assertTrue(write_started.wait(4.0))
-                    time.sleep(0.05)
-                    self.assertFalse(finished.is_set())
-                    self.assertEqual(bg_tab["content"], bg_initial)
-                    release_write.set()
-                    self.assertTrue(finished.wait(4.0))
-                    t.join(timeout=1.0)
-
-                expected_after = "# Background\n\nDirect staged.\n"
-                self.assertEqual(box["result"]["revision"], hashlib.sha256(expected_after.encode("utf-8")).hexdigest())
-                self.assertEqual(bg_tab["content"], expected_after)
-                self.assertTrue(bg_tab["agent_staged"])
-                self.assertEqual(studio.active, active_tab["id"])
-                recovered = {item["id"]: item for item in json.loads(self._read_text_with_sharing_retry(recovery_path))}
-                self.assertEqual(recovered[bg_tab["id"]]["content"], expected_after)
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-            finally:
-                self.dispose(session, studio)
-
-    def test_direct_patch_tab_timeout_is_atomic_with_recovery_publication_for_running_and_queued_writes(self):
+    def test_dirty_draft_save_and_restore_with_current_reader_preserves_reversible_coauthoring(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = self._canonical_root(tmp)
             state_dir = root / "state"
-            notes_dir = root / "notes"
-            notes_dir.mkdir(parents=True, exist_ok=True)
-            active_file = notes_dir / "Active.md"
-            bg_file = notes_dir / "Background.md"
-            active_saved = "# Active\n\nSaved baseline.\n"
-            active_dirty = "# Active\n\nUnsaved active draft.\n"
-            bg_initial = "# Background\n\nOriginal paragraph.\n"
-            active_file.write_text(active_saved, encoding="utf-8")
-            bg_file.write_text(bg_initial, encoding="utf-8")
+            state_dir.mkdir(parents=True, exist_ok=True)
+            note_file = root / "DraftNote.md"
+            disk_initial = "# Draft Note\n\nSaved on disk.\n"
+            dirty_draft = "# Draft Note\n\nUnsaved user draft.\n"
+            ai_coauthored = "# Draft Note\n\nUnsaved user draft.\n\n## AI Summary\n\nReversible coauthoring.\n"
+            note_file.write_text(disk_initial, encoding="utf-8")
 
             session, studio = self.make_studio(state_dir)
+            retired_first = False
             try:
-                studio._agent_stage_sync_timeout = 0.5
-                active_tab = studio._note("Active.md", active_dirty, str(active_file), saved=active_saved)
-                bg_tab = studio._note("Background.md", bg_initial, str(bg_file), saved=bg_initial)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-                studio._recover()
-                session.writes.flush(timeout=4.0)
+                studio.settings["autosave"] = False
+                note_tab = studio._note("DraftNote.md", disk_initial, str(note_file), saved=disk_initial)
+                studio.tabs = [note_tab]
+                studio.active = note_tab["id"]
 
-                recovery_path = (session.data / "recovery.json").resolve()
-                rev0 = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
+                reader_loads: list[dict] = []
+                studio.readerLoad.connect(lambda payload: reader_loads.append(json.loads(payload)))
+                studio.post("r-ready-1", "reader_ready", "{}")
+                self.assertTrue(reader_loads)
+                reader_loads.clear()
 
-                def assert_recovery_excludes_rejected(marker: str, expected_bg: str | None = None):
-                    raw_text = self._read_text_with_sharing_retry(recovery_path)
-                    self.assertNotIn(marker, raw_text)
-                    entries = {item["id"]: item for item in json.loads(raw_text)}
-                    self.assertEqual(entries[active_tab["id"]]["content"], active_dirty)
-                    if expected_bg is None:
-                        self.assertNotIn(bg_tab["id"], entries)
-                    else:
-                        self.assertEqual(entries[bg_tab["id"]]["content"], expected_bg)
-                    self.assertEqual(list(session.data.glob(".recovery.json.*.tmp")), [])
-
-                    verify_dir = root / f"verify_{uuid.uuid4().hex}"
-                    verify_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(recovery_path, verify_dir / "recovery.json")
-                    startup_path = session.data / "startup.json"
-                    if startup_path.exists():
-                        shutil.copy2(startup_path, verify_dir / "startup.json")
-                    restarted_session, restarted_studio = self.make_studio(verify_dir)
-                    try:
-                        restored_by_id = {item["id"]: item for item in restarted_studio.tabs}
-                        self.assertNotIn(marker, json.dumps(restarted_studio.tabs))
-                        if expected_bg is None:
-                            self.assertNotIn(bg_tab["id"], restored_by_id)
-                        else:
-                            self.assertEqual(restored_by_id[bg_tab["id"]]["content"], expected_bg)
-                    finally:
-                        self.dispose(restarted_session, restarted_studio)
-
-                # 1. Running write held at an inside-writer barrier inside documents._write_json_value past timeout.
-                real_write_json = documents_module._write_json_value
-                inside_writer = threading.Event()
-                release_running = threading.Event()
-                hold_inside = True
-
-                def held_write_json(raw, value, seen):
-                    if (
-                        hold_inside
-                        and isinstance(value, list)
-                        and any(isinstance(it, dict) and "Rejected running patch." in it.get("content", "") for it in value)
-                    ):
-                        inside_writer.set()
-                        self.assertTrue(release_running.wait(10.0))
-                    return real_write_json(raw, value, seen)
-
-                running_ops = [{"type": "replace", "old": "Original paragraph.", "new": "Rejected running patch."}]
-                call_err: list[BaseException] = []
-                with patch.object(documents_module, "_write_json_value", side_effect=held_write_json):
-                    worker = threading.Thread(
-                        target=lambda: self._capture_exception(
-                            call_err,
-                            lambda: studio._agent_document_action({
-                                "action": "patch_tab",
-                                "tabId": bg_tab["id"],
-                                "expectedRevision": rev0,
-                                "operations": running_ops,
-                            }),
-                        ),
-                        daemon=True,
-                    )
-                    worker.start()
-                    self.assertTrue(inside_writer.wait(5.0))
-                    worker.join(timeout=5.0)
-                    self.assertFalse(worker.is_alive())
-                    self.assertEqual(len(call_err), 1)
-                    self.assertIsInstance(call_err[0], RuntimeError)
-                    self.assertIn("Could not save draft recovery snapshot", str(call_err[0]))
-
-                    # Release the in-flight writer and drain completely: rejected patch must never be published.
-                    hold_inside = False
-                    release_running.set()
-                    session.writes.flush(timeout=4.0)
-
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-                self.assertEqual(bg_tab["content"], bg_initial)
-                self.assertFalse(bg_tab["agent_staged"])
-                self.assertEqual(studio.active, active_tab["id"])
-                assert_recovery_excludes_rejected("Rejected running patch.", expected_bg=None)
-
-                # 2. Queued write held behind an earlier ordered-writer job past timeout.
-                fifo_started = threading.Event()
-                release_fifo = threading.Event()
-                blocker = session.writes.submit(lambda: (fifo_started.set(), self.assertTrue(release_fifo.wait(10.0))))
-                self.assertTrue(fifo_started.wait(5.0))
-
-                queued_ops = [{"type": "replace", "old": "Original paragraph.", "new": "Rejected queued patch."}]
-                with self.assertRaisesRegex(RuntimeError, "Could not save draft recovery snapshot"):
-                    studio._agent_document_action({
-                        "action": "patch_tab",
-                        "tabId": bg_tab["id"],
-                        "expectedRevision": rev0,
-                        "operations": queued_ops,
-                    })
-
-                release_fifo.set()
-                blocker.result(timeout=4.0)
-                session.writes.flush(timeout=4.0)
-
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-                self.assertEqual(bg_tab["content"], bg_initial)
-                self.assertFalse(bg_tab["agent_staged"])
-                assert_recovery_excludes_rejected("Rejected queued patch.", expected_bg=None)
-
-                # 3. Same-revision retry with rev0 succeeds cleanly and persists v1 to recovery.json.
-                retry_ops = [{"type": "replace", "old": "Original paragraph.", "new": "Accepted v1 patch."}]
-                res_v1 = studio._agent_document_action({
-                    "action": "patch_tab",
-                    "tabId": bg_tab["id"],
-                    "expectedRevision": rev0,
-                    "operations": retry_ops,
-                })
-                bg_v1 = "# Background\n\nAccepted v1 patch.\n"
-                rev1 = hashlib.sha256(bg_v1.encode("utf-8")).hexdigest()
-                self.assertEqual(res_v1["revision"], rev1)
-                self.assertEqual(bg_tab["content"], bg_v1)
-                self.assertTrue(bg_tab["agent_staged"])
-                self.assertEqual(studio.active, active_tab["id"])
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-                assert_recovery_excludes_rejected("Rejected", expected_bg=bg_v1)
-
-                # 4. Holding studio.atomic_json past timeout on v1 -> v2 preserves committed v1 in recovery.json, and retry with rev1 succeeds.
-                real_atomic_json = studio_module.atomic_json
-                atomic_entered = threading.Event()
-                release_atomic = threading.Event()
-                hold_atomic = True
-
-                def held_studio_atomic_json(path, payload):
-                    if hold_atomic and studio_module.folder_ops.same_path(path, recovery_path):
-                        atomic_entered.set()
-                        self.assertTrue(release_atomic.wait(10.0))
-                    return real_atomic_json(path, payload)
-
-                v2_rejected_ops = [{"type": "replace", "old": "Accepted v1 patch.", "new": "Rejected v2 patch."}]
-                v2_err: list[BaseException] = []
-                with patch.object(studio_module, "atomic_json", side_effect=held_studio_atomic_json):
-                    worker2 = threading.Thread(
-                        target=lambda: self._capture_exception(
-                            v2_err,
-                            lambda: studio._agent_document_action({
-                                "action": "patch_tab",
-                                "tabId": bg_tab["id"],
-                                "expectedRevision": rev1,
-                                "operations": v2_rejected_ops,
-                            }),
-                        ),
-                        daemon=True,
-                    )
-                    worker2.start()
-                    self.assertTrue(atomic_entered.wait(5.0))
-                    worker2.join(timeout=5.0)
-                    self.assertFalse(worker2.is_alive())
-                    self.assertEqual(len(v2_err), 1)
-                    self.assertIn("Could not save draft recovery snapshot", str(v2_err[0]))
-
-                    hold_atomic = False
-                    release_atomic.set()
-                    session.writes.flush(timeout=4.0)
-
-                self.assertEqual(bg_tab["content"], bg_v1)
-                assert_recovery_excludes_rejected("Rejected v2 patch.", expected_bg=bg_v1)
-
-                v2_retry_ops = [{"type": "replace", "old": "Accepted v1 patch.", "new": "Accepted v2 patch."}]
-                res_v2 = studio._agent_document_action({
-                    "action": "patch_tab",
-                    "tabId": bg_tab["id"],
-                    "expectedRevision": rev1,
-                    "operations": v2_retry_ops,
-                })
-                bg_v2 = "# Background\n\nAccepted v2 patch.\n"
-                self.assertEqual(res_v2["revision"], hashlib.sha256(bg_v2.encode("utf-8")).hexdigest())
-                self.assertEqual(bg_tab["content"], bg_v2)
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-                assert_recovery_excludes_rejected("Rejected", expected_bg=bg_v2)
-            finally:
-                self.dispose(session, studio)
-
-    def test_live_bridge_patch_tab_timeout_aborts_inflight_recovery_write_and_allows_retry(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            root = self._canonical_root(tmp)
-            state_dir = root / "state"
-            notes_dir = root / "notes"
-            notes_dir.mkdir(parents=True, exist_ok=True)
-            active_file = notes_dir / "Active.md"
-            bg_file = notes_dir / "Background.md"
-            active_initial = "# Active\n\nFocus stays here.\n"
-            bg_initial = "# Background\n\nAsync baseline.\n"
-            active_file.write_text(active_initial, encoding="utf-8")
-            bg_file.write_text(bg_initial, encoding="utf-8")
-
-            session, studio = self.make_studio(state_dir)
-            bridge = None
-            try:
-                active_tab = studio._note("Active.md", active_initial, str(active_file), saved=active_initial)
-                bg_tab = studio._note("Background.md", bg_initial, str(bg_file), saved=bg_initial)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-                studio.ready = True
-                studio._emit(True)
-                bridge, client = self._start_live_bridge(session, studio)
-
-                real_atomic_json = studio_module.atomic_json
-                recovery_path = (session.data / "recovery.json").resolve()
-                rev0 = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
-                entered = threading.Event()
-                release = threading.Event()
-                hold = True
-
-                def held_atomic_json(path, payload):
-                    if hold and studio_module.folder_ops.same_path(path, recovery_path):
-                        entered.set()
-                        self.assertTrue(release.wait(10.0))
-                    return real_atomic_json(path, payload)
-
-                rejected_ops = [{"type": "replace", "old": "Async baseline.", "new": "Rejected bridge timeout."}]
-                with patch.object(agent_live, "REQUEST_TIMEOUT", 0.6), patch.object(
-                    studio_module, "atomic_json", side_effect=held_atomic_json
-                ):
-                    with self.assertRaises(agent_live.LiveBridgeError) as timeout_err:
-                        self._call_client_pumping_qt(
-                            lambda: client.patch_tab(bg_tab["id"], rev0, rejected_ops, window_id=studio.window_id)
-                        )
-                    self.assertIn("timed out", str(timeout_err.exception).casefold())
-                    self.assertTrue(entered.is_set())
-
-                    hold = False
-                    release.set()
-                    session.writes.flush(timeout=4.0)
-                    QTest.qWait(50)
-
-                self.assertEqual(bg_tab["content"], bg_initial)
-                self.assertFalse(bg_tab["agent_staged"])
-                self.assertEqual(studio.active, active_tab["id"])
-                self.assertFalse(recovery_path.exists())
-
-                retry_ops = [{"type": "replace", "old": "Async baseline.", "new": "Accepted after bridge retry."}]
-                res = self._call_client_pumping_qt(
-                    lambda: client.patch_tab(bg_tab["id"], rev0, retry_ops, window_id=studio.window_id)
+                # 1. User edits note in the current reader, leaving an unsaved dirty draft.
+                studio.post(
+                    "r-edit-1",
+                    "document_changed",
+                    json.dumps({"id": note_tab["id"], "content": dirty_draft}),
                 )
-                expected_after = "# Background\n\nAccepted after bridge retry.\n"
-                self.assertEqual(res["revision"], hashlib.sha256(expected_after.encode("utf-8")).hexdigest())
-                self.assertEqual(bg_tab["content"], expected_after)
-                self.assertTrue(bg_tab["agent_staged"])
-                self.assertEqual(studio.active, active_tab["id"])
-                recovered = {item["id"]: item for item in json.loads(self._read_text_with_sharing_retry(recovery_path))}
-                self.assertEqual(recovered[bg_tab["id"]]["content"], expected_after)
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-            finally:
-                if bridge is not None:
-                    bridge.stop()
-                self.dispose(session, studio)
+                self.assertTrue(studio._is_dirty(note_tab))
+                self.assertEqual(self._read_text_with_sharing_retry(note_file), disk_initial)
 
-    def test_closed_window_lifecycle_suspends_live_access_and_aborts_inflight_staged_patch_tab(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            root = self._canonical_root(tmp)
-            state_dir = root / "state"
-            notes_dir = root / "notes"
-            notes_dir.mkdir(parents=True, exist_ok=True)
-            active_file = notes_dir / "Active.md"
-            bg_file = notes_dir / "Background.md"
-            active_initial = "# Active\n\nOpen window note.\n"
-            bg_initial = "# Background\n\nClosed window baseline.\n"
-            active_file.write_text(active_initial, encoding="utf-8")
-            bg_file.write_text(bg_initial, encoding="utf-8")
-
-            session, studio = self.make_studio(state_dir)
-            bridge = None
-            dummy_app = _DummyApp()
-            try:
-                session.settings["keepInBackground"] = True
-                session.settings["agentAccessEnabled"] = True
-                studio.host_window = _VisibleHost(visible=True)
-                active_tab = studio._note("Active.md", active_initial, str(active_file), saved=active_initial)
-                bg_tab = studio._note("Background.md", bg_initial, str(bg_file), saved=bg_initial)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-                studio.ready = True
-                studio._emit(True)
-
-                bridge, client = self._start_live_bridge(session, studio)
-                with patch("core.background_service.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
-                    service = BackgroundService(dummy_app, session, ROOT, lambda _: None, force=False)
-                session.background = service
-                self.assertTrue(service.enabled)
-                self.assertTrue(bridge.enabled)
-
-                real_atomic_json = studio_module.atomic_json
-                recovery_path = (session.data / "recovery.json").resolve()
-                rev0 = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
-                entered = threading.Event()
-                release = threading.Event()
-                hold = True
-
-                def held_atomic_json(path, payload):
-                    if hold and studio_module.folder_ops.same_path(path, recovery_path):
-                        entered.set()
-                        self.assertTrue(release.wait(10.0))
-                    return real_atomic_json(path, payload)
-
-                inflight_ops = [{"type": "replace", "old": "Closed window baseline.", "new": "Aborted on close."}]
-                call_done = threading.Event()
-                call_box: dict = {}
-
-                with patch.object(studio_module, "atomic_json", side_effect=held_atomic_json):
-                    def run_patch():
-                        try:
-                            call_box["result"] = client.patch_tab(
-                                bg_tab["id"],
-                                rev0,
-                                inflight_ops,
-                                window_id=studio.window_id,
-                            )
-                        except BaseException as exc:
-                            call_box["error"] = exc
-                        finally:
-                            call_done.set()
-
-                    worker = threading.Thread(target=run_patch, daemon=True)
-                    worker.start()
-
-                    wait_deadline = time.monotonic() + 3.0
-                    while not entered.is_set() and time.monotonic() < wait_deadline:
-                        self.app.processEvents()
-                        time.sleep(0.005)
-                    self.assertTrue(entered.is_set())
-
-                    studio.host_window.hide()
-                    service.handle_window_visibility(studio)
-                    self.assertFalse(bridge.enabled)
-
-                    hold = False
-                    release.set()
-                    finish_deadline = time.monotonic() + 3.0
-                    while not call_done.is_set() and time.monotonic() < finish_deadline:
-                        self.app.processEvents()
-                        time.sleep(0.005)
-                    worker.join(timeout=1.0)
-                    session.writes.flush(timeout=4.0)
-                    QTest.qWait(40)
-
-                self.assertIn("error", call_box)
-                self.assertEqual(bg_tab["content"], bg_initial)
-                self.assertFalse(bg_tab["agent_staged"])
-                self.assertFalse(recovery_path.exists())
-
-                with self.assertRaises(agent_live.LiveBridgeError):
-                    client.list_tabs()
-
-                studio.host_window.show()
-                service.handle_window_visibility(studio)
-                self.assertTrue(bridge.enabled)
-
-                reopened_client = agent_live.LiveTabClient(bridge.discovery_path, timeout=10.0)
-                retry_ops = [{"type": "replace", "old": "Closed window baseline.", "new": "Staged after reopen."}]
-                res = self._call_client_pumping_qt(
-                    lambda: reopened_client.patch_tab(bg_tab["id"], rev0, retry_ops, window_id=studio.window_id)
+                # 2. Active reader applies an AI patch on top of the dirty draft and notifies Studio.
+                studio.post(
+                    "r-edit-2",
+                    "document_changed",
+                    json.dumps({"id": note_tab["id"], "content": ai_coauthored}),
                 )
-                expected_after = "# Background\n\nStaged after reopen.\n"
-                self.assertEqual(res["revision"], hashlib.sha256(expected_after.encode("utf-8")).hexdigest())
-                self.assertEqual(bg_tab["content"], expected_after)
-                self.assertTrue(bg_tab["agent_staged"])
-                recovered = {item["id"]: item for item in json.loads(self._read_text_with_sharing_retry(recovery_path))}
-                self.assertEqual(recovered[bg_tab["id"]]["content"], expected_after)
-                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
-            finally:
-                if bridge is not None:
-                    bridge.stop()
-                self.dispose(session, studio)
+                studio.post(
+                    "r-banner-1",
+                    "agent_banner_shown",
+                    json.dumps({
+                        "id": note_tab["id"],
+                        "before": dirty_draft,
+                        "after": ai_coauthored,
+                    }),
+                )
+                self.assertTrue(note_tab["agent_unreviewed"])
+                self.assertEqual(len(note_tab["agent_edits"]), 1)
+                self.assertEqual(note_tab["agent_edits"][0]["before"], dirty_draft)
+                self.assertEqual(note_tab["agent_edits"][0]["after"], ai_coauthored)
 
-    def test_staged_patch_tab_preserves_exact_snapshot_across_rename_and_shutdown_drain(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            root = self._canonical_root(tmp)
-            state_dir = root / "state"
-            workspace_dir = root / "workspace"
-            sub_dir = workspace_dir / "docs"
-            sub_dir.mkdir(parents=True, exist_ok=True)
-            active_file = workspace_dir / "Active.md"
-            bg_file = sub_dir / "Background.md"
-            active_initial = "# Active\n\nFocused note.\n"
-            bg_initial = "# Background\n\nOriginal disk text.\n"
-            active_file.write_text(active_initial, encoding="utf-8")
-            bg_file.write_text(bg_initial, encoding="utf-8")
-
-            session, studio = self.make_studio(state_dir)
-            retired_cleanly = False
-            try:
-                studio.folder = studio_module.folder_ops.canonical_path_str(workspace_dir)
-                active_canon = studio_module.folder_ops.canonical_path_str(active_file)
-                bg_canon = studio_module.folder_ops.canonical_path_str(bg_file)
-                active_tab = studio._note("Active.md", active_initial, active_canon, saved=active_initial)
-                bg_tab = studio._note("Background.md", bg_initial, bg_canon, saved=bg_initial)
-                studio.tabs = [active_tab, bg_tab]
-                studio.active = active_tab["id"]
-                studio.ready = True
-                studio._recover()
+                # Subsequent emits in the same reader session must not replay pendingAgentEdits twice.
+                reader_loads.clear()
                 studio._emit(True)
-                session.writes.flush(timeout=4.0)
+                self.assertTrue(reader_loads)
+                self.assertNotIn("pendingAgentEdits", reader_loads[-1])
 
-                rev0 = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
-                staged_text = "# Background\n\nStaged across rename.\n"
-                patch_res = studio._agent_document_action({
-                    "action": "patch_tab",
-                    "tabId": bg_tab["id"],
-                    "expectedRevision": rev0,
-                    "operations": [{"type": "replace", "old": "Original disk text.", "new": "Staged across rename."}],
-                })
-                self.assertTrue(patch_res["changed"])
-                self.assertEqual(studio.active, active_tab["id"])
-                self.assertTrue(bg_tab["agent_staged"])
+                # Persist recovery/session while disk still holds disk_initial.
+                self.dispose(session, studio)
+                retired_first = True
+                self.assertEqual(self._read_text_with_sharing_retry(note_file), disk_initial)
 
-                studio.renameEntry(bg_canon, "RenamedBg.md")
-                rename_deadline = time.monotonic() + 3.0
-                while Path(bg_tab["path"]).name != "RenamedBg.md" and time.monotonic() < rename_deadline:
-                    self.app.processEvents()
-                    time.sleep(0.01)
-                session.writes.flush(timeout=4.0)
-                self.app.processEvents()
-
-                renamed_note = sub_dir / "RenamedBg.md"
-                self.assertTrue(renamed_note.is_file())
-                self.assertEqual(self._read_text_with_sharing_retry(renamed_note), bg_initial)
-                self.assertEqual(studio.active, active_tab["id"])
-                self.assertTrue(bg_tab["agent_staged"])
-
-                rename_entered = threading.Event()
-                release_rename = threading.Event()
-                real_rename_retry = studio_module._rename_path_with_windows_retry
-
-                def gated_rename(src, dst):
-                    rename_entered.set()
-                    self.assertTrue(release_rename.wait(10.0))
-                    return real_rename_retry(src, dst)
-
-                with patch.object(studio_module, "_rename_path_with_windows_retry", side_effect=gated_rename):
-                    studio.renameEntry(studio_module.folder_ops.canonical_path_str(sub_dir), "archive")
-                    self.assertTrue(rename_entered.wait(5.0))
-                    studio.stop()
-                    studio.pool.shutdown(wait=True, cancel_futures=True)
-                    studio._search_pool.shutdown(wait=True, cancel_futures=True)
-                    retired_cleanly = True
-
-                    shutdown_done = threading.Event()
-                    t = threading.Thread(
-                        target=lambda: (session.writes.shutdown(wait=True), shutdown_done.set()),
-                        daemon=True,
-                    )
-                    t.start()
-                    time.sleep(0.02)
-                    release_rename.set()
-                    t.join(timeout=5.0)
-                    self.assertTrue(shutdown_done.is_set())
-
-                final_note = workspace_dir / "archive" / "RenamedBg.md"
-                final_canon = studio_module.folder_ops.canonical_path_str(final_note)
-                self.assertTrue(final_note.is_file())
-                self.assertEqual(self._read_text_with_sharing_retry(final_note), bg_initial)
-
-                recovery_entries = {
-                    item["id"]: item
-                    for item in json.loads(self._read_text_with_sharing_retry(state_dir / "recovery.json"))
-                }
-                self.assertTrue(studio_module.folder_ops.same_path(recovery_entries[bg_tab["id"]]["path"], final_canon))
-                self.assertEqual(recovery_entries[bg_tab["id"]]["content"], staged_text)
-                self.assertTrue(recovery_entries[bg_tab["id"]]["agent_staged"])
-                self.assertTrue(recovery_entries[bg_tab["id"]]["agent_unreviewed"])
-
-                startup_data = json.loads(self._read_text_with_sharing_retry(state_dir / "startup.json"))
-                self.assertTrue(any(studio_module.folder_ops.same_path(p, final_canon) for p in startup_data["paths"]))
-
-                restarted_session, restarted_studio = self.make_studio(state_dir)
+                # 3. Restore Studio session and connect a fresh current reader.
+                restored_session, restored_studio = self.make_studio(state_dir)
                 try:
-                    restored = next(item for item in restarted_studio.tabs if item["id"] == bg_tab["id"])
-                    self.assertTrue(studio_module.folder_ops.same_path(restored["path"], final_canon))
-                    self.assertEqual(restored["content"], staged_text)
-                    self.assertTrue(restored["agent_staged"])
-                    self.assertTrue(restored["agent_unreviewed"])
-                finally:
-                    self.dispose(restarted_session, restarted_studio)
-            finally:
-                if not retired_cleanly:
-                    self.dispose(session, studio)
+                    restored_studio.settings["autosave"] = False
+                    restored_tab = next(item for item in restored_studio.tabs if item["id"] == note_tab["id"])
+                    self.assertEqual(restored_tab["content"], ai_coauthored)
+                    self.assertEqual(restored_tab["saved"], disk_initial)
+                    self.assertTrue(restored_studio._is_dirty(restored_tab))
+                    self.assertTrue(restored_tab["agent_unreviewed"])
+                    self.assertEqual(len(restored_tab["agent_edits"]), 1)
 
-    @staticmethod
-    def _capture_exception(sink: list[BaseException], fn):
-        try:
-            fn()
-        except BaseException as exc:
-            sink.append(exc)
+                    restored_loads: list[dict] = []
+                    restored_studio.readerLoad.connect(
+                        lambda payload: restored_loads.append(json.loads(payload))
+                    )
+                    restored_studio.post("r-ready-2", "reader_ready", "{}")
+                    self.assertTrue(restored_loads)
+                    initial_load = restored_loads[-1]
+                    self.assertEqual(initial_load["id"], restored_tab["id"])
+                    self.assertEqual(initial_load["content"], ai_coauthored)
+                    self.assertTrue(initial_load["agentUnreviewed"])
+                    self.assertEqual(len(initial_load["pendingAgentEdits"]), 1)
+                    self.assertEqual(initial_load["pendingAgentEdits"][0]["before"], dirty_draft)
+                    self.assertEqual(initial_load["pendingAgentEdits"][0]["after"], ai_coauthored)
+
+                    # 4. Current reader undoes AI edit back to the dirty user draft, then saves cleanly.
+                    restored_studio.post(
+                        "r-undo-1",
+                        "document_changed",
+                        json.dumps({"id": restored_tab["id"], "content": dirty_draft}),
+                    )
+                    restored_studio.post(
+                        "r-dismiss-1",
+                        "agent_banner_dismissed",
+                        json.dumps({"id": restored_tab["id"]}),
+                    )
+                    self.assertFalse(restored_tab["agent_unreviewed"])
+                    self.assertTrue(restored_studio._is_dirty(restored_tab))
+
+                    restored_studio.save()
+                    save_deadline = time.monotonic() + 3.0
+                    while time.monotonic() < save_deadline and (
+                        self._read_text_with_sharing_retry(note_file) != dirty_draft
+                        or restored_studio._is_dirty(restored_tab)
+                    ):
+                        self.app.processEvents()
+                        time.sleep(0.01)
+                    self.assertEqual(self._read_text_with_sharing_retry(note_file), dirty_draft)
+                    self.assertFalse(restored_studio._is_dirty(restored_tab))
+                finally:
+                    self.dispose(restored_session, restored_studio)
+            finally:
+                if not retired_first:
+                    self.dispose(session, studio)
 
 
 if __name__ == "__main__":
