@@ -290,8 +290,14 @@ class StudioWorkspaceTest(unittest.TestCase):
 
         captured_calls: list[tuple] = []
         with patch("studio.stream_text_search", side_effect=lambda *a, **kw: captured_calls.append((a, kw))):
+            self.studio.prepareFolderSearch("Ham", True, False)
+            self.assertTrue(self.studio.folderSearchState["pending"] and self.studio.folderSearchState["scanning"])
+            self.assertEqual(captured_calls, [])
+            self.studio.openFolderSearchMatch("tab-42", str(note), "Ham", True)
+            self.assertEqual(self.studio.flush_operation["action"], "sync_for_search")
             self.studio.updateFolderSearch("Hamiltonian", True, True)
             self.assertTrue(_wait_until(lambda: len(captured_calls) == 1))
+            self.assertFalse(self.studio.folderSearchState["pending"])
             gen = self.studio._folder_search_generation
             self.studio._on_workspace_search_batch(gen - 1, [{"name": "stale.md"}], 99, True, True)
             self.assertEqual(self.studio.folderSearchState["matches"], [])

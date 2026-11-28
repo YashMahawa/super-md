@@ -174,11 +174,13 @@ def _entry_dict(name: str, path: str, *, directory: bool, depth: int, expanded: 
 
 def folder_search_state(studio_obj) -> dict:
     flush_op = getattr(studio_obj, "flush_operation", None)
+    pending = bool(getattr(studio_obj, "_folder_search_pending", False))
     sync_pending = bool(studio_obj._folder_search_open and studio_obj._folder_search_query.strip() and flush_op and flush_op.get("action") == "sync_for_search")
     return {
         "open": studio_obj._folder_search_open, "query": studio_obj._folder_search_query,
         "caseSensitive": studio_obj._folder_search_case_sensitive, "includeDiagrams": studio_obj._folder_search_include_diagrams,
-        "matches": studio_obj._folder_search_matches, "scanning": studio_obj._folder_search_scanning or sync_pending,
+        "matches": studio_obj._folder_search_matches, "pending": pending,
+        "scanning": studio_obj._folder_search_scanning or pending or sync_pending,
         "scannedFiles": studio_obj._folder_search_scanned_files, "truncated": studio_obj._folder_search_truncated,
         "hasFolder": bool(getattr(studio_obj, "folder", "")),
     }
@@ -191,39 +193,57 @@ def search_snapshots(studio_obj, *, canon_key_fn=None):
     recent_snap = [{"path": p, "name": Path(p).name, "pinned": canon_key(p) in pinned_keys} for p in getattr(studio_obj, "recent", ()) if p]
     return tabs_snap, recent_snap, (Path(studio_obj.folder) if getattr(studio_obj, "folder", "") else None), getattr(studio_obj, "active", "")
 
-def cancel_folder_search(studio_obj, close: bool = False) -> None:
-    _reset_cancel_state(studio_obj, "_folder_search_cancel", generation_attr="_folder_search_generation")
-    studio_obj._folder_search_scanning = False
-    if not close: return
-    studio_obj._folder_search_open = studio_obj._folder_search_truncated = False
+def cancel_folder_search(studio_obj, close: bool = False) -> int:
+    generation, _ = _reset_cancel_state(studio_obj, "_folder_search_cancel", generation_attr="_folder_search_generation")
+    studio_obj._folder_search_scanning = studio_obj._folder_search_pending = studio_obj._folder_search_truncated = False
     studio_obj._folder_search_matches, studio_obj._folder_search_scanned_files, studio_obj._folder_search_tabs_sig = [], 0, None
-    flush_op = getattr(studio_obj, "flush_operation", None)
-    if flush_op and flush_op.get("action") == "sync_for_search":
-        studio_obj.flush_operation = None
-        _call_optional(getattr(studio_obj, "flush_timer", None), "stop")
+    if close:
+        studio_obj._folder_search_open = False
+        flush_op = getattr(studio_obj, "flush_operation", None)
+        if flush_op and flush_op.get("action") == "sync_for_search":
+            studio_obj.flush_operation = None
+            _call_optional(getattr(studio_obj, "flush_timer", None), "stop")
+    return generation
+
+def apply_folder_search_query(
+    studio_obj, query: str, case_sensitive: bool = False, include_diagrams: bool = False,
+    *, pending: bool = False, stream_search_fn=None, canon_key_fn=None,
+) -> None:
+    if getattr(studio_obj, "retired", False): return
+    studio_obj._folder_search_query = query if isinstance(query, str) else ""
+    studio_obj._folder_search_case_sensitive, studio_obj._folder_search_include_diagrams = bool(case_sensitive), bool(include_diagrams)
+    if not studio_obj._folder_search_open: studio_obj._folder_search_open = True
+    if pending and studio_obj._folder_search_query.strip():
+        _call_method(studio_obj, "_cancel_folder_search", cancel_folder_search, False)
+        studio_obj._folder_search_pending = True
+        studio_obj.workspaceSearchChanged.emit(); return
+    _call_method(studio_obj, "_start_folder_search", start_folder_search, stream_search_fn=stream_search_fn, canon_key_fn=canon_key_fn)
 
 def open_folder_search(studio_obj, *, stream_search_fn=None, canon_key_fn=None) -> None:
     if getattr(studio_obj, "retired", False): return
-    studio_obj._folder_search_open, studio_obj._folder_search_tabs_sig = True, None
+    studio_obj._folder_search_open, studio_obj._folder_search_pending, studio_obj._folder_search_tabs_sig = True, False, None
     if getattr(studio_obj, "ready", False) and studio_obj.tabs and not getattr(studio_obj, "flush_operation", None):
         studio_obj._flush("sync_for_search"); studio_obj.workspaceSearchChanged.emit(); return
     studio_obj.workspaceSearchChanged.emit()
     if studio_obj._folder_search_query.strip():
         _call_method(studio_obj, "_start_folder_search", start_folder_search, stream_search_fn=stream_search_fn, canon_key_fn=canon_key_fn)
 
+def prepare_folder_search(studio_obj, query: str, case_sensitive: bool = False, include_diagrams: bool = False, *, stream_search_fn=None, canon_key_fn=None) -> None:
+    fn = getattr(studio_obj, "_apply_folder_search_query", None)
+    if callable(fn): fn(query, case_sensitive, include_diagrams, pending=True)
+    else: apply_folder_search_query(studio_obj, query, case_sensitive, include_diagrams, pending=True, stream_search_fn=stream_search_fn, canon_key_fn=canon_key_fn)
+
 def update_folder_search(studio_obj, query: str, case_sensitive: bool = False, include_diagrams: bool = False, *, stream_search_fn=None, canon_key_fn=None) -> None:
-    if getattr(studio_obj, "retired", False): return
-    studio_obj._folder_search_query = query if isinstance(query, str) else ""
-    studio_obj._folder_search_case_sensitive, studio_obj._folder_search_include_diagrams, studio_obj._folder_search_open = bool(case_sensitive), bool(include_diagrams), True
-    _call_method(studio_obj, "_start_folder_search", start_folder_search, stream_search_fn=stream_search_fn, canon_key_fn=canon_key_fn)
+    fn = getattr(studio_obj, "_apply_folder_search_query", None)
+    if callable(fn): fn(query, case_sensitive, include_diagrams, pending=False)
+    else: apply_folder_search_query(studio_obj, query, case_sensitive, include_diagrams, pending=False, stream_search_fn=stream_search_fn, canon_key_fn=canon_key_fn)
 
 def start_folder_search(studio_obj, *, stream_search_fn=None, canon_key_fn=None) -> None:
     stream_fn = stream_text_search if stream_search_fn is None else stream_search_fn
-    generation, _ = _reset_cancel_state(studio_obj, "_folder_search_cancel", generation_attr="_folder_search_generation")
-    studio_obj._folder_search_matches, studio_obj._folder_search_scanned_files, studio_obj._folder_search_truncated = [], 0, False
+    generation = _call_method(studio_obj, "_cancel_folder_search", cancel_folder_search, False)
+    if generation is None: generation = getattr(studio_obj, "_folder_search_generation", 0)
     query = studio_obj._folder_search_query
     if not query or not query.strip():
-        studio_obj._folder_search_scanning, studio_obj._folder_search_tabs_sig = False, None
         studio_obj.workspaceSearchChanged.emit(); return
     cancel_event = threading.Event()
     studio_obj._folder_search_cancel, studio_obj._folder_search_scanning = cancel_event, True
@@ -251,12 +271,12 @@ def on_workspace_search_batch(studio_obj, generation: int, batch, scanned: int, 
     studio_obj.workspaceSearchChanged.emit()
 
 def close_folder_search(studio_obj) -> None:
-    if studio_obj._folder_search_open or studio_obj._folder_search_scanning:
+    if studio_obj._folder_search_open or studio_obj._folder_search_scanning or getattr(studio_obj, "_folder_search_pending", False):
         _call_method(studio_obj, "_cancel_folder_search", cancel_folder_search, True)
         studio_obj.workspaceSearchChanged.emit()
 
 def cancel_workspace_search(studio_obj) -> None:
-    changed = studio_obj._folder_search_open or studio_obj._folder_search_scanning
+    changed = studio_obj._folder_search_open or studio_obj._folder_search_scanning or getattr(studio_obj, "_folder_search_pending", False)
     _call_method(studio_obj, "_cancel_folder_search", cancel_folder_search, True)
     if changed: studio_obj.workspaceSearchChanged.emit()
 
@@ -264,7 +284,7 @@ def open_folder_search_match(
     studio_obj, tab_id: str, path: str, query: str, case_sensitive: bool = False,
     source_start: int = -1, source_end: int = -1, match_text: str = "", *, seeded_find_bounds_fn=None,
 ) -> None:
-    if getattr(studio_obj, "retired", False): return
+    if getattr(studio_obj, "retired", False) or getattr(studio_obj, "_folder_search_pending", False): return
     _call_method(studio_obj, "_cancel_folder_search", cancel_folder_search, True)
     studio_obj.workspaceSearchChanged.emit()
     bounds_fn = seeded_find_bounds_fn or getattr(studio_obj, "_seeded_find_bounds", None) or _default_seeded_find_bounds
