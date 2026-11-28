@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
-from PySide6.QtCore import QObject, QUrl, QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QObject, QUrl, QEvent, QPointF, Qt
 from PySide6.QtGui import QGuiApplication, QColor
 from PySide6.QtQml import QQmlEngine, QQmlComponent
 from PySide6.QtQuickControls2 import QQuickStyle

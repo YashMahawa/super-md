@@ -11,7 +11,7 @@ const { invokeMock, toJsxRuntimeSpy } = vi.hoisted(() => ({
   }),
   toJsxRuntimeSpy: vi.fn(),
 }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("../nativeBridge", () => ({ invoke: invokeMock }));
 vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("hast-util-to-jsx-runtime")>();
   return {

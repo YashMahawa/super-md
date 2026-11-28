@@ -1,6 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
 import * as documentAnalysis from "../documentAnalysis";
 import { cachedMarkdownTree } from "./CachedMarkdown";
+import MarkdownPreview, { PREVIEW_REHYPE_PLUGINS, PREVIEW_REMARK_PLUGINS } from "./MarkdownPreview";
 import { readerSourceAnalysis } from "../readerSourceAnalysis";
 
 afterEach(() => vi.restoreAllMocks());
@@ -63,5 +65,118 @@ describe("CachedMarkdown supplied source analysis", () => {
 
     expect(parse).toHaveBeenCalledOnce();
     expect(parse).toHaveBeenCalledWith(source);
+  });
+
+  it("renders identical preview output from supplied source analysis without invoking source parsing in CachedMarkdown", () => {
+    const richSource = [
+      "---",
+      "title: Supplied Source Parity",
+      "---",
+      "",
+      "# Analysis Heading",
+      "",
+      "> [!note] Callout with $x^2 + y^2 = z^2$",
+      "> Highlight ==term==, H~2~O, 10^3^, and <kbd onclick=\"alert(1)\">Esc</kbd><br/>line two.",
+      "",
+      "| Col | Math |",
+      "| --- | --- |",
+      "| Val | $P(X | Y)$ |",
+      "",
+      "- [ ] Task with [ref][target] and footnote[^n1]",
+      "",
+      "<script>alert('xss')</script>",
+      "",
+      "![Dot](data:image/png;base64,iVBORw0KGgo=) ![Vector](data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=) ![HtmlImg](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)",
+      "",
+      "[Relative](./notes/chapter-2.md#summary) [Anchor](#analysis-heading) [Mail](mailto:reader@example.org) [Unsafe](javascript:alert(1)) [UnsafeVb](vbscript:msgbox(1)) [UnsafeData](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)",
+      "",
+      "```python",
+      "total = 40 + 2",
+      "```",
+      "",
+      "[target]: https://example.org/parity",
+      "[^n1]: Footnote from pre-parsed tree.",
+    ].join("\n");
+
+    const supplied = readerSourceAnalysis("reader", richSource)!;
+    const parse = vi.spyOn(documentAnalysis, "analyzeDocument");
+
+    let registeredParser: unknown = "unset";
+    const inspectProcessor = function (this: { parser?: unknown }) {
+      registeredParser = this.parser;
+    };
+
+    const treeFromSupplied = cachedMarkdownTree(
+      richSource,
+      [inspectProcessor, ...PREVIEW_REMARK_PLUGINS],
+      PREVIEW_REHYPE_PLUGINS,
+      false,
+      supplied,
+    );
+    expect(registeredParser).toBeUndefined();
+    expect(parse).not.toHaveBeenCalled();
+
+    const htmlFromSupplied = renderToStaticMarkup(
+      <MarkdownPreview
+        markdown={richSource}
+        documentPath={null}
+        python="python3"
+        dark={false}
+        sourceAnalysis={supplied}
+      />,
+    );
+    expect(parse).not.toHaveBeenCalled();
+
+    const freshVariant = richSource.replace("Supplied Source Parity", "Fresh Source Parity");
+    const htmlFreshWithSupplied = renderToStaticMarkup(
+      <MarkdownPreview
+        markdown={freshVariant}
+        documentPath={null}
+        python="python3"
+        dark={false}
+        sourceAnalysis={readerSourceAnalysis("split", freshVariant) ?? undefined}
+      />,
+    );
+    expect(parse).toHaveBeenCalledOnce();
+
+    const htmlWithoutSupplied = renderToStaticMarkup(
+      <MarkdownPreview
+        markdown={richSource}
+        documentPath={null}
+        python="python3"
+        dark={false}
+      />,
+    );
+    expect(htmlFromSupplied).toBe(htmlWithoutSupplied);
+    expect(treeFromSupplied.children.length).toBeGreaterThan(0);
+    expect(htmlFromSupplied).toContain("Supplied Source Parity");
+    expect(htmlFreshWithSupplied).toContain("Fresh Source Parity");
+    expect(htmlFromSupplied).toContain('class="callout callout-note"');
+    expect(htmlFromSupplied).toContain("<mark>term</mark>");
+    expect(htmlFromSupplied).toContain("<kbd>Esc</kbd><br/>line two.");
+    const imageParagraph = treeFromSupplied.children.find(
+      (node: any) => node.type === "element" && node.tagName === "p" && node.children?.some((child: any) => child.tagName === "img"),
+    ) as any;
+    const hastImgSrcs = imageParagraph.children
+      .filter((child: any) => child.type === "element" && child.tagName === "img")
+      .map((child: any) => child.properties?.src);
+    expect(hastImgSrcs).toEqual([
+      "data:image/png;base64,iVBORw0KGgo=",
+      "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=",
+      "",
+    ]);
+    expect(htmlFromSupplied).not.toContain("onclick");
+    expect(htmlFromSupplied).not.toContain("javascript:");
+    expect(htmlFromSupplied).not.toContain("vbscript:");
+    expect(htmlFromSupplied).not.toContain("data:text/html");
+    expect(htmlFromSupplied).not.toContain("<script");
+    expect(htmlFromSupplied).toContain('src="data:image/png;base64,iVBORw0KGgo="');
+    expect(htmlFromSupplied).toContain('data-note-image-source="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4="');
+    expect(htmlFromSupplied).toContain('href="./notes/chapter-2.md#summary"');
+    expect(htmlFromSupplied).toContain('href="#analysis-heading"');
+    expect(htmlFromSupplied).toContain('href="mailto:reader@example.org"');
+    expect(htmlFromSupplied).toContain('href="https://example.org/parity"');
+    expect(htmlFromSupplied).toContain("Footnote from pre-parsed tree.");
+    expect(htmlFromSupplied).toContain('class="python-cell"');
   });
 });

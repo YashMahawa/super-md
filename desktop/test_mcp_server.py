@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import os
@@ -203,8 +204,6 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_tab_tools_use_bridge_revisions_and_return_mcp_image_blocks(self):
         import base64
-        from mcp import Client
-        from mcp.types import ImageContent
         from mcp_server import build_mcp_server
 
         class FakeLive:
@@ -348,7 +347,7 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                 "action": "outline", "path": target, "offset": 2, "limit": 7})
             self.assertEqual(outline.structured_content["target"], target)
             self.assertEqual((live.outline_call["offset"], live.outline_call["limit"]), (2, 7))
-            search = await client.call_tool("document_search", {
+            await client.call_tool("document_search", {
                 "path": target, "query": "body", "limit": 3, "context": 10, "offset": 5,
                 "case_sensitive": True, "whole_word": True, "regex": False, "exclude_diagrams": True,
             })
@@ -1000,6 +999,225 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                         outside_message="outside",
                         _system_aliases=(),
                     )
+
+    async def test_document_inspect_and_view_current_expose_bounded_displayed_properties_and_redact_hidden_fields(self):
+        from mcp import Client
+        from mcp_server import build_mcp_server
+
+        png_1x1 = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+            b"\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        jpeg_1x1 = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+        revision = "a" * 64
+        expected_props = {
+            "title": "Path Integrals & Symmetries",
+            "author": "Richard Feynman, Emmy Noether",
+            "authors": ["Richard Feynman", "Emmy Noether"],
+            "tags": ["quantum", "physics"],
+        }
+
+        class FakeLiveClient:
+            def __init__(self):
+                self.capture_has_props = True
+                self.capture_revision = revision
+                self.context_revision = revision
+                self.oversized_props = False
+
+            def _raw_props(self):
+                if self.oversized_props:
+                    return {
+                        "title": "T" * 450,
+                        "author": "A" * 700,
+                        "authors": [f"Author {i} " + ("X" * 240) for i in range(25)],
+                        "tags": [f"tag-{i}-" + ("y" * 140) for i in range(60)],
+                        "subtitle": "Redacted subtitle",
+                        "date": "2026-03-15",
+                        "description": "Redacted description",
+                        "aliases": ["RedactedAlias"],
+                        "customSecret": "ignored",
+                    }
+                return {
+                    **expected_props,
+                    "subtitle": "Redacted subtitle",
+                    "date": "2026-03-15",
+                    "description": "Redacted description",
+                    "aliases": ["RedactedAlias"],
+                    "customSecret": "ignored",
+                }
+
+            def list_sessions(self):
+                return {"available": True, "sessions": [{"windowId": "win1", "available": True}]}
+
+            def list_tabs(self, window_id=None):
+                return {
+                    "available": True,
+                    "tabs": [{
+                        "id": "win1:tab1",
+                        "windowId": "win1",
+                        "title": "Path Integrals",
+                        "path": None,
+                        "isActive": True,
+                        "revision": revision,
+                    }],
+                }
+
+            def read_tab(self, tab_id, offset=0, limit=1, **kwargs):
+                return {
+                    "id": tab_id,
+                    "windowId": "win1",
+                    "title": "Path Integrals",
+                    "path": None,
+                    "format": "markdown",
+                    "isDirty": True,
+                    "sourceLength": 64,
+                    "revision": revision,
+                    "assets": [],
+                    "assetCount": 0,
+                    "properties": self._raw_props(),
+                }
+
+            def outline_tab(self, tab_id, offset=0, limit=80):
+                return {
+                    "revision": revision,
+                    "headings": [{"index": 0, "level": 1, "title": "Lecture 1", "slug": "lecture-1", "offset": 44}],
+                    "total": 1,
+                    "truncated": False,
+                }
+
+            def document_action(self, tab_id, action, **kwargs):
+                if action != "get_context":
+                    raise AssertionError(f"Unexpected document_action: {action}")
+                return {
+                    "tabId": tab_id,
+                    "revision": revision,
+                    "sourceLength": 64,
+                    "mode": "reader",
+                    "properties": self._raw_props(),
+                    "reading": {"offset": 0, "heading": "Path Integrals & Symmetries", "visibleText": "Path Integrals & Symmetries"},
+                    "visibleSource": {"text": "---\ntitle: Path Integrals & Symmetries\n---\n", "start": 0, "end": 43, "total_chars": 64, "next_offset": 43, "truncated": True},
+                }
+
+            def render_tab(self, tab_id, window_id=None, width=None, image_format="jpeg"):
+                ctx = {
+                    "tabId": tab_id,
+                    "revision": self.context_revision,
+                    "sourceLength": 64,
+                    "mode": "reader",
+                    "reading": {"offset": 0, "heading": "Path Integrals & Symmetries", "visibleText": "Path Integrals & Symmetries"},
+                    "visibleSource": {"text": "---\ntitle: Path Integrals & Symmetries\n---\n", "start": 0, "end": 43, "total_chars": 64, "next_offset": 43, "truncated": True},
+                }
+                if self.capture_has_props:
+                    ctx["properties"] = self._raw_props()
+                use_jpeg = image_format == "jpeg"
+                return {
+                    "tabId": tab_id,
+                    "revision": self.capture_revision,
+                    "mime_type": "image/jpeg" if use_jpeg else "image/png",
+                    "data": jpeg_1x1 if use_jpeg else png_1x1,
+                    "width": 1,
+                    "height": 1,
+                    "context": ctx,
+                }
+
+        def assert_only_allowed_properties(props):
+            self.assertEqual(set(props.keys()), {"title", "author", "authors", "tags"})
+            for hidden_key in ("subtitle", "date", "description", "aliases", "customSecret"):
+                self.assertNotIn(hidden_key, props)
+
+        with tempfile.TemporaryDirectory() as folder:
+            note_path = Path(folder) / "study.md"
+            note_path.write_text(
+                "---\n"
+                'title: "Path Integrals & Symmetries"\n'
+                "subtitle: Hidden Subtitle\n"
+                "author: [Richard Feynman, Emmy Noether]\n"
+                "date: 2026-03-15\n"
+                "description: Hidden Description\n"
+                "aliases: [HiddenAlias]\n"
+                "customSecret: HiddenSecret\n"
+                "tags: [quantum, physics, quantum]\n"
+                "---\n\n# Lecture 1\n",
+                encoding="utf-8",
+            )
+            fake_live = FakeLiveClient()
+            server, _ = build_mcp_server([folder], live_client=fake_live)
+            async with Client(server) as client:
+                inspected = await client.call_tool("document_inspect", {"path": "study.md"})
+                self.assertFalse(inspected.is_error, inspected.content)
+                self.assertEqual(inspected.structured_content["properties"], expected_props)
+                assert_only_allowed_properties(inspected.structured_content["properties"])
+
+                live_inspected = await client.call_tool("document_inspect", {"path": "tab:win1:tab1"})
+                self.assertFalse(live_inspected.is_error, live_inspected.content)
+                self.assertEqual(live_inspected.structured_content["properties"], expected_props)
+                assert_only_allowed_properties(live_inspected.structured_content["properties"])
+
+                no_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": False})
+                self.assertFalse(no_img.is_error, no_img.content)
+                no_img_payload = json.loads(no_img.content[0].text)
+                self.assertEqual(no_img_payload["readingContextSource"], "context_read")
+                self.assertEqual(no_img_payload["readingContext"]["properties"], expected_props)
+                assert_only_allowed_properties(no_img_payload["readingContext"]["properties"])
+
+                with_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True})
+                self.assertFalse(with_img.is_error, with_img.content)
+                with_img_payload = json.loads(with_img.content[1].text)
+                self.assertEqual(with_img_payload["readingContextSource"], "viewport_capture")
+                self.assertTrue(with_img_payload["readingContextAlignedWithCapture"])
+                self.assertEqual(with_img_payload["readingContext"]["properties"], expected_props)
+                self.assertEqual(with_img_payload["captureContext"]["properties"], expected_props)
+                assert_only_allowed_properties(with_img_payload["readingContext"]["properties"])
+                assert_only_allowed_properties(with_img_payload["captureContext"]["properties"])
+
+                high_img = await client.call_tool(
+                    "view_current", {"tabId": "win1:tab1", "includeImage": True, "quality": "high"}
+                )
+                self.assertFalse(high_img.is_error, high_img.content)
+                high_payload = json.loads(high_img.content[1].text)
+                self.assertEqual(high_payload["imagePreview"]["mimeType"], "image/png")
+                self.assertEqual(high_payload["readingContext"]["properties"], expected_props)
+
+                # When viewport capture omits properties, view_current preserves reading_context.properties.
+                fake_live.capture_has_props = False
+                fallback_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True})
+                self.assertFalse(fallback_img.is_error, fallback_img.content)
+                fallback_payload = json.loads(fallback_img.content[1].text)
+                self.assertEqual(fallback_payload["readingContext"]["properties"], expected_props)
+                assert_only_allowed_properties(fallback_payload["readingContext"]["properties"])
+                fake_live.capture_has_props = True
+
+                # Oversized metadata values are bounded while hidden fields remain redacted.
+                fake_live.oversized_props = True
+                bounded_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True})
+                self.assertFalse(bounded_img.is_error, bounded_img.content)
+                bounded_payload = json.loads(bounded_img.content[1].text)
+                bounded_props = bounded_payload["readingContext"]["properties"]
+                assert_only_allowed_properties(bounded_props)
+                self.assertEqual(len(bounded_props["title"]), 300)
+                self.assertEqual(len(bounded_props["author"]), 500)
+                self.assertEqual(len(bounded_props["authors"]), 20)
+                self.assertTrue(all(len(a) <= 200 for a in bounded_props["authors"]))
+                self.assertEqual(len(bounded_props["tags"]), 50)
+                self.assertTrue(all(len(t) <= 100 for t in bounded_props["tags"]))
+                fake_live.oversized_props = False
+
+                # When nested capture context revision differs from the tab revision, keep context_read without promoting stale capture context.
+                fake_live.context_revision = "b" * 64
+                unaligned_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True})
+                self.assertFalse(unaligned_img.is_error, unaligned_img.content)
+                unaligned_payload = json.loads(unaligned_img.content[1].text)
+                self.assertEqual(unaligned_payload["readingContextSource"], "context_read")
+                self.assertFalse(unaligned_payload["captureContext"]["contextRevisionMatches"])
+                self.assertFalse(unaligned_payload["readingContextAlignedWithCapture"])
+                self.assertEqual(unaligned_payload["readingContext"]["properties"], expected_props)
+                fake_live.context_revision = revision
+
+                # When the rendered capture revision itself differs from the context revision, mcp_server rejects the stale capture.
+                fake_live.capture_revision = "c" * 64
+                stale_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True})
+                self.assertTrue(stale_img.is_error)
 
 
 if __name__ == "__main__":
