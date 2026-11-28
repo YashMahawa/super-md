@@ -23,6 +23,8 @@ import { MaterialButton, MaterialIconButton, MaterialSelect, MaterialSlider, Mat
 import { isTypewriterShortcutEvent, setTypewriterScroll, toggleTypewriterScroll, useTypewriterScroll } from "./typewriterScroll";
 import { applyHistoryEdit, replayHistory, trimHistoryCache, tryLiveTextareaHistory, type LiveHistoryEditMeta, type NoteHistory } from "./noteHistory";
 import { scrollInputVersion } from "./scrollAnchor";
+import { cancelHeadingNavigation, readingKeyboardScrollDelta } from "./documentNavigation";
+import { rememberWindowedScrollSource } from "./windowedSearch";
 import { captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, isProgrammaticAnchorScroll, primeEditorAnchor, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
 import { settleSharedSourceAnchor } from "./useSharedSourceAnchor";
 
@@ -380,9 +382,33 @@ export default function App() {
       (target instanceof Element && !!target.closest(".workspace")) ||
       (typeof x === "number" && typeof y === "number" && !!document.elementFromPoint(x, y)?.closest(".workspace"));
     const onWheel = (event: WheelEvent) => {
-      if (!event.ctrlKey && !event.metaKey) return;
+      const target = event.target instanceof Element ? event.target : null;
+      const readingRoot = target?.closest<HTMLElement>(".reading-scroll") ?? null;
+      cancelHeadingNavigation(readingRoot);
+      if (!event.ctrlKey && !event.metaKey) {
+        if (readingRoot && !target?.closest("textarea,input,.interactive-chart,.note-image,[data-independent-zoom]")) {
+          rememberWindowedScrollSource(
+            readingRoot,
+            event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? readingRoot.clientHeight : 1),
+          );
+        }
+        return;
+      }
       event.preventDefault();
       if (inWorkspace(event.target, event.clientX, event.clientY)) setZoom((current) => current * Math.exp(-event.deltaY * .0016));
+    };
+    const onScrollKey = (event: KeyboardEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const readingRoot =
+        target?.closest<HTMLElement>(".reading-scroll") ||
+        (!target || target === document.body || target === document.documentElement
+          ? workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null
+          : null);
+      if (!readingRoot) return;
+      const delta = readingKeyboardScrollDelta(event, readingRoot);
+      if (delta === null) return;
+      cancelHeadingNavigation(readingRoot);
+      rememberWindowedScrollSource(readingRoot, delta);
     };
     const onGestureStart = (event: Event) => {
       event.preventDefault();
@@ -409,6 +435,7 @@ export default function App() {
     };
     const onTouchEnd = (event: TouchEvent) => { if (event.touches.length < 2) gestureInWorkspace.current = false; };
     document.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    document.addEventListener("keydown", onScrollKey);
     document.addEventListener("gesturestart", onGestureStart, { passive: false, capture: true });
     document.addEventListener("gesturechange", onGestureChange, { passive: false, capture: true });
     document.addEventListener("gestureend", onGestureEnd, { passive: false, capture: true });
@@ -417,6 +444,7 @@ export default function App() {
     document.addEventListener("touchend", onTouchEnd, { passive: true, capture: true });
     return () => {
       document.removeEventListener("wheel", onWheel, true);
+      document.removeEventListener("keydown", onScrollKey);
       document.removeEventListener("gesturestart", onGestureStart, true);
       document.removeEventListener("gesturechange", onGestureChange, true);
       document.removeEventListener("gestureend", onGestureEnd, true);
