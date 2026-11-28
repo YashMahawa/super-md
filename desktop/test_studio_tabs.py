@@ -244,6 +244,12 @@ class StudioTabsTest(unittest.TestCase):
         reopened = next(t for t in self.studio.tabs if t["id"] == tab_id)
         self.assertEqual((reopened["agent_staged"], reopened["agent_unreviewed"], reopened["agent_edits"]), (False, False, []))
         self.assertEqual((reopened["content"], reopened["saved"], self.studio.closed_tabs), ("# Unsaved edit\n", "# Original\n", []))
+        self.studio.closed_tabs[:] = [{**reopened, "id": "legacy-staged", "path": "", "agent_staged": 1}]
+        self.studio.reopenTab()
+        self.studio._activation_generation += 1
+        self.assertTrue(_wait_until(lambda: any(t["id"] == "legacy-staged" for t in self.studio.tabs)))
+        self.assertIs(next(t for t in self.studio.tabs if t["id"] == "legacy-staged")["agent_staged"], True)
+        self.studio.tabs = [t for t in self.studio.tabs if t["id"] != "legacy-staged"]
         reopened["saved"] = reopened["content"]
 
         self.studio.newNote()

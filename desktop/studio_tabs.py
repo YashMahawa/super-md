@@ -463,6 +463,7 @@ def reopen_tab(studio_obj, *, snapshot_tab_fn=snapshot_tab_state, same_closed_re
         existing = next((t for t in studio_obj.tabs if note.get("path") and t["path"] == note["path"]), None)
         target_note = existing or note
         if not existing:
+            note["agent_staged"] = bool(note.get("agent_staged", False))
             studio_obj.tabs.append(note)
             if note.get("path"):
                 try:

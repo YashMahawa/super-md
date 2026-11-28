@@ -1,5 +1,7 @@
 //! The same local typesetter is used by desktop and Android. No browser print layout.
 pub mod portable;
+#[doc(hidden)]
+pub mod slug;
 pub mod theme;
 pub mod pdf_assets;
 pub mod frontmatter;
@@ -34,7 +36,7 @@ pub struct PdfOptions {
 }
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { page_size: "a4".into(), margin: 14., font_size: 10.5, line_height: 1.4, paragraph_spacing: 0.65, font_family: "Manrope".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
+        Self { page_size: "a4".into(), margin: 14., font_size: 10.5, line_height: 1.5, paragraph_spacing: 0.65, font_family: "Manrope".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
     }
 }
 impl PdfOptions {
@@ -924,9 +926,7 @@ struct Renderer<'a> {
     link_depth: usize,
 }
 fn heading_slug(value: &str) -> String {
-    let value = value.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_').collect::<String>();
-    let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
-    if slug.is_empty() { "section".into() } else { slug }
+    slug::heading_slug(value)
 }
 fn parse_braced_fence_language(raw_info: &str) -> Option<&'static str> {
     let trimmed = raw_info.trim();
