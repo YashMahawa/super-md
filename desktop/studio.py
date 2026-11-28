@@ -9,12 +9,10 @@ import io
 import json
 import ipaddress
 import math
-import mimetypes
 import os
 import platform
 import shutil
 import re
-import secrets
 import socket
 import stat
 import subprocess
@@ -27,6 +25,7 @@ import urllib.request
 import uuid
 import weakref
 import zipfile
+from collections import deque
 from pathlib import Path
 try:
     import shiboken6
@@ -38,7 +37,7 @@ from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCur
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, is_valid_asset_filename,
-    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    materialize_assets, open_note, stage_atomic_json, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
@@ -58,13 +57,13 @@ from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
-from latest_writes import LatestWriteExecutor
-import updates
-import app_integration
+from latest_writes import ExactWriteAborted, LatestWriteExecutor
 if __package__:
     from . import studio_runtime
+    from .core import app_integration, updates
 else:
     import studio_runtime
+    from core import app_integration, updates
 import python_runtime
 import pending_python
 from export_jobs import ExportJobRegistry
@@ -80,7 +79,8 @@ try:
 except ImportError:
     import studio_chrome
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
+from quick_switcher import FolderNoteIndex, build_quick_switcher_candidates, coalesce_walk_roots, normalize_workspace_roots, rank_quick_switcher_items
+from workspace_links import WorkspaceLinkCache, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 from core.paths import DESKTOP_DIR, resource_root
 
@@ -391,8 +391,8 @@ def _extract_local_drop_paths(values) -> list[Path]:
         elif isinstance(raw, Path):
             local_str = str(raw)
         else:
-            text = str(raw).strip()
-            if not text:
+            text = str(raw)
+            if not text or not text.strip():
                 continue
             url = QUrl(text)
             if url.isLocalFile():
@@ -401,7 +401,7 @@ def _extract_local_drop_paths(values) -> list[Path]:
                 local_str = text
             else:
                 continue
-        if not local_str:
+        if not local_str or not local_str.strip() or "\0" in local_str:
             continue
         try:
             resolved = Path(local_str).expanduser().resolve()
@@ -503,6 +503,31 @@ class _StoppedFileWatcher:
 _STOPPED_WATCHER = _StoppedFileWatcher()
 
 
+def _watcher_alive(watcher) -> bool:
+    if watcher is None or watcher is _STOPPED_WATCHER:
+        return False
+    if shiboken6 is None:
+        return True
+    try:
+        return shiboken6.isValid(watcher)
+    except TypeError:
+        return True
+
+
+class _MutualWorkspaceLinkCache(WorkspaceLinkCache):
+    """WorkspaceLinkCache wrapper that participates in Session mutual cache invalidation."""
+
+    def __init__(self, *, on_invalidate=None) -> None:
+        super().__init__()
+        self._on_invalidate = on_invalidate
+
+    def invalidate(self, folder=None) -> None:
+        raw = "" if folder is None else (os.fspath(folder) if isinstance(folder, os.PathLike) else str(folder))
+        super().invalidate(None if not raw.strip() else raw)
+        if self._on_invalidate is not None:
+            self._on_invalidate(folder)
+
+
 def _matches_media_signature(mime: str, data: bytes) -> bool:
     return studio_paths_media.matches_media_signature(mime, data)
 
@@ -549,6 +574,8 @@ class Session(QObject):
         self.locations = {}
         self.drafts = {}
         self.windows = {}
+        self._agent_stage_queue = deque()
+        self._agent_staging_active = False
         self.custom_theme = None
         self.theme_epoch = 0
         self.theme_revision = 0
@@ -660,7 +687,72 @@ class Session(QObject):
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
-        self.workspace_links = WorkspaceLinkCache()
+        self._cache_invalidation_local = threading.local()
+        self.folder_note_index = FolderNoteIndex(
+            on_invalidate=self._on_folder_note_index_invalidated,
+        )
+        self.workspace_links = _MutualWorkspaceLinkCache(
+            on_invalidate=self._on_workspace_links_invalidated,
+        )
+
+    def _notify_quick_switcher_windows(self) -> None:
+        windows = [
+            win
+            for win in list(getattr(self, "windows", {}).values())
+            if not getattr(win, "retired", False) and getattr(win, "_quick_switcher_open", False)
+        ]
+        if not windows:
+            return
+        if threading.current_thread() is threading.main_thread():
+            for win in windows:
+                win._refresh_quick_switcher_candidates()
+        else:
+            for win in windows:
+                weak_win = weakref.ref(win)
+                QTimer.singleShot(
+                    0,
+                    win,
+                    lambda ref=weak_win: (
+                        w._refresh_quick_switcher_candidates()
+                        if (w := ref()) is not None
+                        and not getattr(w, "retired", False)
+                        and getattr(w, "_quick_switcher_open", False)
+                        else None
+                    ),
+                )
+
+    def _on_folder_note_index_invalidated(self, target_path=None) -> None:
+        if getattr(self._cache_invalidation_local, "active", False):
+            return
+        self._cache_invalidation_local.active = True
+        try:
+            links = getattr(self, "workspace_links", None)
+            if links is not None:
+                links.invalidate(target_path)
+            self._notify_quick_switcher_windows()
+        finally:
+            self._cache_invalidation_local.active = False
+
+    def _on_workspace_links_invalidated(self, target_path=None) -> None:
+        if getattr(self._cache_invalidation_local, "active", False):
+            return
+        self._cache_invalidation_local.active = True
+        try:
+            index = getattr(self, "folder_note_index", None)
+            if index is not None:
+                index.invalidate(target_path)
+            self._notify_quick_switcher_windows()
+        finally:
+            self._cache_invalidation_local.active = False
+
+    def invalidate_workspace_caches(self, target_path=None) -> None:
+        index = getattr(self, "folder_note_index", None)
+        if index is not None:
+            index.invalidate(target_path)
+        else:
+            links = getattr(self, "workspace_links", None)
+            if links is not None:
+                links.invalidate(target_path)
 
     @Slot(object)
     def _on_rename_completed(self, payload):
@@ -903,12 +995,27 @@ class Session(QObject):
         payload = tab.get("assets", {}).get(grant.source)
         return payload if isinstance(payload, str) and id(payload) == grant.embedded_identity else None
 
+    def _enqueue_agent_stage(self, runner) -> None:
+        self._agent_stage_queue.append(runner)
+        if not self._agent_staging_active:
+            self._advance_agent_stage_queue()
+
+    def _advance_agent_stage_queue(self) -> None:
+        while self._agent_stage_queue:
+            runner = self._agent_stage_queue.popleft()
+            self._agent_staging_active = True
+            if runner():
+                return
+        self._agent_staging_active = False
+
 class Studio(QObject):
     changed = Signal()
     sidebarChanged = Signal()
     tabsChanged = Signal()
     activeTabChanged = Signal()
     shortcutsChanged = Signal()
+    quickSwitcherChanged = Signal()
+    quickSwitcherIndexed = Signal(int, object)
     workspaceSearchChanged = Signal()
     workspaceSearchBatch = Signal(int, object, int, bool, bool)
     readerLoad = Signal(str)
@@ -945,6 +1052,7 @@ class Studio(QObject):
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
         self._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
+        self.quickSwitcherIndexed.connect(self._on_quick_switcher_indexed)
         self.session = session or Session(isolated)
         weak_self = weakref.ref(self)
         def _on_session_changed():
@@ -1002,6 +1110,8 @@ class Studio(QObject):
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
         self._closing_tabs: set[str] = set()
+        self._staging_tabs: set[str] = set()
+        self._max_agent_stage_attempts = 3
         self.note_watcher = QFileSystemWatcher(self)
         self.note_watcher.fileChanged.connect(self._external_note_changed)
         self.note_watcher.directoryChanged.connect(self._external_note_changed)
@@ -1035,11 +1145,19 @@ class Studio(QObject):
         self._folder_search_include_diagrams = False
         self._folder_search_matches: list[dict] = []
         self._folder_search_scanning = False
+        self._folder_search_pending = False
         self._folder_search_scanned_files = 0
         self._folder_search_truncated = False
         self._folder_search_generation = 0
         self._folder_search_cancel: threading.Event | None = None
         self._folder_search_tabs_sig: list[tuple[str, str, bool]] | None = None
+        self._quick_switcher_open = False
+        self._quick_switcher_query = ""
+        self._quick_switcher_items: list[dict] = []
+        self._quick_switcher_candidates: list[dict] = []
+        self._quick_switcher_loading = False
+        self._quick_switcher_generation = 0
+        self._quick_switcher_cancel: threading.Event | None = None
         self._pending_seeded_find: dict | None = None
         self.mode = self.settings.get("readingMode", "live")
         self.fullscreen = False
@@ -1137,8 +1255,10 @@ class Studio(QObject):
             tab.setdefault("saved_assets", dict(tab.get("assets", {})))
             tab.setdefault("assets_dirty", False)
             tab.setdefault("conflict", False)
+            tab["agent_staged"] = bool(tab.get("agent_staged", False))
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
-        self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
+        with self.session._rename_state_lock:
+            self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
         self._startup_placeholder_ids = set()
         self._welcome_placeholder_id = None
         self._touched_tab_ids = set()
@@ -1183,6 +1303,14 @@ class Studio(QObject):
             restore_expanded = list(self.session.startup_expanded)
             self.session.startup_folder = ""
             self.session.startup_expanded = []
+        pending_active_restore = bool(
+            restore_enabled
+            and self._startup_active
+            and not any(t["id"] == target_active_id for t in self.tabs)
+            and any(folder_ops.same_path(p, self._startup_active) for p in restore_paths)
+        )
+        if not pending_active_restore:
+            self._activate_tab_state(self._current())
         if restore_enabled and restore_paths:
             self._startup_order = restore_paths
             self._restoring_paths = set(self._startup_order)
@@ -1201,6 +1329,20 @@ class Studio(QObject):
 
     def _restore_cloud_connection(self):
         studio_agent_setup._restore_cloud_connection(self)
+
+    @property
+    def folder(self) -> str:
+        return getattr(self, "_folder", "")
+
+    @folder.setter
+    def folder(self, value: str) -> None:
+        previous = getattr(self, "_folder", "")
+        updated = value if isinstance(value, str) else str(value or "")
+        self._folder = updated
+        if previous and previous != updated:
+            self._invalidate_folder_index(previous)
+        if updated and updated != previous:
+            self._invalidate_folder_index(updated)
 
     @property
     def files(self): return getattr(self, "_files", [])
@@ -1246,7 +1388,25 @@ class Studio(QObject):
         assets = dict(assets) if assets else {}
         return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
                 "assets": assets, "saved_assets": dict(assets), "assets_dirty": False,
-                "portable": portable, "conflict": False}
+                "portable": portable, "conflict": False, "agent_staged": False}
+
+    def _activate_tab_state(self, tab: dict | None) -> None:
+        if not tab:
+            return
+        if tab.get("agent_staged"):
+            tab["agent_staged"] = False
+            if (
+                self.settings.get("autosave")
+                and tab.get("path")
+                and self._is_dirty(tab)
+                and not tab.get("conflict")
+            ):
+                self.autosave_timer.start(900)
+
+    def _clear_agent_staging(self, tab: dict | None) -> None:
+        if not tab:
+            return
+        tab["agent_staged"] = False
 
     def _is_dirty(self, tab: dict) -> bool:
         if tab.get("content") != tab.get("saved"):
@@ -1269,7 +1429,7 @@ class Studio(QObject):
         tab_id = tab.get("id")
         if not tab_id or tab_id in self._touched_tab_ids:
             return False
-        if self._is_dirty(tab) or tab.get("path") or tab.get("assets") or tab.get("conflict"):
+        if self._is_dirty(tab) or tab.get("agent_staged") or tab.get("path") or tab.get("assets") or tab.get("conflict"):
             return False
         session_entry = self.reader_edits.sessions.get(tab_id)
         if session_entry is not None and session_entry[1] > 0:
@@ -1516,8 +1676,237 @@ class Studio(QObject):
                 return True
         return False
 
+    def _quick_switcher_roots(self) -> list[Path]:
+        windows = [self]
+        if hasattr(self, "session") and hasattr(self.session, "windows"):
+            windows.extend(
+                win for win in self.session.windows.values()
+                if win is not self and not getattr(win, "retired", False)
+            )
+        raw_roots: list[str | Path] = []
+        for win in windows:
+            folder = getattr(win, "folder", "")
+            if folder:
+                raw_roots.append(folder)
+        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
+        if location:
+            raw_roots.append(location)
+        return normalize_workspace_roots(raw_roots)
+
+    def _quick_switcher_snapshots(self):
+        tabs_snap = [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "path": t["path"],
+                "dirty": self._is_dirty(t),
+            }
+            for t in self.tabs
+        ]
+        recent_paths = [p for p in self.recent if p]
+        pinned_paths = [p for p in self.session.pinned if p]
+        roots = self._quick_switcher_roots()
+        return tabs_snap, recent_paths, pinned_paths, roots, self.active
+
+    def _invalidate_folder_index(self, target_path: str | Path | None = None):
+        session = getattr(self, "session", None)
+        if session is not None and hasattr(session, "invalidate_workspace_caches"):
+            session.invalidate_workspace_caches(target_path)
+            return
+        index = getattr(session, "folder_note_index", None)
+        if index is not None:
+            index.invalidate(target_path)
+        links = getattr(session, "workspace_links", None)
+        if links is not None:
+            links.invalidate(target_path)
+        for win in list(getattr(session, "windows", {}).values()):
+            if not getattr(win, "retired", False) and getattr(win, "_quick_switcher_open", False):
+                win._refresh_quick_switcher_candidates()
+
+    def _cancel_quick_switcher(self, close: bool = False):
+        if self._quick_switcher_cancel is not None:
+            self._quick_switcher_cancel.set()
+            self._quick_switcher_cancel = None
+        self._quick_switcher_generation += 1
+        self._quick_switcher_loading = False
+        if close:
+            self._quick_switcher_open = False
+            self._quick_switcher_query = ""
+            self._quick_switcher_items = []
+            self._quick_switcher_candidates = []
+
+    @Property("QVariantMap", notify=quickSwitcherChanged)
+    def quickSwitcherState(self):
+        return {
+            "open": self._quick_switcher_open,
+            "query": self._quick_switcher_query,
+            "items": self._quick_switcher_items,
+            "loading": self._quick_switcher_loading,
+            "hasFolder": bool(self.folder),
+        }
+
+    def _refresh_quick_switcher_candidates(self):
+        if self.retired or not self._quick_switcher_open:
+            return
+        if self._quick_switcher_cancel is not None:
+            self._quick_switcher_cancel.set()
+            self._quick_switcher_cancel = None
+        self._quick_switcher_generation += 1
+        generation = self._quick_switcher_generation
+
+        tabs_snap, recent_paths, pinned_paths, roots, active_id = self._quick_switcher_snapshots()
+        walk_roots = coalesce_walk_roots(roots)
+        folder_index: FolderNoteIndex = self.session.folder_note_index
+
+        warm_entries: dict[str, list[dict]] = {}
+        needs_cold_walk = False
+        for root in walk_roots:
+            root_key = folder_ops.normalize_path_key(root)
+            cached = folder_index.peek_entries(root)
+            if cached is None:
+                needs_cold_walk = True
+                warm_entries[root_key] = []
+            else:
+                warm_entries[root_key] = cached
+
+        self._quick_switcher_candidates = build_quick_switcher_candidates(
+            tabs_snap,
+            recent_paths,
+            pinned_paths,
+            roots,
+            warm_entries,
+            active_id=active_id,
+        )
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self._quick_switcher_loading = needs_cold_walk and bool(walk_roots)
+        self.quickSwitcherChanged.emit()
+
+        if not walk_roots:
+            return
+
+        cancel_event = threading.Event()
+        self._quick_switcher_cancel = cancel_event
+
+        def worker():
+            refreshed: dict[str, list[dict]] = {}
+            changed = needs_cold_walk
+            for root in walk_roots:
+                if cancel_event.is_set() or self.retired:
+                    return
+                root_key = folder_ops.normalize_path_key(root)
+                entries = folder_index.get_entries(root, cancel_event=cancel_event, revalidate=True)
+                if cancel_event.is_set() or self.retired:
+                    return
+                refreshed[root_key] = entries
+                if warm_entries.get(root_key) != entries:
+                    changed = True
+            if not cancel_event.is_set() and not self.retired and (changed or needs_cold_walk):
+                self.quickSwitcherIndexed.emit(generation, refreshed)
+
+        try:
+            self._search_pool.submit(worker)
+        except RuntimeError:
+            self._quick_switcher_loading = False
+            self.quickSwitcherChanged.emit()
+
+    def _on_quick_switcher_indexed(self, generation: int, root_entries):
+        if self.retired or not self._quick_switcher_open or generation != self._quick_switcher_generation:
+            return
+        tabs_snap, recent_paths, pinned_paths, roots, active_id = self._quick_switcher_snapshots()
+        self._quick_switcher_candidates = build_quick_switcher_candidates(
+            tabs_snap,
+            recent_paths,
+            pinned_paths,
+            roots,
+            dict(root_entries),
+            active_id=active_id,
+        )
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self._quick_switcher_loading = False
+        self.quickSwitcherChanged.emit()
+
+    @Slot()
+    def openQuickSwitcher(self):
+        if self.retired:
+            return
+        self._quick_switcher_open = True
+        self._quick_switcher_query = ""
+        self._refresh_quick_switcher_candidates()
+
+    @Slot(str)
+    def setQuickSwitcherQuery(self, query: str):
+        if self.retired:
+            return
+        next_query = query if isinstance(query, str) else ""
+        if not self._quick_switcher_open:
+            self._quick_switcher_open = True
+            self._quick_switcher_query = next_query
+            self._refresh_quick_switcher_candidates()
+            return
+        if next_query == self._quick_switcher_query:
+            return
+        self._quick_switcher_query = next_query
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self.quickSwitcherChanged.emit()
+
+    @Slot()
+    def closeQuickSwitcher(self):
+        if not self._quick_switcher_open and not self._quick_switcher_loading:
+            return
+        self._cancel_quick_switcher(close=True)
+        self.quickSwitcherChanged.emit()
+
+    @Slot(str, str)
+    def activateQuickSwitcherItem(self, tab_id: str, path: str):
+        if self.retired:
+            return
+        self.closeQuickSwitcher()
+        existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
+        if existing is None and path:
+            existing = self._find_open_tab(path, canonicalize_local=True) or next(
+                (t for t in self.tabs if t.get("path") and folder_ops.same_path(t["path"], path)),
+                None,
+            )
+        for tab in self.tabs:
+            tab.pop("pendingHeading", None)
+        if existing is not None:
+            existing_path = existing.get("path") or ""
+            open_target = path or existing_path
+            if existing_path and open_target:
+                try:
+                    resolved_target = local_path(open_target)
+                    can_route_open = (
+                        not resolved_target.is_dir()
+                        and not Path(existing_path).is_symlink()
+                        and (
+                            existing_path == str(resolved_target)
+                            or folder_ops.same_path(existing_path, resolved_target)
+                            or os.path.samefile(existing_path, str(resolved_target))
+                        )
+                    )
+                except OSError:
+                    can_route_open = False
+                if can_route_open:
+                    self.openNote(open_target)
+                    return
+            self.selectTab(existing["id"])
+            self._focus_open_target(self._activation_generation)
+            return
+        if path:
+            self.openNote(path)
+
     def _watch_notes(self,force=False):
-        if self.retired:return
+        if self.retired or not _watcher_alive(self.note_watcher):
+            return
         active_suspensions = self._active_watch_suspensions()
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
         signature=(paths,self.folder,tuple(sorted(self.expanded)))
@@ -1558,7 +1947,7 @@ class Studio(QObject):
         parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
         entry_list = [(target_path, parent_str, is_dir, threading.Event(), new_path)]
         for win in list(self.session.windows.values()):
-            if win.retired:
+            if win.retired or not _watcher_alive(win.note_watcher):
                 continue
             win.note_watch_paths = None
             watched = list(win.note_watcher.files() + win.note_watcher.directories())
@@ -1629,6 +2018,8 @@ class Studio(QObject):
                 path for path in changed if not self._is_watch_target_suspended(path, current_suspensions)
             }
             self._reload_changed_content(effective_changed)
+            for changed_path in effective_changed:
+                self._invalidate_folder_index(changed_path)
             if self.folder and (effective_changed or emitted_location_change):
                 self.session.workspace_links.invalidate(self.folder)
             if self.folder and (
@@ -1697,6 +2088,9 @@ class Studio(QObject):
                     tab.update(path="",name=draft["name"],conflict=False)
                 self._remove_tab(tab["id"])
             self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
+        self._invalidate_folder_index(old)
+        if new:
+            self._invalidate_folder_index(new)
         self.session.workspace_links.invalidate()
         self._preferences();self._recover();self._emit()
 
@@ -1710,9 +2104,10 @@ class Studio(QObject):
                 or self._is_path_suspended(path, active_suspensions)
                 or not ({path,str(Path(path).parent)} & changed)
                 or tab["id"] in self.saving
+                or tab["id"] in self._staging_tabs
             ):
                 continue
-            was_dirty=self._is_dirty(tab)
+            was_dirty=self._is_dirty(tab) or bool(tab.get("agent_staged"))
             try:
                 stat_result=Path(path).stat();stamp=(stat_result.st_mtime_ns,stat_result.st_size)
             except OSError:continue
@@ -1723,7 +2118,7 @@ class Studio(QObject):
                 if error or not current:return
                 self.note_file_stamps[path]=stamp
                 content,assets,portable=result
-                if was_dirty or self._is_dirty(current) or current.get("conflict"):
+                if was_dirty or self._is_dirty(current) or current.get("agent_staged") or current.get("conflict"):
                     if content!=current["saved"] or assets!=current.get("saved_assets",{}):
                         current["conflict"]=True
                         self.message="This file changed outside Super MD. Autosave is paused for this tab."
@@ -1742,7 +2137,10 @@ class Studio(QObject):
 
     def _schedule_theme(self,*args): studio_chrome.schedule_theme(self, *args)
 
-    def _watch_palette(self): studio_chrome.watch_palette(self, palette_paths_fn=system_palette_paths)
+    def _watch_palette(self):
+        if getattr(self, "retired", False) or not _watcher_alive(getattr(self, "palette_watcher", None)):
+            return
+        studio_chrome.watch_palette(self, palette_paths_fn=system_palette_paths)
 
     def _palette_changed(self,*args): studio_chrome.palette_changed(self, *args)
 
@@ -1754,7 +2152,9 @@ class Studio(QObject):
         if self.retired: return
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
         self._cancel_subfolder_search()
+        self._cancel_quick_switcher(close=True)
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
+        self._folder_search_pending = False
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         if self._python_pool is not None:
             self._python_pool.shutdown(wait=False, cancel_futures=True)
@@ -1824,12 +2224,15 @@ class Studio(QObject):
                 except Exception:
                     pass
         if not self.session.is_quitting() and self.session.windows:
-            self.session.workspace.pop(self.window_id,None)
-            self.session.window_workspaces.pop(self.window_id,None)
+            with self.session._rename_state_lock:
+                self.session.workspace.pop(self.window_id,None)
+                self.session.window_workspaces.pop(self.window_id,None)
             next(iter(self.session.windows.values()))._recover()
         if self.system_preferences.state() != QProcess.ProcessState.NotRunning:
             self.system_preferences.terminate()
-            self.system_preferences.waitForFinished(300)
+            if not self.system_preferences.waitForFinished(300):
+                self.system_preferences.kill()
+                self.system_preferences.waitForFinished(100)
 
     def _folder_slice_key(self, files):
         return (
@@ -2022,7 +2425,8 @@ class Studio(QObject):
             "caseSensitive": self._folder_search_case_sensitive,
             "includeDiagrams": self._folder_search_include_diagrams,
             "matches": self._folder_search_matches,
-            "scanning": self._folder_search_scanning or sync_pending,
+            "pending": self._folder_search_pending,
+            "scanning": self._folder_search_scanning or self._folder_search_pending or sync_pending,
             "scannedFiles": self._folder_search_scanned_files,
             "truncated": self._folder_search_truncated,
             "hasFolder": bool(self.folder),
@@ -2052,27 +2456,52 @@ class Studio(QObject):
         folder_path = Path(self.folder) if self.folder else None
         return tabs_snap, recent_snap, folder_path, self.active
 
-    def _cancel_folder_search(self, close: bool = False):
+    def _cancel_folder_search(self, close: bool = False) -> int:
         if self._folder_search_cancel is not None:
             self._folder_search_cancel.set()
             self._folder_search_cancel = None
         self._folder_search_generation += 1
         self._folder_search_scanning = False
+        self._folder_search_pending = False
+        self._folder_search_matches = []
+        self._folder_search_scanned_files = 0
+        self._folder_search_truncated = False
+        self._folder_search_tabs_sig = None
         if close:
             self._folder_search_open = False
-            self._folder_search_matches = []
-            self._folder_search_scanned_files = 0
-            self._folder_search_truncated = False
-            self._folder_search_tabs_sig = None
             if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
                 self.flush_operation = None
                 self.flush_timer.stop()
+        return self._folder_search_generation
+
+    def _apply_folder_search_query(
+        self,
+        query: str,
+        case_sensitive: bool = False,
+        include_diagrams: bool = False,
+        *,
+        pending: bool = False,
+    ) -> None:
+        if self.retired:
+            return
+        self._folder_search_query = query if isinstance(query, str) else ""
+        self._folder_search_case_sensitive = bool(case_sensitive)
+        self._folder_search_include_diagrams = bool(include_diagrams)
+        if not self._folder_search_open:
+            self._folder_search_open = True
+        if pending and self._folder_search_query.strip():
+            self._cancel_folder_search(close=False)
+            self._folder_search_pending = True
+            self.workspaceSearchChanged.emit()
+            return
+        self._start_folder_search()
 
     @Slot()
     def openFolderSearch(self):
         if self.retired:
             return
         self._folder_search_open = True
+        self._folder_search_pending = False
         self._folder_search_tabs_sig = None
         if self.ready and self.tabs and not self.flush_operation:
             self._flush("sync_for_search")
@@ -2083,29 +2512,17 @@ class Studio(QObject):
                 self._start_folder_search()
 
     @Slot(str, bool, bool)
+    def prepareFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=True)
+
+    @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
-        if self.retired:
-            return
-        self._folder_search_query = query if isinstance(query, str) else ""
-        self._folder_search_case_sensitive = bool(case_sensitive)
-        self._folder_search_include_diagrams = bool(include_diagrams)
-        if not self._folder_search_open:
-            self._folder_search_open = True
-        self._start_folder_search()
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=False)
 
     def _start_folder_search(self):
-        if self._folder_search_cancel is not None:
-            self._folder_search_cancel.set()
-            self._folder_search_cancel = None
-        self._folder_search_generation += 1
-        generation = self._folder_search_generation
-        self._folder_search_matches = []
-        self._folder_search_scanned_files = 0
-        self._folder_search_truncated = False
+        generation = self._cancel_folder_search(close=False)
         query = self._folder_search_query
         if not query or not query.strip():
-            self._folder_search_scanning = False
-            self._folder_search_tabs_sig = None
             self.workspaceSearchChanged.emit()
             return
         cancel_event = threading.Event()
@@ -2155,14 +2572,14 @@ class Studio(QObject):
 
     @Slot()
     def closeFolderSearch(self):
-        if not self._folder_search_open and not self._folder_search_scanning:
+        if not self._folder_search_open and not self._folder_search_scanning and not self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
 
     @Slot()
     def cancelWorkspaceSearch(self):
-        changed = self._folder_search_open or self._folder_search_scanning
+        changed = self._folder_search_open or self._folder_search_scanning or self._folder_search_pending
         self._cancel_folder_search(close=True)
         if changed:
             self.workspaceSearchChanged.emit()
@@ -2180,7 +2597,7 @@ class Studio(QObject):
         source_end: int = -1,
         match_text: str = "",
     ):
-        if self.retired:
+        if self.retired or self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
@@ -2451,7 +2868,7 @@ class Studio(QObject):
         return studio_runtime.install_update(self, updates_mod=updates, app_integration_mod=app_integration, open_url_fn=QDesktopServices.openUrl, start_detached_fn=QProcess.startDetached)
 
     def _can_move(self):
-        return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
+        return not (self.retired or self.busy or self.saving or self._staging_tabs or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
 
     @Slot(str, str, result=bool)
     def canReceiveTab(self, source_id, tab_id):
@@ -2483,12 +2900,16 @@ class Studio(QObject):
         self.session.reader_assets.revoke_tab(self.window_id, tab_id)
         target.tabs.insert(max(0, min(len(target.tabs), index)), note)
         target.active = tab_id
+        target._activate_tab_state(note)
         emptied = not self.tabs
         if emptied: self.tabs.append(self._note("Untitled.md"))
-        if self.active == tab_id: self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
+        if self.active == tab_id:
+            self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
+            self._activate_tab_state(self._current())
         # Update both owners before writing one recovery snapshot: never duplicate
         # or temporarily lose a dirty note in the durable recovery stream.
-        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])]
+        with self.session._rename_state_lock:
+            self.session.drafts[self.window_id] = self._window_recovery_drafts()
         target._recover()
         self._emit(); target._emit()
         if emptied: QTimer.singleShot(0, self.allowClose.emit)
@@ -2560,7 +2981,10 @@ class Studio(QObject):
 
     def _clear_theme_background_overrides(self): studio_chrome.clear_theme_background_overrides(self)
 
-    def _watch_custom_theme(self): studio_chrome.watch_custom_theme(self)
+    def _watch_custom_theme(self):
+        if getattr(self, "retired", False) or not _watcher_alive(getattr(self, "custom_theme_watcher", None)):
+            return
+        studio_chrome.watch_custom_theme(self)
 
     def _custom_theme_event(self): studio_chrome.custom_theme_event(self)
 
@@ -2607,7 +3031,11 @@ class Studio(QObject):
     def setNoteLocation(self, value):
         directory = local_path(value)
         if directory.is_dir():
-            self.settings["newNoteLocation"] = str(directory)
+            old_location = self.settings.get("newNoteLocation")
+            self.settings["newNoteLocation"] = folder_ops.canonical_path_str(directory)
+            if old_location:
+                self._invalidate_folder_index(old_location)
+            self._invalidate_folder_index(directory)
             self._preferences(); self._emit(False)
 
     @Slot(str)
@@ -2720,6 +3148,46 @@ class Studio(QObject):
             self._pending_write_retirements.pop(token, None)
         done(value, error)
 
+    def _submit_exact_recovery_write(self, action, done, *, on_retired=None, on_enqueued=None):
+        token = uuid.uuid4().hex
+        invoked = False
+
+        def notify_retired():
+            nonlocal invoked
+            with self._write_callback_lock:
+                if invoked:
+                    return
+                invoked = True
+                self._pending_write_retirements.pop(token, None)
+            if on_retired is not None:
+                on_retired()
+
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            notify_retired()
+            return False
+
+        if on_retired is not None:
+            with self._write_callback_lock:
+                self._pending_write_retirements[token] = notify_retired
+
+        def exact_completed(status, rev, error):
+            if self.retired:
+                notify_retired()
+                return
+            try:
+                self.backgroundWriteCompleted.emit((token, done, notify_retired, (status, rev, error), None))
+            except RuntimeError:
+                notify_retired()
+
+        try:
+            self.writes.submit_latest_exact(
+                "recovery", action, None, exact_completed, on_enqueued=on_enqueued
+            )
+        except RuntimeError:
+            notify_retired()
+            return False
+        return True
+
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
         persisted_settings = dict(self.settings)
@@ -2733,45 +3201,77 @@ class Studio(QObject):
         data=json.dumps(self.session.locations).encode()
         self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
 
-    def _recover(self):
+    def _build_startup_snapshot_locked(self):
         # Clean tabs need only paths, never another copy of their image bytes.
+        window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t) or t.get("agent_staged")]
+        self.session.workspace[self.window_id] = window_tabs
+        self.session.window_workspaces[self.window_id] = {
+            "folder": self.folder,
+            "expanded": sorted(self.expanded) if self.folder else [],
+            "active": self._current()["path"],
+            "activeId": self.active,
+        }
+        self.session._last_recovered_window_id = self.window_id
+        entries = [dict(entry) for tabs in self.session.workspace.values() for entry in tabs]
+        windows_payload = []
+        for wid, w_tabs in self.session.workspace.items():
+            meta = self.session.window_workspaces.get(wid, {})
+            w_folder = meta.get("folder", "")
+            windows_payload.append({
+                "windowId": wid,
+                "tabs": [dict(t) for t in w_tabs],
+                "active": meta.get("active", ""),
+                "activeId": meta.get("activeId", ""),
+                "folder": w_folder,
+                "expanded": list(meta.get("expanded", [])) if w_folder else [],
+            })
+        primary_folder = windows_payload[0]["folder"] if windows_payload else self.folder
+        primary_expanded = windows_payload[0]["expanded"] if windows_payload else (sorted(self.expanded) if self.folder else [])
+        return {
+            "paths": list(dict.fromkeys(t["path"] for t in entries if t["path"])),
+            "tabs": entries,
+            "active": self._current()["path"],
+            "activeId": self.active,
+            "folder": primary_folder,
+            "expanded": primary_expanded,
+            "windows": windows_payload,
+        }
+
+    def _submit_startup_snapshot(self):
         with self.session._rename_state_lock:
-            window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t)]
-            self.session.workspace[self.window_id] = window_tabs
-            self.session.window_workspaces[self.window_id] = {
-                "folder": self.folder,
-                "expanded": sorted(self.expanded) if self.folder else [],
-                "active": self._current()["path"],
-                "activeId": self.active,
-            }
-            self.session._last_recovered_window_id = self.window_id
-            entries = [dict(entry) for tabs in self.session.workspace.values() for entry in tabs]
-            windows_payload = []
-            for wid, w_tabs in self.session.workspace.items():
-                meta = self.session.window_workspaces.get(wid, {})
-                w_folder = meta.get("folder", "")
-                windows_payload.append({
-                    "windowId": wid,
-                    "tabs": [dict(t) for t in w_tabs],
-                    "active": meta.get("active", ""),
-                    "activeId": meta.get("activeId", ""),
-                    "folder": w_folder,
-                    "expanded": list(meta.get("expanded", [])) if w_folder else [],
-                })
-            primary_folder = windows_payload[0]["folder"] if windows_payload else self.folder
-            primary_expanded = windows_payload[0]["expanded"] if windows_payload else (sorted(self.expanded) if self.folder else [])
-            workspace = {
-                "paths": list(dict.fromkeys(t["path"] for t in entries if t["path"])),
-                "tabs": entries,
-                "active": self._current()["path"],
-                "activeId": self.active,
-                "folder": primary_folder,
-                "expanded": primary_expanded,
-                "windows": windows_payload,
-            }
-            # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
-            self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])]
-            drafts = [_snapshot_tab_state(tab, include_view_state=False) for tabs in self.session.drafts.values() for tab in tabs]
+            workspace = self._build_startup_snapshot_locked()
+        self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
+
+    def _window_recovery_drafts(self, tabs=None):
+        source_tabs = self.tabs if tabs is None else tabs
+        return [
+            _snapshot_tab_state(t, include_view_state=False)
+            for t in source_tabs
+            if (self._is_dirty(t) or t.get("agent_staged"))
+            and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged"))
+        ]
+
+    def _combined_recovery_drafts(self, window_drafts):
+        with self.session._rename_state_lock:
+            combined = []
+            replaced = False
+            for wid, tabs in self.session.drafts.items():
+                if wid == self.window_id:
+                    combined.extend(_snapshot_tab_state(tab, include_view_state=False) for tab in window_drafts)
+                    replaced = True
+                else:
+                    combined.extend(_snapshot_tab_state(tab, include_view_state=False) for tab in tabs)
+            if not replaced:
+                combined.extend(_snapshot_tab_state(tab, include_view_state=False) for tab in window_drafts)
+            return combined
+
+    def _recover(self):
+        with self.session._rename_state_lock:
+            workspace = self._build_startup_snapshot_locked()
+            # Snapshot only unsaved or agent-staged tabs. Asset bytes stay in recovery, never in displayed source.
+            window_drafts = self._window_recovery_drafts()
+            self.session.drafts[self.window_id] = window_drafts
+            drafts = self._combined_recovery_drafts(window_drafts)
         self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
         self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
 
@@ -3000,6 +3500,8 @@ class Studio(QObject):
         def finished(result, error):
             self._restoring_paths.discard(str(path))
             if error:
+                if restoring and not self._restoring_paths and activation_generation == self._activation_generation:
+                    self._activate_tab_state(self._current())
                 if completion_callback: completion_callback(None, error)
                 return
             content, assets, portable = result
@@ -3037,8 +3539,11 @@ class Studio(QObject):
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
             if should_activate:
                 self.active = note["id"]
+                self._activate_tab_state(note)
                 if pending_heading:
                     note["pendingHeading"] = pending_heading
+            elif restoring and not self._restoring_paths and activation_generation == self._activation_generation:
+                self._activate_tab_state(self._current())
             self.settings["welcomed"] = True
             canon_note_path = folder_ops.canonical_path_str(path)
             self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
@@ -3077,6 +3582,7 @@ class Studio(QObject):
             return
         if id!=self.active and any(t["id"] == id for t in self.tabs):
             self.active = id
+            self._activate_tab_state(self._current())
             self.recovery_timer.start(800)
             self._emit()
 
@@ -3122,13 +3628,18 @@ class Studio(QObject):
                 self._emit(False);return
             existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
             if existing:
-                if activation_generation==self._activation_generation:self.active=existing["id"]
+                if activation_generation==self._activation_generation:
+                    self.active=existing["id"]
+                    self._activate_tab_state(existing)
             else:
+                note["agent_staged"] = bool(note.get("agent_staged", False))
                 self.tabs.append(note)
                 if note.get("path"):
                     try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
                     except OSError:pass
-                if activation_generation==self._activation_generation:self.active=note["id"]
+                if activation_generation==self._activation_generation:
+                    self.active=note["id"]
+                    self._activate_tab_state(note)
             self.closed_tabs[:]=next_refs
             self._recover();self._emit()
         def read_note():
@@ -3567,11 +4078,14 @@ class Studio(QObject):
         elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
-                current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
-                if current_sig != self._folder_search_tabs_sig:
-                    self._start_folder_search()
-                else:
+                if self._folder_search_pending:
                     self.workspaceSearchChanged.emit()
+                else:
+                    current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
+                    if current_sig != self._folder_search_tabs_sig:
+                        self._start_folder_search()
+                    else:
+                        self.workspaceSearchChanged.emit()
         elif operation["action"] == "open_search_match":
             request = json.loads(operation["target"])
             tab_id = request.get("tabId") or ""
@@ -3756,6 +4270,7 @@ class Studio(QObject):
                 assets_dirty=bool(archived_assets),
                 portable=bool(captured.get("portable")),
                 conflict=False,
+                agent_staged=False,
             )
 
         def work():
@@ -3822,6 +4337,7 @@ class Studio(QObject):
                 portable=portable,
                 conflict=False,
             )
+            self._clear_agent_staging(target)
             self.message = "Reloaded note from disk"
             self._recover()
             self._emit(load=tab_id == self.active)
@@ -3837,7 +4353,7 @@ class Studio(QObject):
         except OSError:
             same_path = str(path) == original_path
         portable = bool(force_portable or path.suffix.lower() == ".smd" or (tab["portable"] and same_path))
-        if id in self.saving: return
+        if id in self.saving or id in self._staging_tabs: return
         self.saving.add(id)
         def finished(outcome, error):
             self.saving.discard(id)
@@ -3867,6 +4383,12 @@ class Studio(QObject):
                     portable=portable,
                     conflict=False,
                 )
+                if not automatic:
+                    self._clear_agent_staging(target)
+                if not automatic or str(path) != original_path:
+                    self._invalidate_folder_index(path)
+                    if original_path and str(path) != original_path:
+                        self._invalidate_folder_index(original_path)
                 try:
                     self._agent_open_paths.add(str(Path(path).resolve()))
                 except OSError:
@@ -3875,7 +4397,7 @@ class Studio(QObject):
                     self.session.workspace_links.invalidate(path.parent)
                     self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                     self._preferences()
-                if automatic and self._is_dirty(target): self.autosave_timer.start(900)
+                if automatic and self._is_dirty(target) and not target.get("agent_staged"): self.autosave_timer.start(900)
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
@@ -3913,7 +4435,7 @@ class Studio(QObject):
     def _autosave(self):
         if not self.settings["autosave"]: return
         for tab in self.tabs:
-            if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and tab["id"] not in self.saving:
+            if tab["path"] and self._is_dirty(tab) and not tab.get("agent_staged") and not tab.get("conflict") and tab["id"] not in self.saving and tab["id"] not in self._staging_tabs:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = "", on_rebound=None):
@@ -3985,9 +4507,11 @@ class Studio(QObject):
             win._recover()
             if win.folder:
                 win._load_tree()
-            if win._folder_search_open and win._folder_search_query.strip():
+            if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
                 win._start_folder_search()
             win._emit()
+        self._invalidate_folder_index(old_path)
+        self._invalidate_folder_index(new_path)
 
     @Slot(str)
     def notifyMessage(self, text):
@@ -4026,11 +4550,14 @@ class Studio(QObject):
                 write_portable(target, "", {})
             else:
                 atomic_write(target, b"")
-            return folder_ops.canonical_path_str(target.resolve(strict=True))
+            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+            self.session.folder_note_index.invalidate(created_str)
+            return created_str
 
         def finished(created_path, error):
             if error or not created_path:
                 return
+            self._invalidate_folder_index(created_path)
             self.session.workspace_links.invalidate(self.folder)
             created = Path(created_path)
             for win in list(self.session.windows.values()):
@@ -4085,11 +4612,14 @@ class Studio(QObject):
             if target.exists() or folder_ops._is_link_or_junction(target):
                 raise ValueError("An item with that name already exists.")
             target.mkdir(parents=False, exist_ok=False)
-            return folder_ops.canonical_path_str(target.resolve(strict=True))
+            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+            self.session.folder_note_index.invalidate(created_str)
+            return created_str
 
         def finished(created_dir, error):
             if error or not created_dir:
                 return
+            self._invalidate_folder_index(created_dir)
             self.session.workspace_links.invalidate(self.folder)
             created = Path(created_dir)
             for win in list(self.session.windows.values()):
@@ -4316,7 +4846,7 @@ class Studio(QObject):
             return
         for win in list(self.session.windows.values()):
             for tab in win.tabs:
-                if tab["id"] in win.saving and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
+                if (tab["id"] in win.saving or tab["id"] in win._staging_tabs) and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
                     self.message = "Wait for the current save to finish."
                     self._emit(False)
                     return
@@ -4333,7 +4863,7 @@ class Studio(QObject):
     @Slot(str, str)
     def renameNote(self, id, name):
         tab = next((t for t in self.tabs if t["id"] == id), None)
-        if not tab or id in self.saving: return
+        if not tab or id in self.saving or id in self._staging_tabs: return
         try:
             has_saved = bool(tab.get("path"))
             existing_ext = folder_ops.note_extension(tab["name"])
@@ -4507,6 +5037,7 @@ class Studio(QObject):
         if self.active == id:
             self._activation_generation += 1
             self.active = self.tabs[min(current_index, len(self.tabs)-1)]["id"]
+            self._activate_tab_state(self._current())
         self._recover()
         self._emit()
 
@@ -4599,7 +5130,7 @@ class Studio(QObject):
         elif action == "window": self.newWindowRequested.emit()
 
     def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
-        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
+        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}[format]
         selected = filename or Path(tab["name"]).stem or "Super MD export"
         if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
             raise ValueError("Export filename must be a basename")
@@ -4634,35 +5165,513 @@ class Studio(QObject):
     def _agent_export_chunk(self, job_id, offset=0, limit=262_144):
         return studio_exports.agent_export_chunk(self, job_id, offset, limit)
 
+    _RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot; the edit was not applied. Retry patch_tab."
+    _RECOVERY_ERROR_SUPERSEDED = "Draft recovery write was superseded before staging completed; retry patch_tab."
+    _RECOVERY_NOTICE = "Couldn't save draft recovery data. Keep Super MD open and retry."
+
+    def _validate_and_compute_patch_tab(self, args: dict, *, bridge_revision_json: bool = False):
+        tab_id = args.get("tabId")
+        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+        if tab is None or tab_id in getattr(self, "_closing_tabs", ()):
+            raise ValueError("The requested live tab is no longer open")
+        staging_tabs = getattr(self, "_staging_tabs", None)
+        if staging_tabs is not None and tab_id in staging_tabs:
+            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
+        saving = getattr(self, "saving", None)
+        if saving is not None and tab_id in saving:
+            raise ValueError("A save is already in progress for this tab; retry after it finishes")
+        expected = args.get("expectedRevision")
+        previous = tab["content"]
+        revision = hashlib.sha256(previous.encode("utf-8")).hexdigest()
+        if not isinstance(expected, str) or expected != revision:
+            if bridge_revision_json and expected is not None:
+                raise ValueError(json.dumps({
+                    "error": "Revision conflict; inspect the current note before retrying",
+                    "currentRevision": revision,
+                    "sourceLength": len(previous),
+                }))
+            raise ValueError("Live tab revision changed; inspect it again before editing")
+        operations = args.get("operations")
+        if not isinstance(operations, list) or len(operations) > 100:
+            raise ValueError("operations must contain at most 100 edits")
+        if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > 64_000:
+            raise ValueError("Patch operations exceed the 64 KB limit")
+        from agent_documents import apply_patch_operations_detailed
+        edited, operation_results = apply_patch_operations_detailed(previous, operations)
+        changed = edited != previous
+        return tab, tab_id, previous, revision, edited, operation_results, changed
+
+    def _build_staged_recovery_candidate(self, tab_id: str, current_tab: dict, edited: str, changed: bool) -> list:
+        if changed:
+            candidate_tab = {
+                **current_tab,
+                "content": edited,
+                "agent_staged": True,
+            }
+        else:
+            candidate_tab = dict(current_tab)
+        with self.session._rename_state_lock:
+            replaced_tabs = [candidate_tab if item["id"] == tab_id else item for item in self.tabs]
+            window_drafts = self._window_recovery_drafts(replaced_tabs)
+            return self._combined_recovery_drafts(window_drafts)
+
+    def _commit_staged_patch_tab(
+        self,
+        current_tab: dict,
+        tab_id: str,
+        edited: str,
+        operation_results: list,
+        changed: bool,
+    ) -> dict:
+        if changed:
+            current_tab["content"] = edited
+            if self.active != tab_id:
+                current_tab["agent_staged"] = True
+            else:
+                current_tab["agent_staged"] = False
+                if (
+                    self.settings.get("autosave")
+                    and current_tab.get("path")
+                    and self._is_dirty(current_tab)
+                    and not current_tab.get("conflict")
+                ):
+                    self.autosave_timer.start(900)
+        if getattr(self, "message", "") == self._RECOVERY_NOTICE:
+            self.message = ""
+        with self.session._rename_state_lock:
+            self.session.drafts[self.window_id] = self._window_recovery_drafts()
+        if changed and self.active == tab_id:
+            self._recover()
+        else:
+            self._submit_startup_snapshot()
+        if changed:
+            self._emit(load=(self.active == tab_id))
+        return {
+            "tabId": tab_id,
+            "windowId": self.window_id,
+            "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
+            "sourceLength": len(edited),
+            "changed": changed,
+            "applied": len(operation_results),
+            "operation_results": operation_results,
+            "isDirty": edited != current_tab["saved"],
+        }
+
+    def _make_staged_recovery_write_action(
+        self,
+        tab_id: str,
+        previous: str,
+        candidate_path: str,
+        snapshot: list,
+        decision_lock: threading.Lock,
+        attempt_state: dict,
+        rev_holder: list[int],
+        wrote_holder: list[bool],
+    ):
+        recovery_path = self.data / "recovery.json"
+
+        def should_abort_locked() -> bool:
+            if (
+                attempt_state["decided"]
+                or self.retired
+                or getattr(self.writes, "_shutdown", False)
+                or self.writes.latest_revision("recovery") != rev_holder[0]
+            ):
+                return True
+            live_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+            return (
+                live_tab is None
+                or tab_id in self._closing_tabs
+                or live_tab["content"] != previous
+                or live_tab.get("path", "") != candidate_path
+            )
+
+        def should_abort() -> bool:
+            with decision_lock:
+                return should_abort_locked()
+
+        def write_action() -> None:
+            with decision_lock:
+                if should_abort_locked():
+                    if not attempt_state["decided"]:
+                        attempt_state["decided"] = True
+                        attempt_state["outcome"] = "aborted"
+                    raise ExactWriteAborted()
+            prior_bytes = recovery_path.read_bytes() if recovery_path.exists() else None
+            with stage_atomic_json(recovery_path, abort_check=should_abort) as staged:
+                atomic_json(recovery_path, snapshot)
+                with decision_lock:
+                    if should_abort_locked():
+                        if not attempt_state["decided"]:
+                            attempt_state["decided"] = True
+                            attempt_state["outcome"] = "aborted"
+                        if staged.intercepted:
+                            staged.discard()
+                        else:
+                            if prior_bytes is None:
+                                if recovery_path.exists():
+                                    recovery_path.unlink()
+                            else:
+                                atomic_write(recovery_path, prior_bytes)
+                        raise ExactWriteAborted()
+                    if staged.intercepted:
+                        staged.publish(recovery_path)
+                    attempt_state["decided"] = True
+                    attempt_state["outcome"] = "published"
+                    wrote_holder[0] = True
+
+        return write_action
+
+    def _stage_inactive_patch_tab_sync(self, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool) -> dict:
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            raise ValueError("The target desktop window was closed")
+        max_attempts = max(1, int(getattr(self, "_max_agent_stage_attempts", 3)))
+        timeout = float(getattr(self, "_agent_stage_sync_timeout", 10.0))
+        had_recovery_timer = self.recovery_timer.isActive()
+        if had_recovery_timer:
+            self.recovery_timer.stop()
+        any_wrote_candidate = False
+        self._staging_tabs.add(tab_id)
+        try:
+            for attempt in range(max_attempts):
+                if self.retired or getattr(self.writes, "_shutdown", False):
+                    if any_wrote_candidate and not getattr(self.writes, "_shutdown", False):
+                        self._recover()
+                    raise ValueError("The target desktop window was closed")
+                current_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if current_tab is None or tab_id in self._closing_tabs:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("The requested live tab is no longer open")
+                if current_tab["content"] != previous:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("Live tab revision changed; inspect it again before editing")
+                if self.recovery_timer.isActive():
+                    had_recovery_timer = True
+                    self.recovery_timer.stop()
+                candidate_path = current_tab.get("path", "")
+                all_drafts = self._build_staged_recovery_candidate(
+                    tab_id, current_tab, edited, changed
+                )
+                decision_lock = threading.Lock()
+                attempt_state = {"decided": False, "outcome": None}
+                rev_holder = [0]
+                wrote_holder = [False]
+                write_action = self._make_staged_recovery_write_action(
+                    tab_id, previous, candidate_path, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder
+                )
+                rev, outcome = self.writes.submit_latest_exact(
+                    "recovery",
+                    write_action,
+                    on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev),
+                )
+                try:
+                    status, _done_rev, write_error = outcome.result(timeout=timeout)
+                except concurrent.futures.TimeoutError as exc:
+                    with decision_lock:
+                        if not attempt_state["decided"]:
+                            attempt_state["decided"] = True
+                            attempt_state["outcome"] = "timed_out"
+                        published = attempt_state["outcome"] == "published"
+                    if not published:
+                        if any_wrote_candidate:
+                            self._recover()
+                        elif had_recovery_timer:
+                            self.recovery_timer.start(800)
+                        raise RuntimeError(self._RECOVERY_ERROR_FAILED) from exc
+                    try:
+                        status, _done_rev, write_error = outcome.result(timeout=2.0)
+                    except concurrent.futures.TimeoutError as post_exc:
+                        self._recover()
+                        raise RuntimeError(self._RECOVERY_ERROR_FAILED) from post_exc
+                if wrote_holder[0]:
+                    any_wrote_candidate = True
+                if self.retired or getattr(self.writes, "_shutdown", False):
+                    raise ValueError("The target desktop window was closed")
+                now_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if now_tab is None or tab_id in self._closing_tabs:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("The requested live tab is no longer open")
+                if now_tab["content"] != previous:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("Live tab revision changed; inspect it again before editing")
+                if status == "failed" or write_error is not None:
+                    if any_wrote_candidate:
+                        self._recover()
+                    elif had_recovery_timer:
+                        self.recovery_timer.start(800)
+                    raise RuntimeError(self._RECOVERY_ERROR_FAILED) from write_error
+                if (
+                    status == "committed"
+                    and self.writes.committed_revision("recovery") == rev
+                    and self.writes.latest_revision("recovery") == rev
+                    and now_tab.get("path", "") == candidate_path
+                ):
+                    return self._commit_staged_patch_tab(
+                        now_tab, tab_id, edited, operation_results, changed
+                    )
+                if attempt + 1 < max_attempts:
+                    continue
+                if any_wrote_candidate:
+                    self._recover()
+                elif had_recovery_timer:
+                    self.recovery_timer.start(800)
+                raise RuntimeError(self._RECOVERY_ERROR_SUPERSEDED)
+            raise RuntimeError(self._RECOVERY_ERROR_SUPERSEDED)
+        finally:
+            self._staging_tabs.discard(tab_id)
+
+    def _stage_inactive_patch_tab_async(
+        self,
+        args,
+        on_complete,
+        *,
+        register_cancel=None,
+        is_cancelled=None,
+    ) -> None:
+        tab, tab_id, previous, revision, edited, operation_results, changed = self._validate_and_compute_patch_tab(
+            args, bridge_revision_json=True
+        )
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            raise ValueError("The target desktop window was closed")
+        if tab_id == self.active:
+            result = self._agent_document_action(args)
+            on_complete(result, None)
+            return
+        if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged")):
+            on_complete({
+                "tabId": tab_id,
+                "windowId": self.window_id,
+                "revision": revision,
+                "sourceLength": len(edited),
+                "changed": False,
+                "applied": len(operation_results),
+                "operation_results": operation_results,
+                "isDirty": False,
+            }, None)
+            return
+
+        max_attempts = max(1, int(getattr(self, "_max_agent_stage_attempts", 3)))
+        queue_token = uuid.uuid4().hex
+        finished_flag = False
+        active_in_queue = False
+        had_recovery_timer = False
+        any_wrote_candidate = False
+        stage_lock = threading.Lock()
+        stage_cancelled = False
+        current_attempt: tuple[threading.Lock, dict] | None = None
+
+        self._staging_tabs.add(tab_id)
+
+        def finish_stage(result, error):
+            nonlocal finished_flag
+            if finished_flag:
+                return
+            finished_flag = True
+            with self._write_callback_lock:
+                self._pending_write_retirements.pop(queue_token, None)
+            self._staging_tabs.discard(tab_id)
+            if active_in_queue:
+                self.session._advance_agent_stage_queue()
+            on_complete(result, error)
+
+        def finish_cancelled_on_ui(_result=None, _error=None):
+            if finished_flag:
+                return
+            if any_wrote_candidate and not self.retired and not getattr(self.writes, "_shutdown", False):
+                self._recover()
+            elif had_recovery_timer and not self.retired:
+                self.recovery_timer.start(800)
+            finish_stage(None, self._RECOVERY_ERROR_FAILED)
+
+        def cancel_stage() -> bool:
+            nonlocal stage_cancelled
+            with stage_lock:
+                active_attempt = current_attempt
+                if active_attempt is None:
+                    stage_cancelled = True
+                    published = False
+                else:
+                    d_lock, a_state = active_attempt
+                    with d_lock:
+                        if not a_state["decided"]:
+                            a_state["decided"] = True
+                            a_state["outcome"] = "timed_out"
+                        published = a_state["outcome"] == "published"
+                    if not published:
+                        stage_cancelled = True
+            if not published:
+                try:
+                    self.completed.emit((finish_cancelled_on_ui, None, None, False))
+                except RuntimeError:
+                    pass
+            return published
+
+        if callable(register_cancel):
+            register_cancel(cancel_stage)
+
+        with self._write_callback_lock:
+            self._pending_write_retirements[queue_token] = lambda: finish_stage(
+                None, "The target desktop window was closed"
+            )
+
+        def run_attempt(attempt: int) -> None:
+            nonlocal had_recovery_timer, any_wrote_candidate, current_attempt
+            if finished_flag:
+                return
+            with stage_lock:
+                cancelled_now = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
+            if cancelled_now:
+                finish_cancelled_on_ui()
+                return
+            if self.retired or getattr(self.writes, "_shutdown", False):
+                if any_wrote_candidate and not getattr(self.writes, "_shutdown", False):
+                    self._recover()
+                finish_stage(None, "The target desktop window was closed")
+                return
+            current_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+            if current_tab is None or tab_id in self._closing_tabs:
+                if any_wrote_candidate:
+                    self._recover()
+                finish_stage(None, "The requested live tab is no longer open")
+                return
+            if current_tab["content"] != previous:
+                if any_wrote_candidate:
+                    self._recover()
+                cur_rev = hashlib.sha256(current_tab["content"].encode("utf-8")).hexdigest()
+                finish_stage(None, json.dumps({
+                    "error": "Revision conflict; inspect the current note before retrying",
+                    "currentRevision": cur_rev,
+                    "sourceLength": len(current_tab["content"]),
+                }))
+                return
+            if self.recovery_timer.isActive():
+                had_recovery_timer = True
+                self.recovery_timer.stop()
+            candidate_path = current_tab.get("path", "")
+            all_drafts = self._build_staged_recovery_candidate(
+                tab_id, current_tab, edited, changed
+            )
+            decision_lock = threading.Lock()
+            attempt_state = {"decided": False, "outcome": None}
+            with stage_lock:
+                if stage_cancelled or (callable(is_cancelled) and bool(is_cancelled())):
+                    finish_cancelled_on_ui()
+                    return
+                current_attempt = (decision_lock, attempt_state)
+            rev_holder = [0]
+            wrote_holder = [False]
+            write_action = self._make_staged_recovery_write_action(
+                tab_id, previous, candidate_path, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder
+            )
+
+            def on_write_done(outcome_tuple, _err_str):
+                nonlocal any_wrote_candidate
+                if finished_flag:
+                    return
+                status, rev, write_error = outcome_tuple
+                if wrote_holder[0]:
+                    any_wrote_candidate = True
+                with stage_lock:
+                    cancelled_after = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
+                if cancelled_after:
+                    finish_cancelled_on_ui()
+                    return
+                if self.retired or getattr(self.writes, "_shutdown", False):
+                    finish_stage(None, "The target desktop window was closed")
+                    return
+                now_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if now_tab is None or tab_id in self._closing_tabs:
+                    if any_wrote_candidate:
+                        self._recover()
+                    finish_stage(None, "The requested live tab is no longer open")
+                    return
+                if now_tab["content"] != previous:
+                    if any_wrote_candidate:
+                        self._recover()
+                    cur_rev = hashlib.sha256(now_tab["content"].encode("utf-8")).hexdigest()
+                    finish_stage(None, json.dumps({
+                        "error": "Revision conflict; inspect the current note before retrying",
+                        "currentRevision": cur_rev,
+                        "sourceLength": len(now_tab["content"]),
+                    }))
+                    return
+                if status == "failed" or write_error is not None:
+                    if any_wrote_candidate:
+                        self._recover()
+                    elif had_recovery_timer:
+                        self.recovery_timer.start(800)
+                    finish_stage(None, self._RECOVERY_ERROR_FAILED)
+                    return
+                if (
+                    status == "committed"
+                    and self.writes.committed_revision("recovery") == rev
+                    and self.writes.latest_revision("recovery") == rev
+                    and now_tab.get("path", "") == candidate_path
+                ):
+                    result = self._commit_staged_patch_tab(
+                        now_tab, tab_id, edited, operation_results, changed
+                    )
+                    finish_stage(result, None)
+                    return
+                if attempt + 1 < max_attempts:
+                    run_attempt(attempt + 1)
+                    return
+                if any_wrote_candidate:
+                    self._recover()
+                elif had_recovery_timer:
+                    self.recovery_timer.start(800)
+                finish_stage(None, self._RECOVERY_ERROR_SUPERSEDED)
+
+            self._submit_exact_recovery_write(
+                write_action,
+                on_write_done,
+                on_retired=lambda: finish_stage(None, "The target desktop window was closed"),
+                on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev),
+            )
+
+        def start_queued() -> bool:
+            nonlocal active_in_queue
+            if finished_flag:
+                return False
+            with stage_lock:
+                cancelled_before_start = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
+            if cancelled_before_start:
+                finish_cancelled_on_ui()
+                return False
+            with self._write_callback_lock:
+                self._pending_write_retirements.pop(queue_token, None)
+            active_in_queue = True
+            run_attempt(0)
+            return not finished_flag
+
+        self.session._enqueue_agent_stage(start_queued)
+
     def _agent_document_action(self, args):
         action = args.get("action")
         if action == "patch_tab":
-            tab_id = args.get("tabId")
-            tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-            if tab is None:
-                raise ValueError("The requested live tab is no longer open")
-            expected = args.get("expectedRevision")
-            revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
-            if not isinstance(expected, str) or expected != revision:
-                raise ValueError("Live tab revision changed; inspect it again before editing")
-            operations = args.get("operations")
-            if not isinstance(operations, list) or len(operations) > 100:
-                raise ValueError("operations must contain at most 100 edits")
-            if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > 64_000:
-                raise ValueError("Patch operations exceed the 64 KB limit")
-            from agent_documents import apply_patch_operations_detailed
-            edited, operation_results = apply_patch_operations_detailed(tab["content"], operations)
-            changed = edited != tab["content"]
-            if changed:
-                tab["content"] = edited
-                self.recovery_timer.start(800)
-                self.autosave_timer.start(900)
-                self._emit(load=tab_id == self.active)
-            return {"tabId": tab_id, "windowId": self.window_id,
-                    "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
-                    "sourceLength": len(edited), "changed": changed,
-                    "applied": len(operation_results), "operation_results": operation_results,
-                    "isDirty": edited != tab["saved"]}
+            tab, tab_id, previous, revision, edited, operation_results, changed = self._validate_and_compute_patch_tab(args)
+            if tab_id == self.active:
+                if changed:
+                    tab["content"] = edited
+                    self.recovery_timer.start(800)
+                    self.autosave_timer.start(900)
+                    self._emit(load=True)
+                return {"tabId": tab_id, "windowId": self.window_id,
+                        "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
+                        "sourceLength": len(edited), "changed": changed,
+                        "applied": len(operation_results), "operation_results": operation_results,
+                        "isDirty": edited != tab["saved"]}
+            if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged")):
+                return {"tabId": tab_id, "windowId": self.window_id,
+                        "revision": revision,
+                        "sourceLength": len(edited), "changed": False,
+                        "applied": len(operation_results), "operation_results": operation_results,
+                        "isDirty": False}
+            return self._stage_inactive_patch_tab_sync(tab_id, previous, edited, operation_results, changed)
         if action == "replace_tab_asset":
             return self._replace_tab_asset_native(args)
         if action == "asset_action" and args.get("assetAction") == "attach":
@@ -4707,6 +5716,9 @@ class Studio(QObject):
             tab = next((item for item in self.tabs if item["id"] == tab_id), None)
             if tab is None:
                 raise ValueError("The requested live tab is no longer open")
+            staging = getattr(self, "_staging_tabs", None)
+            if staging is not None and tab_id in staging:
+                raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
             expected = args.get("expectedRevision")
             revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
             if not isinstance(expected, str) or expected != revision:
@@ -4836,8 +5848,16 @@ class Studio(QObject):
             saving.discard(tab_id)
         return finalize(value, None)
 
-    def _agent_document_action_async(self, args, on_complete):
+    def _agent_document_action_async(self, args, on_complete, *, register_cancel=None, is_cancelled=None):
         action = args.get("action")
+        if action == "patch_tab":
+            self._stage_inactive_patch_tab_async(
+                args,
+                on_complete,
+                register_cancel=register_cancel,
+                is_cancelled=is_cancelled,
+            )
+            return
         if action == "save_document":
             prepared = Studio._prepare_save_document(self, args)
         elif action == "replace_tab_asset":
@@ -4882,6 +5902,9 @@ class Studio(QObject):
         tab = next((item for item in self.tabs if item["id"] == tab_id), None)
         if not tab:
             raise ValueError("Save requires a target tab that is still open")
+        staging = getattr(self, "_staging_tabs", None)
+        if staging is not None and tab_id in staging:
+            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
         saving = getattr(self, "saving", None)
         if saving is not None and tab_id in saving:
             raise ValueError("A save is already in progress for this tab; retry after it finishes")
@@ -4990,6 +6013,7 @@ class Studio(QObject):
                     portable=fmt == "smd",
                     conflict=False,
                 )
+                Studio._clear_agent_staging(self, target)
                 is_dirty = Studio._is_dirty(self, target)
                 if is_dirty and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
                     self.autosave_timer.start(900)
@@ -4997,6 +6021,9 @@ class Studio(QObject):
             self._recover()
             self._emit()
             if path_changed:
+                Studio._invalidate_folder_index(self, resolved_path)
+                if old_canonical_path or old_path:
+                    Studio._invalidate_folder_index(self, old_canonical_path or old_path)
                 Studio._refresh_open_folder_trees(self, resolved_path, old_canonical_path or old_path)
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
                     "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
@@ -5786,7 +6813,7 @@ class Studio(QObject):
             saving_tab_id = (save_as_tab or captured["id"]) if (command == "export_fmd_native" and save_as) else captured["id"]
             is_portable_tab_save = command == "export_fmd_native" and not agent_export_info and bool(args.get("save") or save_as)
             if is_portable_tab_save:
-                if saving_tab_id in self.saving:
+                if saving_tab_id in self.saving or saving_tab_id in self._staging_tabs:
                     raise ValueError("A save is already in progress for this tab; retry after it finishes")
                 self.saving.add(saving_tab_id)
             python = self.settings["python"]
@@ -5923,6 +6950,7 @@ class Studio(QObject):
                         assets_dirty=False,
                         conflict=False,
                     )
+                    self._clear_agent_staging(target)
                     if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
                     self.message = "Saved"
                     self._recover()
@@ -5931,8 +6959,9 @@ class Studio(QObject):
                 elif command == "export_fmd_native" and save_as:
                     save_target = next((t for t in self.tabs if t["id"] == (save_as_tab or captured["id"])), target)
                     if save_target:
+                        old_save_path = save_target.get("path", "")
                         old_assets = save_target.get("assets", {})
-                        path_changed = save_target.get("path") != save_as
+                        path_changed = not old_save_path or not folder_ops.same_path(old_save_path, save_as)
                         if old_assets != args["assets"] or path_changed:
                             self.session.reader_assets.revoke_tab(self.window_id, save_target["id"])
                         merged_assets = args["assets"] if path_changed else _preserve_unchanged_assets(old_assets, args["assets"])
@@ -5948,6 +6977,10 @@ class Studio(QObject):
                             portable=True,
                             conflict=False,
                         )
+                        self._clear_agent_staging(save_target)
+                        self._invalidate_folder_index(save_as)
+                        if old_save_path and path_changed:
+                            self._invalidate_folder_index(old_save_path)
                         try:
                             self._agent_open_paths.add(str(Path(save_as).resolve()))
                         except OSError:
@@ -5959,13 +6992,14 @@ class Studio(QObject):
                         self.message = "Saved"
                         self._recover()
                         self._emit()
-                        if path_changed:
-                            self._refresh_open_folder_trees(save_as)
+                        self._refresh_open_folder_trees(save_as, old_save_path)
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
                     self.pending_save_as_tab = ""
                 elif command.startswith("export_"):
                     studio_exports.finalize_standalone_export(self, result["path"])
+                    if is_searchable_note_name(Path(result["path"]).name):
+                        self._invalidate_folder_index(result["path"])
                 if agent_export_info:
                     studio_exports.complete_agent_export(self, id, agent_export_info, result)
                 if not agent_export_info:

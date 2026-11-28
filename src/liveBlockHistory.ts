@@ -37,7 +37,7 @@ export interface BlockKeyState {source:string;keys:Map<number,string>;seq:number
 export type PendingBlockFocus={offset:number}|'end'|null;
 
 interface PendingSuggestionEdit {
-  from:number;to:number;insertLength:number;
+  session:number;from:number;to:number;insertLength:number;
   origStart:number;origEnd:number;origDirection:SelectionDirection;
   selectionStart:number;selectionEnd:number;selectionDirection:SelectionDirection;
 }
@@ -359,7 +359,8 @@ export function useLiveBlockEditing({
   },[editorRef,hasEditing,lastSelection,latestRef,pendingInputMetaRef,pendingSelection,rememberSelection,replayBlockHistory,setCaret,syncTextareaCaret,syncedMarkdownRef,update]);
 
   const handleSuggestionAction=useCallback((edit?:{from:number;to:number;insertLength:number})=>{
-    const area=editorRef.current;if(!area){pendingSuggestionEditRef.current=null;return;}
+    const area=editorRef.current,activeSession=latestRef.current.editing?.session;
+    if(!area||activeSession===undefined){pendingSuggestionEditRef.current=null;return;}
     const origStart=area.selectionStart,origEnd=area.selectionEnd;
     const direction=area.selectionDirection||'none';
     let start=origStart,end=origEnd;
@@ -368,7 +369,7 @@ export function useLiveBlockEditing({
       const mapOffset=(pos:number)=>pos<=edit.from?pos:pos>=edit.to?pos+delta:edit.from+edit.insertLength;
       start=mapOffset(start);end=mapOffset(end);
       pendingSelection.current={start,end,direction};
-      pendingSuggestionEditRef.current={...edit,origStart,origEnd,origDirection:direction,selectionStart:start,selectionEnd:end,selectionDirection:direction};
+      pendingSuggestionEditRef.current={session:activeSession,...edit,origStart,origEnd,origDirection:direction,selectionStart:start,selectionEnd:end,selectionDirection:direction};
       setCaret(start);
     }else pendingSuggestionEditRef.current=null;
     area.focus({preventScroll:true});
@@ -554,11 +555,11 @@ export function useLiveBlockEditing({
   const handleSuggestionChange=useCallback((next:string)=>{
     const suggestionEdit=pendingSuggestionEditRef.current;
     pendingSuggestionEditRef.current=null;
-    const area=editorRef.current;
-    if(area&&suggestionEdit){
+    const area=editorRef.current,{editing:active,draftText:currentDraft}=latestRef.current;
+    if(area&&suggestionEdit&&active?.session===suggestionEdit.session){
       const replacement=next.slice(suggestionEdit.from,suggestionEdit.from+suggestionEdit.insertLength);
       applyInlineBlockEdit(
-        area,latestRef.current.draftText,suggestionEdit.from,suggestionEdit.to,replacement,
+        area,currentDraft,suggestionEdit.from,suggestionEdit.to,replacement,
         next,suggestionEdit.selectionStart,suggestionEdit.selectionEnd,suggestionEdit.selectionDirection,
         {start:suggestionEdit.origStart,end:suggestionEdit.origEnd,direction:suggestionEdit.origDirection},
       );
