@@ -40,7 +40,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
-from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
+from PySide6.QtWebEngineCore import QWebEngineProfile
 from studio import Session, Studio, ROOT
 from external_open import ExternalOpenRouter
 from agent_live import create_qt_bridge

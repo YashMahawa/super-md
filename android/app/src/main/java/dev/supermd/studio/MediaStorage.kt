@@ -20,7 +20,6 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.zip.Deflater
 import java.util.zip.GZIPOutputStream
 
 internal const val PORTABLE_GZIP_LEVEL = 3
@@ -432,21 +431,6 @@ class MediaStorage(private val context: Context) {
             }
             else -> false
         }
-    }
-
-    fun importUris(uris: List<Uri>): JSONArray {
-        require(uris.size in 1..32)
-        var total = 0L; val result = JSONArray()
-        for (uri in uris) {
-            require(isSafeExternalUri(uri)) { "Unsupported image URI" }
-            val name = resolveUriDisplayName(uri) ?: "Image"
-            val type = imageMime(name, context.contentResolver.getType(uri))
-            val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
-            requireMediaSignature(type, bytes)
-            total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-            result.put(store(name, type, bytes))
-        }
-        return result
     }
 
     fun importDroppedUris(uris: List<Uri>): DroppedImageBatch {
