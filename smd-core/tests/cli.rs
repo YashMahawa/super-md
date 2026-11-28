@@ -811,6 +811,69 @@ fn pack_and_export_share_local_asset_resolution_preserving_reference_keys_and_li
         );
         assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
     }
+
+    #[cfg(unix)]
+    {
+        let fifo_path = w.file("notes/growing-stream.svg");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo_path)
+                .status()
+                .unwrap()
+                .success(),
+            "mkfifo should create a streaming pipe inside notes/"
+        );
+        assert_eq!(fs::metadata(&fifo_path).unwrap().len(), 0);
+        fs::write(
+            w.file("notes/growing-stream.md"),
+            "# Growing Stream\n\n![Growing](growing-stream.svg?stream=1#frag)\n",
+        )
+        .unwrap();
+
+        for (subcommand, destination, sentinel) in [
+            ("export", "keep.pdf", preexisting_pdf.as_slice()),
+            ("pack", "keep.smd", preexisting_smd.as_slice()),
+        ] {
+            let writer_fifo = fifo_path.clone();
+            let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let opened_writer = std::sync::Arc::clone(&opened);
+            let writer = std::thread::spawn(move || -> usize {
+                let Ok(mut out) = fs::OpenOptions::new().write(true).open(&writer_fifo) else {
+                    return 0;
+                };
+                opened_writer.store(true, Ordering::SeqCst);
+                let chunk = [b'x'; 65_536];
+                let target = smd_core::portable::MAX_IMAGE * 2;
+                let mut written = 0usize;
+                while written < target {
+                    let step = chunk.len().min(target - written);
+                    match out.write(&chunk[..step]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => written += n,
+                    }
+                }
+                written
+            });
+
+            let out = w.run(&[subcommand, "notes/growing-stream.md", destination]);
+            if !opened.load(Ordering::SeqCst) {
+                let _ = fs::File::open(&fifo_path);
+            }
+            let written = writer.join().unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{subcommand} growing-stream must exit 1");
+            assert!(
+                err.contains("Image exceeds 25 MB"),
+                "{subcommand} growing-stream must enforce MAX_IMAGE while reading, got: {err}"
+            );
+            assert!(
+                written > smd_core::portable::MAX_IMAGE
+                    && written <= smd_core::portable::MAX_IMAGE + 4 * 1024 * 1024,
+                "{subcommand} must stop reading near MAX_IMAGE + 1 instead of reading 50 MB, writer wrote {written} bytes"
+            );
+            assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+        }
+    }
 }
 
 

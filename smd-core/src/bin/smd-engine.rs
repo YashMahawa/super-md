@@ -356,7 +356,10 @@ fn resolve_note_image<'a>(
     if std::fs::metadata(&file)?.len() > portable::MAX_IMAGE as u64 {
         bail!("Image exceeds 25 MB");
     }
-    let bytes = std::fs::read(&file)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&file)?
+        .take(portable::MAX_IMAGE as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > portable::MAX_IMAGE {
         bail!("Image exceeds 25 MB");
     }
@@ -550,6 +553,103 @@ mod tests {
         let resaved_note = resaved_note.expect("portable note");
         assert!(resaved_md.contains(&compat_key));
         assert_eq!(portable::image_bytes(&resaved_note.assets[&compat_key]).unwrap().1, svg_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_note_image_enforces_canonical_folder_and_caps_growing_reads_at_max_image() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("smd-engine-resolve-{}-{nanos}", std::process::id()));
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(
+            dir.join("outside.svg"),
+            b"<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'/>",
+        )
+        .unwrap();
+        let canonical_root = notes.canonicalize().unwrap();
+
+        let outside_err = match resolve_note_image(&canonical_root, None, "../outside.svg?v=1#frag") {
+            Ok(_) => panic!("expected outside-root local image to fail"),
+            Err(err) => err,
+        };
+        assert!(outside_err.to_string().contains("Image is outside the note folder"), "got: {outside_err:#}");
+
+        let prefix = b"<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><!--";
+        let suffix = b"--></svg>";
+        let mut exact_svg = Vec::with_capacity(portable::MAX_IMAGE + 1);
+        exact_svg.extend_from_slice(prefix);
+        exact_svg.resize(portable::MAX_IMAGE - suffix.len(), b'a');
+        exact_svg.extend_from_slice(suffix);
+        assert_eq!(exact_svg.len(), portable::MAX_IMAGE);
+        let exact_path = notes.join("exact.svg");
+        std::fs::write(&exact_path, &exact_svg).unwrap();
+
+        match resolve_note_image(&canonical_root, None, "exact.svg?v=1#ok").unwrap() {
+            ResolvedNoteImage::Local { bytes, .. } => assert_eq!(bytes.len(), portable::MAX_IMAGE),
+            _ => panic!("expected local image resolution"),
+        }
+
+        exact_svg.push(b'\n');
+        std::fs::write(&exact_path, &exact_svg).unwrap();
+        let over_err = match resolve_note_image(&canonical_root, None, "exact.svg?v=2#over") {
+            Ok(_) => panic!("expected MAX_IMAGE + 1 local image to fail"),
+            Err(err) => err,
+        };
+        assert!(over_err.to_string().contains("Image exceeds 25 MB"), "got: {over_err:#}");
+
+        #[cfg(unix)]
+        {
+            let fifo_path = notes.join("growing.svg");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo_path)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "mkfifo should create a streaming pipe inside canonical_root"
+            );
+            assert_eq!(std::fs::metadata(&fifo_path).unwrap().len(), 0);
+
+            let fifo_writer_path = fifo_path.clone();
+            let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let opened_writer = std::sync::Arc::clone(&opened);
+            let writer = std::thread::spawn(move || -> usize {
+                let Ok(mut out) = std::fs::OpenOptions::new().write(true).open(&fifo_writer_path) else {
+                    return 0;
+                };
+                opened_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+                let chunk = [b'x'; 65_536];
+                let target = portable::MAX_IMAGE * 2;
+                let mut written = 0usize;
+                while written < target {
+                    let step = chunk.len().min(target - written);
+                    match out.write(&chunk[..step]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => written += n,
+                    }
+                }
+                written
+            });
+
+            let stream_err = match resolve_note_image(&canonical_root, None, "growing.svg?live=1#stream") {
+                Ok(_) => panic!("expected growing stream past MAX_IMAGE to fail"),
+                Err(err) => err,
+            };
+            if !opened.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = std::fs::File::open(&fifo_path);
+            }
+            let written = writer.join().unwrap();
+            assert!(stream_err.to_string().contains("Image exceeds 25 MB"), "got: {stream_err:#}");
+            assert!(
+                written > portable::MAX_IMAGE && written <= portable::MAX_IMAGE + 4 * 1024 * 1024,
+                "expected bounded read to stop at MAX_IMAGE + 1 instead of reading 50 MB, writer wrote {written} bytes"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
