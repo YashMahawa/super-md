@@ -39,6 +39,8 @@ internal fun isSearchableNoteName(name: String): Boolean {
     return name.substring(dot + 1).lowercase(Locale.ROOT) in SEARCHABLE_EXTENSIONS
 }
 
+enum class FolderSearchMode { TEXT, FILES }
+
 data class FolderSearchMatch(
     val key: String,
     val tabId: String?,
@@ -55,10 +57,12 @@ data class FolderSearchMatch(
     val sourceStart: Int = -1,
     val sourceEnd: Int = -1,
     val matchText: String = "",
+    val isFileMatch: Boolean = false,
 )
 
 data class FolderSearchState(
     val visible: Boolean = false,
+    val mode: FolderSearchMode = FolderSearchMode.TEXT,
     val query: String = "",
     val caseSensitive: Boolean = false,
     val includeDiagrams: Boolean = false,
@@ -588,6 +592,80 @@ private suspend fun searchMarkdownLines(
     return found to truncated
 }
 
+private class SearchStreamAccumulator(
+    tabsCount: Int, private val mode: FolderSearchMode, private val query: String,
+    private val caseSensitive: Boolean, private val includeDiagrams: Boolean, private val maxMatches: Int,
+    private val onBatch: (suspend (List<FolderSearchMatch>, Int, Boolean, Boolean) -> Unit)?,
+) {
+    private val seenKeys = HashSet<String>(maxOf(16, tabsCount * 2))
+    val allMatches = ArrayList<FolderSearchMatch>()
+    private val pending = ArrayList<FolderSearchMatch>()
+    var scannedFiles = 0
+    var truncated = false
+
+    fun markSeenUri(uriStr: String?): Uri? {
+        val parsed = uriStr?.takeIf(String::isNotBlank)?.let { runCatching { Uri.parse(it) }.getOrNull() } ?: return null
+        return if (seenKeys.add(canonicalDocumentKey(parsed))) parsed else null
+    }
+
+    suspend fun flush(done: Boolean) {
+        if (onBatch != null && (pending.isNotEmpty() || done)) {
+            val snapshot = pending.toList()
+            pending.clear()
+            onBatch(snapshot, scannedFiles, truncated, done)
+        }
+    }
+
+    suspend fun accept(found: List<FolderSearchMatch>, hitCap: Boolean = false): Boolean {
+        val remaining = maxMatches - allMatches.size
+        if (found.isNotEmpty() && remaining > 0) {
+            val accepted = if (found.size > remaining) found.subList(0, remaining) else found
+            allMatches.addAll(accepted)
+            pending.addAll(accepted)
+            if (pending.size >= BATCH_SIZE) flush(done = false)
+        }
+        if (hitCap || found.size > remaining || allMatches.size >= maxMatches) {
+            truncated = true
+            return true
+        }
+        return false
+    }
+
+    suspend fun finish(): FolderSearchState {
+        flush(done = true)
+        return FolderSearchState(
+            mode = mode, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams,
+            matches = allMatches, scanning = false, scannedFiles = scannedFiles, truncated = truncated,
+        )
+    }
+}
+
+private suspend fun collectDiskSearchTargets(
+    folderRoot: SearchTreeNode?,
+    recents: List<RecentNote>,
+    statFileRecents: Boolean,
+    markSeenUri: (String?) -> Uri?,
+): List<Pair<FileEntry, Uri>> {
+    val candidates = folderRoot?.let { walkFolderTree(it) } ?: orderedRecents(recents).mapNotNull { rec ->
+        if (statFileRecents) {
+            if (!isSearchableNoteName(rec.name)) return@mapNotNull null
+            val parsed = runCatching { Uri.parse(rec.uri) }.getOrNull() ?: return@mapNotNull null
+            if (parsed.scheme == "file") {
+                val f = parsed.path?.let(::File) ?: return@mapNotNull null
+                if (runCatching { Files.isSymbolicLink(f.toPath()) }.getOrDefault(false) || !f.isFile) return@mapNotNull null
+            }
+        }
+        FileEntry(rec.name, rec.uri, directory = false, relative = rec.relative?.takeIf(String::isNotBlank) ?: rec.name)
+    }
+    val deduped = ArrayList<Pair<FileEntry, Uri>>(candidates.size)
+    for (entry in candidates) {
+        coroutineContext.ensureActive()
+        val parsedUri = markSeenUri(entry.uri) ?: continue
+        deduped.add(entry to parsedUri)
+    }
+    return deduped
+}
+
 internal suspend fun streamTextSearch(
     query: String,
     tabs: List<Note>,
@@ -605,85 +683,24 @@ internal suspend fun streamTextSearch(
         onBatch?.invoke(emptyList(), 0, false, true)
         return FolderSearchState(query = query, caseSensitive = caseSensitive, includeDiagrams = !excludeDiagrams)
     }
-
-    val seenKeys = HashSet<String>(maxOf(16, tabs.size * 2))
-    fun markSeenUri(uriStr: String?): Uri? {
-        if (uriStr.isNullOrBlank()) return null
-        val parsed = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return null
-        if (!seenKeys.add(canonicalDocumentKey(parsed))) return null
-        return parsed
-    }
-
+    val stream = SearchStreamAccumulator(tabs.size, FolderSearchMode.TEXT, query, caseSensitive, !excludeDiagrams, maxMatches, onBatch)
     val foldedNeedle = if (caseSensitive) query else foldWithOffsets(query).text
-    val orderedTabs = tabs.sortedBy { if (it.id == activeTabId) 0 else 1 }
-    val allMatches = ArrayList<FolderSearchMatch>()
-    val pending = ArrayList<FolderSearchMatch>()
-    var scannedFiles = 0
-    var truncated = false
 
-    suspend fun flush(done: Boolean) {
-        if (onBatch != null && (pending.isNotEmpty() || done)) {
-            val snapshot = pending.toList()
-            pending.clear()
-            onBatch(snapshot, scannedFiles, truncated, done)
-        }
-    }
-
-    for (tab in orderedTabs) {
+    for (tab in tabs.sortedBy { if (it.id == activeTabId) 0 else 1 }) {
         coroutineContext.ensureActive()
         if (tab.id.isEmpty()) continue
-        markSeenUri(tab.uri)
-        scannedFiles++
+        stream.markSeenUri(tab.uri)
+        stream.scannedFiles++
         val (found, hitCap) = searchMarkdownLines(
-            markdown = tab.content,
-            query = query,
-            foldedNeedle = foldedNeedle,
-            caseSensitive = caseSensitive,
-            excludeDiagrams = excludeDiagrams,
-            keyPrefix = tab.uri ?: "tab:${tab.id}",
-            tabId = tab.id,
-            uri = tab.uri,
-            name = tab.name,
-            relative = tab.relative?.takeIf(String::isNotBlank) ?: tab.name,
-            dirty = tab.dirty,
-            isOpen = true,
-            remainingBudget = maxMatches - allMatches.size,
+            markdown = tab.content, query = query, foldedNeedle = foldedNeedle, caseSensitive = caseSensitive,
+            excludeDiagrams = excludeDiagrams, keyPrefix = tab.uri ?: "tab:${tab.id}", tabId = tab.id, uri = tab.uri,
+            name = tab.name, relative = tab.relative?.takeIf(String::isNotBlank) ?: tab.name, dirty = tab.dirty,
+            isOpen = true, remainingBudget = maxMatches - stream.allMatches.size,
         )
-        if (found.isNotEmpty()) {
-            allMatches.addAll(found)
-            pending.addAll(found)
-            if (pending.size >= BATCH_SIZE) flush(done = false)
-        }
-        if (hitCap || allMatches.size >= maxMatches) {
-            truncated = true
-            flush(done = true)
-            return FolderSearchState(
-                query = query,
-                caseSensitive = caseSensitive,
-                includeDiagrams = !excludeDiagrams,
-                matches = allMatches,
-                scanning = false,
-                scannedFiles = scannedFiles,
-                truncated = true,
-            )
-        }
+        if (stream.accept(found, hitCap)) return stream.finish()
     }
 
-    val candidates: List<FileEntry> = if (folderRoot != null) {
-        walkFolderTree(folderRoot)
-    } else {
-        orderedRecents(recents).map { rec ->
-            FileEntry(rec.name, rec.uri, directory = false, relative = rec.relative?.takeIf(String::isNotBlank) ?: rec.name)
-        }
-    }
-
-    val dedupedCandidates = ArrayList<Pair<FileEntry, Uri>>(candidates.size)
-    for (entry in candidates) {
-        coroutineContext.ensureActive()
-        val parsedUri = markSeenUri(entry.uri) ?: continue
-        dedupedCandidates.add(entry to parsedUri)
-    }
-
+    val dedupedCandidates = collectDiskSearchTargets(folderRoot, recents, statFileRecents = false, markSeenUri = stream::markSeenUri)
     if (dedupedCandidates.isNotEmpty()) {
         coroutineScope {
             val inflight = ArrayDeque<Deferred<Pair<List<FolderSearchMatch>, Boolean>?>>(SEARCH_WINDOW_CONCURRENCY)
@@ -696,22 +713,13 @@ internal suspend fun streamTextSearch(
                         async(Dispatchers.IO) {
                             coroutineContext.ensureActive()
                             val markdown = runCatching {
-                                openUriStream(parsedUri)?.use { stream -> media.readSearchableNote(stream) }
+                                openUriStream(parsedUri)?.use { s -> media.readSearchableNote(s) }
                             }.getOrNull() ?: return@async null
                             searchMarkdownLines(
-                                markdown = markdown,
-                                query = query,
-                                foldedNeedle = foldedNeedle,
-                                caseSensitive = caseSensitive,
-                                excludeDiagrams = excludeDiagrams,
-                                keyPrefix = entry.uri,
-                                tabId = null,
-                                uri = entry.uri,
-                                name = entry.name,
-                                relative = entry.relative.ifBlank { entry.name },
-                                dirty = false,
-                                isOpen = false,
-                                remainingBudget = MAX_MATCHES_PER_NOTE,
+                                markdown = markdown, query = query, foldedNeedle = foldedNeedle, caseSensitive = caseSensitive,
+                                excludeDiagrams = excludeDiagrams, keyPrefix = entry.uri, tabId = null, uri = entry.uri,
+                                name = entry.name, relative = entry.relative.ifBlank { entry.name }, dirty = false,
+                                isOpen = false, remainingBudget = MAX_MATCHES_PER_NOTE,
                             )
                         },
                     )
@@ -724,38 +732,64 @@ internal suspend fun streamTextSearch(
                     coroutineContext.ensureActive()
                     val task = inflight.removeFirst()
                     submitNext()
-                    val scannedResult = task.await() ?: continue
-                    scannedFiles++
-                    val (found, _) = scannedResult
-                    val remaining = maxMatches - allMatches.size
-                    if (found.isNotEmpty() && remaining > 0) {
-                        val accepted = if (found.size > remaining) found.subList(0, remaining) else found
-                        allMatches.addAll(accepted)
-                        pending.addAll(accepted)
-                        if (pending.size >= BATCH_SIZE) flush(done = false)
-                    }
-                    if (found.size > remaining || allMatches.size >= maxMatches) {
-                        truncated = true
-                        break
-                    }
+                    val (found, _) = task.await() ?: continue
+                    stream.scannedFiles++
+                    if (stream.accept(found)) break
                 }
             } finally {
-                for (task in inflight) {
-                    if (!task.isCompleted) task.cancel()
-                }
+                for (task in inflight) if (!task.isCompleted) task.cancel()
             }
         }
     }
 
     coroutineContext.ensureActive()
-    flush(done = true)
-    return FolderSearchState(
-        query = query,
-        caseSensitive = caseSensitive,
-        includeDiagrams = !excludeDiagrams,
-        matches = allMatches,
-        scanning = false,
-        scannedFiles = scannedFiles,
-        truncated = truncated,
-    )
+    return stream.finish()
+}
+
+internal suspend fun streamFileSearch(
+    query: String,
+    tabs: List<Note>,
+    recents: List<RecentNote>,
+    folderRoot: SearchTreeNode?,
+    activeTabId: String = "",
+    caseSensitive: Boolean = false,
+    includeDiagrams: Boolean = false,
+    maxMatches: Int = MAX_SEARCH_MATCHES,
+    onBatch: (suspend (batch: List<FolderSearchMatch>, scannedFiles: Int, truncated: Boolean, done: Boolean) -> Unit)? = null,
+): FolderSearchState {
+    val needle = query.trim().replace('\\', '/')
+    if (needle.isEmpty()) {
+        onBatch?.invoke(emptyList(), 0, false, true)
+        return FolderSearchState(mode = FolderSearchMode.FILES, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams)
+    }
+    val stream = SearchStreamAccumulator(tabs.size, FolderSearchMode.FILES, query, caseSensitive, includeDiagrams, maxMatches, onBatch)
+    val matchRelative = '/' in needle
+    val foldedNeedle = if (caseSensitive) needle else foldWithOffsets(needle).text
+    suspend fun matchEntry(keyPrefix: String, tabId: String?, uri: String?, name: String, relative: String, dirty: Boolean, isOpen: Boolean): Boolean {
+        stream.scannedFiles++
+        val target = if (matchRelative) relative else name
+        val span = findLineMatchSpans(target, needle, foldedNeedle, caseSensitive).firstOrNull() ?: return false
+        if (stream.allMatches.size >= maxMatches) { stream.truncated = true; return true }
+        val slice = formatMatchSnippet(target, span.first, span.last + 1)
+        val hit = FolderSearchMatch(
+            key = "$keyPrefix:file", tabId = tabId, uri = uri, name = name, relative = relative,
+            line = 0, column = span.first + 1, snippet = slice.snippet, matchStart = slice.matchStart,
+            matchEnd = slice.matchEnd, dirty = dirty, isOpen = isOpen, isFileMatch = true,
+        )
+        return stream.accept(listOf(hit))
+    }
+    for (tab in tabs.sortedBy { if (it.id == activeTabId) 0 else 1 }) {
+        coroutineContext.ensureActive()
+        if (tab.id.isEmpty()) continue
+        stream.markSeenUri(tab.uri)
+        if (matchEntry(tab.uri ?: "tab:${tab.id}", tab.id, tab.uri, tab.name, tab.relative?.takeIf(String::isNotBlank) ?: tab.name, tab.dirty, true)) break
+    }
+    if (!stream.truncated) {
+        for ((entry, _) in collectDiskSearchTargets(folderRoot, recents, statFileRecents = true, markSeenUri = stream::markSeenUri)) {
+            coroutineContext.ensureActive()
+            if (matchEntry(entry.uri, null, entry.uri, entry.name, entry.relative.ifBlank { entry.name }, false, false)) break
+        }
+    }
+    coroutineContext.ensureActive()
+    return stream.finish()
 }

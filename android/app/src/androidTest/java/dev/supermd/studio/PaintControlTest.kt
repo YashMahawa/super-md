@@ -12,18 +12,53 @@ import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Rule
 import org.junit.Test
 
+internal fun invalidateViewTree(view: android.view.View) {
+    view.invalidate()
+    if (view is android.view.ViewGroup) for (i in 0 until view.childCount) invalidateViewTree(view.getChildAt(i))
+}
+
+internal fun pulseNextFrame(activity: ComponentActivity, sleepMs: Long = 200L) {
+    InstrumentationRegistry.getInstrumentation().runOnMainSync {
+        val decor = activity.window.decorView
+        invalidateViewTree(decor)
+        decor.postInvalidateOnAnimation()
+    }
+    android.os.SystemClock.sleep(sleepMs)
+}
+
 class PaintControlTest {
     // A renderer calibration must not race the real app's welcome Dialog,
     // WebView startup or state restoration. StudioUiTest covers MainActivity.
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
-    private fun assertPaintedStripes(name: String) {
+    private fun awaitActivityFramePresented() {
         compose.waitForIdle()
+        val instrument = InstrumentationRegistry.getInstrumentation()
+        compose.waitUntil(10_000) {
+            val ready = java.util.concurrent.atomic.AtomicBoolean(false)
+            instrument.runOnMainSync {
+                val activity = compose.activity; val decor = activity.window.decorView
+                ready.set(activity.hasWindowFocus() && decor.isAttachedToWindow && decor.isShown && decor.width > 0 && decor.height > 0)
+            }
+            ready.get()
+        }
+        val committed = java.util.concurrent.CountDownLatch(1)
+        instrument.runOnMainSync {
+            val decor = compose.activity.window.decorView
+            decor.viewTreeObserver.registerFrameCommitCallback { committed.countDown() }
+            invalidateViewTree(decor); decor.postInvalidateOnAnimation()
+        }
+        committed.await(3, java.util.concurrent.TimeUnit.SECONDS)
+    }
+    private fun assertPaintedStripes(name: String) {
+        awaitActivityFramePresented()
         var latest: android.graphics.Bitmap? = null
         var observed = "no screenshot"
+        var attempts = 0
         try {
             // Compose idleness does not guarantee that SurfaceFlinger has
             // presented a frame. Wait for actual pixels, not a fixed sleep.
             compose.waitUntil(15_000) {
+                if (attempts++ > 0) pulseNextFrame(compose.activity)
                 latest?.recycle()
                 val bitmap = InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
                 latest = bitmap

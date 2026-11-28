@@ -42,38 +42,50 @@ internal class FolderSearchController(
     internal val seededFindMutable = MutableStateFlow<PendingSeededFind?>(null)
     val seededFind: StateFlow<PendingSeededFind?> = seededFindMutable.asStateFlow()
     private var folderSearchJob: Job? = null
+    private var activeReaderFlushedForSession = false
 
     fun cancel() {
         folderSearchJob?.cancel()
         folderSearchJob = null
+        activeReaderFlushedForSession = false
     }
 
-    fun openFolderSearch(initialQuery: String? = null) {
+    private suspend fun flushActiveIfNeeded() {
+        val tabs = readState().tabs
+        val activeId = readState().active.id
+        if (tabs.isNotEmpty() && activeId.isNotEmpty()) {
+            try {
+                flushActiveReader(activeId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun openFolderSearch(initialQuery: String? = null, initialMode: FolderSearchMode? = null) {
         folderSearchJob?.cancel()
+        activeReaderFlushedForSession = false
         val previous = folderSearchMutable.value
         val nextQuery = initialQuery ?: previous.query
+        val nextMode = initialMode ?: previous.mode
+        val reusePrevious = nextQuery == previous.query && nextMode == previous.mode && nextQuery.isNotEmpty()
         folderSearchMutable.value = previous.copy(
             visible = true,
+            mode = nextMode,
             query = nextQuery,
             scanning = nextQuery.isNotEmpty(),
-            matches = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.matches else emptyList(),
-            scannedFiles = if (nextQuery == previous.query && nextQuery.isNotEmpty()) previous.scannedFiles else 0,
+            matches = if (reusePrevious) previous.matches else emptyList(),
+            scannedFiles = if (reusePrevious) previous.scannedFiles else 0,
             truncated = false,
         )
         folderSearchJob = scope.launch {
-            if (readState().tabs.isNotEmpty()) {
-                val activeId = readState().active.id
-                if (activeId.isNotEmpty()) {
-                    try {
-                        flushActiveReader(activeId)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                    }
-                }
+            if (nextMode == FolderSearchMode.TEXT && !activeReaderFlushedForSession) {
+                flushActiveIfNeeded()
+                activeReaderFlushedForSession = true
             }
             if (nextQuery.isNotEmpty()) {
-                runFolderSearchScan(nextQuery, previous.caseSensitive, previous.includeDiagrams)
+                runFolderSearchScan(nextQuery, previous.caseSensitive, previous.includeDiagrams, nextMode)
             }
         }
     }
@@ -82,29 +94,29 @@ internal class FolderSearchController(
         query: String = folderSearchMutable.value.query,
         caseSensitive: Boolean = folderSearchMutable.value.caseSensitive,
         includeDiagrams: Boolean = folderSearchMutable.value.includeDiagrams,
+        mode: FolderSearchMode = folderSearchMutable.value.mode,
     ) {
         folderSearchJob?.cancel()
         folderSearchJob = null
-        val visible = folderSearchMutable.value.visible
-        if (query.isEmpty()) {
-            folderSearchMutable.value = FolderSearchState(
-                visible = visible,
-                query = "",
-                caseSensitive = caseSensitive,
-                includeDiagrams = includeDiagrams,
-                scanning = false,
-            )
+        val previous = folderSearchMutable.value
+        val visible = previous.visible
+        if (query.isEmpty() || !visible) {
+            folderSearchMutable.value = FolderSearchState(visible = visible, mode = mode, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams, scanning = false)
+            if (visible && mode == FolderSearchMode.TEXT && !activeReaderFlushedForSession) {
+                folderSearchJob = scope.launch {
+                    flushActiveIfNeeded()
+                    activeReaderFlushedForSession = true
+                }
+            }
             return
         }
-        folderSearchMutable.value = FolderSearchState(
-            visible = visible,
-            query = query,
-            caseSensitive = caseSensitive,
-            includeDiagrams = includeDiagrams,
-            scanning = true,
-        )
+        folderSearchMutable.value = FolderSearchState(visible = visible, mode = mode, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams, scanning = true)
         folderSearchJob = scope.launch {
-            runFolderSearchScan(query, caseSensitive, includeDiagrams)
+            if (mode == FolderSearchMode.TEXT && !activeReaderFlushedForSession) {
+                flushActiveIfNeeded()
+                activeReaderFlushedForSession = true
+            }
+            runFolderSearchScan(query, caseSensitive, includeDiagrams, mode)
         }
     }
 
@@ -112,50 +124,55 @@ internal class FolderSearchController(
         query: String,
         caseSensitive: Boolean,
         includeDiagrams: Boolean,
+        mode: FolderSearchMode,
     ) {
         val currentState = readState()
         val tabsSnapshot = currentState.tabs
         val activeTabId = currentState.active.id
         val recentSnapshot = readRecent()
         val folderUri = currentState.folder?.let(Uri::parse)
-        val finalState = withContext(Dispatchers.IO) {
-            streamTextSearch(
-                query = query,
-                tabs = tabsSnapshot,
-                recents = recentSnapshot,
-                folderRoot = resolveSearchRoot(app, folderUri),
-                media = media,
-                openUriStream = { candidateUri ->
-                    val target = documentAccess.resolve(candidateUri, writing = false)
-                    if (target.scheme == "file") target.path?.let(::File)?.inputStream()
-                    else app.contentResolver.openInputStream(target)
-                },
-                activeTabId = activeTabId,
-                caseSensitive = caseSensitive,
-                excludeDiagrams = !includeDiagrams,
-                onBatch = { batch, scannedFiles, truncated, done ->
-                    if (batch.isNotEmpty() || done) {
-                        withContext(Dispatchers.Main.immediate) {
-                            val current = folderSearchMutable.value
-                            if (current.visible &&
-                                current.query == query &&
-                                current.caseSensitive == caseSensitive &&
-                                current.includeDiagrams == includeDiagrams
-                            ) {
-                                folderSearchMutable.value = current.copy(
-                                    matches = current.matches + batch,
-                                    scannedFiles = scannedFiles,
-                                    truncated = truncated,
-                                    scanning = !done,
-                                )
-                            }
-                        }
+        val onBatch: suspend (List<FolderSearchMatch>, Int, Boolean, Boolean) -> Unit = { batch, scannedFiles, truncated, done ->
+            if (batch.isNotEmpty() || done) {
+                withContext(Dispatchers.Main.immediate) {
+                    val current = folderSearchMutable.value
+                    if (current.visible &&
+                        current.mode == mode &&
+                        current.query == query &&
+                        current.caseSensitive == caseSensitive &&
+                        current.includeDiagrams == includeDiagrams
+                    ) {
+                        folderSearchMutable.value = current.copy(
+                            matches = current.matches + batch,
+                            scannedFiles = scannedFiles,
+                            truncated = truncated,
+                            scanning = !done,
+                        )
                     }
-                },
-            )
+                }
+            }
+        }
+        val finalState = withContext(Dispatchers.IO) {
+            val searchRoot = resolveSearchRoot(app, folderUri)
+            if (mode == FolderSearchMode.FILES) {
+                streamFileSearch(
+                    query = query, tabs = tabsSnapshot, recents = recentSnapshot, folderRoot = searchRoot,
+                    activeTabId = activeTabId, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams, onBatch = onBatch,
+                )
+            } else {
+                streamTextSearch(
+                    query = query, tabs = tabsSnapshot, recents = recentSnapshot, folderRoot = searchRoot, media = media,
+                    openUriStream = { candidateUri ->
+                        val target = documentAccess.resolve(candidateUri, writing = false)
+                        if (target.scheme == "file") target.path?.let(::File)?.inputStream()
+                        else app.contentResolver.openInputStream(target)
+                    },
+                    activeTabId = activeTabId, caseSensitive = caseSensitive, excludeDiagrams = !includeDiagrams, onBatch = onBatch,
+                )
+            }
         }
         val current = folderSearchMutable.value
         if (current.visible &&
+            current.mode == mode &&
             current.query == query &&
             current.caseSensitive == caseSensitive &&
             current.includeDiagrams == includeDiagrams
@@ -167,6 +184,7 @@ internal class FolderSearchController(
     fun closeFolderSearch() {
         folderSearchJob?.cancel()
         folderSearchJob = null
+        activeReaderFlushedForSession = false
         if (folderSearchMutable.value.visible || folderSearchMutable.value.scanning) {
             folderSearchMutable.value = folderSearchMutable.value.copy(visible = false, scanning = false)
         }
@@ -186,9 +204,10 @@ internal class FolderSearchController(
             (match.tabId != null && tab.id == match.tabId) ||
                 (!match.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, match.uri))
         }
+        val armInNoteFind = currentSearch.mode == FolderSearchMode.TEXT && !match.isFileMatch && query.isNotEmpty()
         val hasValidRange = match.sourceStart >= 0 && match.sourceEnd >= match.sourceStart
-        if (query.isNotEmpty()) {
-            seededFindMutable.value = PendingSeededFind(
+        seededFindMutable.value = if (armInNoteFind) {
+            PendingSeededFind(
                 query = query,
                 caseSensitive = caseSensitive,
                 targetTabId = existing?.id ?: match.tabId,
@@ -197,10 +216,12 @@ internal class FolderSearchController(
                 sourceEnd = if (hasValidRange) match.sourceEnd else null,
                 matchText = if (hasValidRange) match.matchText.takeIf { it.isNotEmpty() } else null,
             )
+        } else {
+            null
         }
         if (existing != null) {
             if (currentState.active.id == existing.id) {
-                scope.launch { onBarrierActiveTab(existing.id) }
+                if (armInNoteFind) scope.launch { onBarrierActiveTab(existing.id) }
             } else {
                 onSelectTab(existing.id)
             }

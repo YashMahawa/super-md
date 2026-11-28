@@ -51,6 +51,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -500,6 +501,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     val chromeTapJob=remember {arrayOfNulls<kotlinx.coroutines.Job>(1)}
     DisposableEffect(Unit){onDispose{chromeTapJob[0]?.cancel()}}
     var web by remember { mutableStateOf<WebView?>(null) }
+    val focusManager = LocalFocusManager.current
     var chromeHeight by remember { mutableIntStateOf(0) }
     val readerNote = remember { arrayOfNulls<String>(1) }
     // WebView timer controls are process-wide. Track every reader so a stopped
@@ -547,11 +549,12 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             }
         }
     }
+    val findSyncGen = remember { java.util.concurrent.atomic.AtomicInteger(0) }
     DisposableEffect(activity, web) {
         model.assetAccessRestored = { document, source ->
             web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
         }
-        activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
+        activity.dismissDocument = { findSyncGen.incrementAndGet(); web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
         activity.openReaderFind = { replace ->
             menu = false
@@ -579,22 +582,40 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
         findRequest = 0
         findReplace = false
-        reader.requestFocus(View.FOCUS_DOWN)
-        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
-            reader.post {
-                reader.requestFocus(View.FOCUS_DOWN)
-                val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
-                val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
-                val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                if (!hasHardwareKeyboard || showImeWithHardware) {
-                    inputMethod?.showSoftInput(reader, InputMethodManager.SHOW_IMPLICIT)
-                } else {
-                    // WebView.focus() can itself open the software keyboard
-                    // after an input receives focus. Honor the hardware-keyboard
-                    // preference even when DOM focus was restored natively.
+        val syncToken = findSyncGen.incrementAndGet()
+        if (!reader.hasFocus()) {
+            focusManager.clearFocus(force = true)
+            reader.requestFocus(View.FOCUS_DOWN)
+        }
+        var shownExplicitIme = false
+        var hidImeAfterEditorReady = false
+        fun syncFindInput(attempt: Int) {
+            if (syncToken != findSyncGen.get() || reader !== web || reader.getTag(R.id.reader_destroyed_tag) == true) return
+            if (attempt > 6 && !model.state.value.readerOverlay) return
+            if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+            val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
+            val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
+            val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            val editorReady = reader.hasFocus() && reader.onCheckIsTextEditor()
+            if (!hasHardwareKeyboard || showImeWithHardware) {
+                val rootInsets = reader.rootWindowInsets
+                if (rootInsets != null && WindowInsetsCompat.toWindowInsetsCompat(rootInsets).isVisible(WindowInsetsCompat.Type.ime())) return
+                if (editorReady && (!shownExplicitIme || attempt % 4 == 0)) {
+                    shownExplicitIme = true
+                    inputMethod?.showSoftInput(reader, 0)
+                    WindowCompat.getInsetsController(activity.window, reader).show(WindowInsetsCompat.Type.ime())
+                } else if (attempt == 0) inputMethod?.showSoftInput(reader, 0)
+                if (attempt < 30) reader.postDelayed({ syncFindInput(attempt + 1) }, 60L)
+            } else {
+                if (attempt == 0 || (editorReady && !hidImeAfterEditorReady)) {
+                    if (editorReady) hidImeAfterEditorReady = true
                     inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
                 }
+                if (!hidImeAfterEditorReady && attempt < 15) reader.postDelayed({ syncFindInput(attempt + 1) }, 40L)
             }
+        }
+        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
+            reader.post { syncFindInput(0) }
         }
     }
     var readerReady by remember { mutableStateOf(false) }
@@ -1467,7 +1488,12 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             state = folderSearch,
             hasFolder = state.folder != null,
             onUpdate = model::updateFolderSearch,
-            onSelect = model::openSearchMatch,
+            onSelect = { match ->
+                if (match.isFileMatch) {
+                    web?.evaluateJavascript("if(document.querySelector('.reading-search')&&!document.querySelector('.image-viewer,.theme-guide-dialog'))window.supermdDismiss?.();true", null)
+                }
+                model.openSearchMatch(match)
+            },
             onDismiss = model::cancelWorkspaceSearch,
         )
     }
@@ -1535,10 +1561,11 @@ internal fun buildHighlightedSnippet(
 @Composable internal fun FolderSearchModal(
     state: FolderSearchState,
     hasFolder: Boolean,
-    onUpdate: (String, Boolean, Boolean) -> Unit,
+    onUpdate: (String, Boolean, Boolean, FolderSearchMode) -> Unit,
     onSelect: (FolderSearchMatch) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val isFilesMode = state.mode == FolderSearchMode.FILES
     val focusRequester = remember { FocusRequester() }
     var selectedIndex by remember(state.matches) { mutableIntStateOf(0) }
     val highlightColor = MaterialTheme.colorScheme.primary
@@ -1575,12 +1602,15 @@ internal fun buildHighlightedSnippet(
                     }
                 },
         ) {
-            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("Search across notes", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
+                            if (state.query.isNotEmpty()) {
+                                if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
+                                else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files"
+                            } else if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
                             else "No folder open · searching open tabs and accessible recent notes",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1590,13 +1620,13 @@ internal fun buildHighlightedSnippet(
                 }
                 OutlinedTextField(
                     value = state.query,
-                    onValueChange = { onUpdate(it, state.caseSensitive, state.includeDiagrams) },
+                    onValueChange = { onUpdate(it, state.caseSensitive, state.includeDiagrams, state.mode) },
                     singleLine = true,
-                    placeholder = { Text("Search text across notes…") },
+                    placeholder = { Text(if (isFilesMode) "Search file names across notes…" else "Search text across notes…") },
                     leadingIcon = { Icon(Icons.Rounded.Search, null) },
                     trailingIcon = {
                         if (state.query.isNotEmpty()) {
-                            IconButton(onClick = { onUpdate("", state.caseSensitive, state.includeDiagrams) }) {
+                            IconButton(onClick = { onUpdate("", state.caseSensitive, state.includeDiagrams, state.mode) }) {
                                 Icon(Icons.Rounded.Close, "Clear query")
                             }
                         }
@@ -1604,41 +1634,27 @@ internal fun buildHighlightedSnippet(
                     modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
                 )
                 Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    FilterChip(
-                        selected = state.caseSensitive,
-                        onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams) },
-                        label = { Text("Match case") },
-                    )
-                    FilterChip(
-                        selected = state.includeDiagrams,
-                        onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams) },
-                        label = { Text("Diagrams") },
-                    )
-                    Spacer(Modifier.weight(1f))
-                    if (state.query.isNotEmpty()) {
-                        Text(
-                            if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
-                            else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+                    FilterChip(selected = !isFilesMode, onClick = { if (isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.TEXT) }, label = { Text("Text") })
+                    FilterChip(selected = isFilesMode, onClick = { if (!isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.FILES) }, label = { Text("Files") })
+                    FilterChip(selected = state.caseSensitive, onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams, state.mode) }, label = { Text("Match case") })
+                    FilterChip(selected = state.includeDiagrams, enabled = !isFilesMode, onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams, state.mode) }, label = { Text("Diagrams") })
                 }
                 if (state.scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
                 if (state.query.isEmpty()) {
                     Text(
-                        "Type to search Markdown prose across notes. Inline SVG, Mermaid, and chart blocks are skipped unless Diagrams is enabled.",
+                        if (isFilesMode) "Type to match note file names from metadata without reading note contents or arming in-note Find."
+                        else "Type to search Markdown prose across notes. Inline SVG, Mermaid, and chart blocks are skipped unless Diagrams is enabled.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 12.dp),
                     )
                 } else if (!state.scanning && state.matches.isEmpty()) {
                     Text(
-                        "No matches found.",
+                        if (isFilesMode) "No matching file names found." else "No matches found.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 16.dp),
@@ -1662,13 +1678,15 @@ internal fun buildHighlightedSnippet(
                                         if (match.dirty) {
                                             Text("Edited", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                                         }
-                                        Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
-                                            Text(
-                                                "L${match.line}",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                            )
+                                        if (!match.isFileMatch && match.line > 0) {
+                                            Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                                                Text(
+                                                    "L${match.line}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                                )
+                                            }
                                         }
                                     }
                                     Text(
