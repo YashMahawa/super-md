@@ -11,6 +11,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -123,5 +125,28 @@ class ExportShareCoordinatorTest {
         assertEquals(0, shareCalls)
         assertEquals("Portable .smd exported", model.state.value.message)
         assertTrue(ExportFilename.hasExpectedHeader(exportedSmd.readBytes().let { it.copyOf(minOf(it.size, 64)) }, NativeExportFormat.PORTABLE_SMD))
+    }
+
+    @Test fun initWithUnlistableRestoredFolderHandlesImmediateFailureBeforeCoordinatorAccess() {
+        runBlocking { repeat(8) { launch(Dispatchers.IO) {} } }
+        val clearMethod = StudioViewModel::class.java.getDeclaredMethod("onCleared").apply { isAccessible = true }
+        repeat(40) { index ->
+            val key = "export-share-init-$index-${UUID.randomUUID()}"
+            app.getSharedPreferences("studio-window-$key", 0)
+                .edit()
+                .putBoolean("folderMigrated", true)
+                .putString("folder", "file:///nonexistent-${UUID.randomUUID()}")
+                .commit()
+            val model = StudioViewModel(app, key)
+            try {
+                val deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                while (model.state.value.error == null && System.nanoTime() < deadlineNs) {
+                    shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10)); Thread.sleep(5)
+                }
+                assertTrue(model.state.value.error?.startsWith("Could not list folder:") == true)
+            } finally {
+                clearMethod.invoke(model)
+            }
+        }
     }
 }

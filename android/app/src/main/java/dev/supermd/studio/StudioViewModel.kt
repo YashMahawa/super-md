@@ -1245,44 +1245,51 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
         }
     }
-    private val exportShare = ExportShareCoordinator(
-        app = getApplication(),
-        scope = viewModelScope,
-        media = media,
-        fonts = fonts,
-        documentAccess = documentAccess,
-        documentWrites = documentWrites,
-        autosavePending = autosavePending,
-        closingNoteIds = closingNoteIds,
-        savedPortableAssets = savedPortableAssets,
-        readState = { mutable.value },
-        updateState = { mutable.value = it },
-        changeState = ::change,
-        busy = ::busy,
-        fail = ::fail,
-        noteLocation = { noteLocation() },
-        readPortableSaveAsNoteId = { portableSaveAsNoteId },
-        writePortableSaveAsNoteId = { portableSaveAsNoteId = it },
-        readPortableForceOverwrite = { portableForceOverwrite },
-        writePortableForceOverwrite = { portableForceOverwrite = it },
-        readCloseAfterSaveNoteId = { closeAfterSaveNoteId },
-        writeCloseAfterSaveNoteId = { closeAfterSaveNoteId = it },
-        clearPendingPortableWriteState = ::clearPendingPortableWriteState,
-        collectNativePortableAssets = ::collectNativePortableAssets,
-        readListedRelative = { listedRelative },
-        resolveVerifiedWriteDestination = ::resolveVerifiedWriteDestination,
-        clearDocumentAccessFailure = ::clearDocumentAccessFailure,
-        diskMatchesBaseline = { target, note -> diskMatchesBaseline(target, note) },
-        recordPortableBaseline = ::recordPortableBaseline,
-        resolveDisplayName = ::resolveDisplayName,
-        resolveOpenFolderRelativeOnIo = { uri -> resolveOpenFolderRelativeOnIo(uri) },
-        rememberNote = ::remember,
-        listFolder = ::listFolder,
-        closeNote = { id -> close(id) },
-        markAssetsDirty = ::markAssetsDirty,
-        editNote = ::edit,
-        clearReaderFolderIndex = { readerFolderIndex.clear() },
-    )
+    private lateinit var exportShareCache: ExportShareCoordinator
+    private val exportShare: ExportShareCoordinator
+        get() = if (::exportShareCache.isInitialized) exportShareCache else synchronized(this) {
+            if (!::exportShareCache.isInitialized) {
+                exportShareCache = ExportShareCoordinator(
+                    app = getApplication(),
+                    scope = viewModelScope,
+                    media = media,
+                    fonts = fonts,
+                    readDocumentAccess = { documentAccess },
+                    documentWrites = documentWrites,
+                    removeAutosavePending = { autosavePending.remove(it) },
+                    closingNoteIds = closingNoteIds,
+                    savedPortableAssets = savedPortableAssets,
+                    readState = { mutable.value },
+                    updateState = { mutable.value = it },
+                    changeState = ::change,
+                    busy = ::busy,
+                    fail = ::fail,
+                    noteLocation = { noteLocation() },
+                    readPortableSaveAsNoteId = { portableSaveAsNoteId },
+                    writePortableSaveAsNoteId = { portableSaveAsNoteId = it },
+                    readPortableForceOverwrite = { portableForceOverwrite },
+                    writePortableForceOverwrite = { portableForceOverwrite = it },
+                    readCloseAfterSaveNoteId = { closeAfterSaveNoteId },
+                    writeCloseAfterSaveNoteId = { closeAfterSaveNoteId = it },
+                    clearPendingPortableWriteState = ::clearPendingPortableWriteState,
+                    collectNativePortableAssets = ::collectNativePortableAssets,
+                    readListedRelative = { listedRelative },
+                    resolveVerifiedWriteDestination = ::resolveVerifiedWriteDestination,
+                    clearDocumentAccessFailure = ::clearDocumentAccessFailure,
+                    diskMatchesBaseline = { target, note -> diskMatchesBaseline(target, note) },
+                    recordPortableBaseline = ::recordPortableBaseline,
+                    resolveDisplayName = ::resolveDisplayName,
+                    resolveOpenFolderRelativeOnIo = { uri -> resolveOpenFolderRelativeOnIo(uri) },
+                    rememberNote = ::remember,
+                    listFolder = ::listFolder,
+                    closeNote = { id -> close(id) },
+                    markAssetsDirty = ::markAssetsDirty,
+                    editNote = ::edit,
+                    clearReaderFolderIndex = { readerFolderIndex.clear() },
+                )
+            }
+            exportShareCache
+        }
     var outputUri: Uri?
         get() = exportShare.outputUri
         set(value) { exportShare.outputUri = value }

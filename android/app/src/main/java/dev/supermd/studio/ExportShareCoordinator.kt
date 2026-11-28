@@ -26,8 +26,8 @@ import java.util.concurrent.ConcurrentHashMap
 internal class ExportShareCoordinator(
     private val app: Application, private val scope: CoroutineScope,
     private val media: MediaStorage, private val fonts: FontLibrary,
-    private val documentAccess: DocumentAccess, private val documentWrites: Mutex,
-    private val autosavePending: MutableSet<String>, private val closingNoteIds: Set<String>,
+    private val readDocumentAccess: () -> DocumentAccess, private val documentWrites: Mutex,
+    private val removeAutosavePending: (String) -> Unit, private val closingNoteIds: Set<String>,
     private val savedPortableAssets: ConcurrentHashMap<String, JSONObject>,
     private val readState: () -> StudioState, private val updateState: (StudioState) -> Unit,
     private val changeState: ((StudioState) -> StudioState) -> Unit,
@@ -237,7 +237,7 @@ internal class ExportShareCoordinator(
             val force = readPortableForceOverwrite()
             writePortableForceOverwrite(false)
             if (save && !force && !diskMatchesBaseline(target, note)) {
-                autosavePending.remove(effectiveId)
+                removeAutosavePending(effectiveId)
                 withContext(Dispatchers.Main) {
                     changeState { s -> s.copy(busy = false, conflictedTabIds = s.conflictedTabIds + effectiveId, pendingSaveConflictNoteId = effectiveId) }
                 }
@@ -264,13 +264,13 @@ internal class ExportShareCoordinator(
                 staged.outputStream().use { media.writeFmd(it, content, effectiveAssets, savedPortableAssets[effectiveId]) }
                 verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
                 resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
-                documentAccess.persist(destination)
+                readDocumentAccess().persist(destination)
                 val savedName = if (rebindId != null) resolveDisplayName(destination) ?: ExportFilename.suggestedName(note.name, NativeExportFormat.PORTABLE_SMD) else note.name
                 val openRel = if (rebinding) resolveOpenFolderRelativeOnIo(destination) else null
                 withContext(Dispatchers.Main) {
                     if (rebinding) {
                         portableOutput = null; portableDestinationIsNew = false; writePortableSaveAsNoteId(null)
-                        autosavePending.remove(effectiveId)
+                        removeAutosavePending(effectiveId)
                         clearDocumentAccessFailure(destination.toString())
                         recordPortableBaseline(effectiveId, nextDirectory!!)
                         changeState { s ->
