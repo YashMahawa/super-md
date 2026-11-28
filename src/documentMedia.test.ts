@@ -60,6 +60,90 @@ describe("portable media", () => {
     const result = await prepareFmd("# Keep\n\n![Proof][p]\n\n[p]: proof.png \"A title\"\n", "/notes/a.md");
     expect(result.content).toContain("![Proof][p]"); expect(result.content).toMatch(/\[p\]: <assets\/image-.*\.png> "A title"/);
   });
+  it("omits unchanged local portable assets without load_asset IPC while packing newly referenced images", async () => {
+    native.mockReset().mockImplementation(async (command: string, args?: { source?: string }) => {
+      if (command === "load_asset" && args?.source === "diagrams/new-arch.png") {
+        return "data:image/png;base64,aGVsbG8=";
+      }
+      throw new Error(`Unexpected IPC call: ${command} ${JSON.stringify(args)}`);
+    });
+    const deck = {
+      title: "Architecture",
+      steps: [
+        { label: "Unchanged slide", image: "assets/step-1.png", markdown: "![Nested unchanged](assets/fig-1.png)" },
+      ],
+    };
+    const md = [
+      "# Lecture",
+      "",
+      "![Unchanged](assets/fig-1.png)",
+      "![Ref unchanged][r]",
+      "",
+      "[r]: assets/fig-2.svg \"Diagram\"",
+      "",
+      '<img src="assets/inline-existing.png" width="240" alt="Existing">',
+      "",
+      "![[assets/fig-1.png|Wiki local]]",
+      "",
+      "![Newly added](diagrams/new-arch.png)",
+      "",
+      "![Inline data](data:image/gif;base64,R0lGODlhAQABAAAAACw=)",
+      "",
+      "![Unapproved remote](https://untrusted.example/stays-remote.png)",
+      "",
+      "```smd-steps",
+      JSON.stringify(deck, null, 2),
+      "```",
+      "",
+    ].join("\n");
+
+    const result = await prepareFmd(md, "content://vault/Lecture.smd", {
+      portable: true,
+      localAssets: ["assets/fig-1.png", "assets/fig-2.svg", "assets/step-1.png", "assets/inline-existing.png"],
+      omitLocalAssets: true,
+      trustedImageHosts: [],
+      approvedImageUrls: [],
+    });
+
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(native).toHaveBeenCalledWith("load_asset", {
+      documentPath: "content://vault/Lecture.smd",
+      source: "diagrams/new-arch.png",
+    });
+    expect(result.content).toContain("![Unchanged](assets/fig-1.png)");
+    expect(result.content).toContain('[r]: assets/fig-2.svg "Diagram"');
+    expect(result.content).toContain('<img src="assets/inline-existing.png" width="240" alt="Existing">');
+    expect(result.content).toContain("![Wiki local](<assets/fig-1.png>)");
+    expect(result.content).toContain("![Unapproved remote](https://untrusted.example/stays-remote.png)");
+    expect(result.content).toContain('"image": "assets/step-1.png"');
+    expect(Object.keys(result.assets)).toHaveLength(2);
+    for (const key of ["assets/fig-1.png", "assets/fig-2.svg", "assets/step-1.png", "assets/inline-existing.png"]) {
+      expect(result.assets[key]).toBeUndefined();
+    }
+    expect(Object.values(result.assets)).toEqual(
+      expect.arrayContaining(["data:image/png;base64,aGVsbG8=", "data:image/gif;base64,R0lGODlhAQABAAAAACw="]),
+    );
+  });
+  it("packs approved HTML img remote sources while keeping unapproved HTML img tags untouched", async () => {
+    const remoteSvg = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=";
+    native.mockReset().mockImplementation(async (command: string) => {
+      if (command === "fetch_resource") return { body: remoteSvg };
+      throw new Error(`Unexpected IPC: ${command}`);
+    });
+    const htmlMd = [
+      '<img src="https://images.example/diagram.svg" alt="Trusted">',
+      '<img src="//untrusted.example/proto.svg" alt="Protocol relative">',
+    ].join("\n\n");
+    const packed = await prepareFmd(htmlMd, "/notes/consent.smd", {
+      trustedImageHosts: ["images.example"],
+      approvedImageUrls: [],
+    });
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(native).toHaveBeenCalledWith("fetch_resource", { url: "https://images.example/diagram.svg", image: true });
+    expect(Object.values(packed.assets)).toEqual([remoteSvg]);
+    expect(packed.content).toMatch(/<img src="assets\/image-.*\.svg" alt="Trusted">/);
+    expect(packed.content).toContain('<img src="//untrusted.example/proto.svg" alt="Protocol relative">');
+  });
   it("preserves existing 151 to 159 character safe portable asset names across .smd paths, opaque SAF URIs, and smd-steps", async () => {
     native.mockReset().mockResolvedValue("data:image/svg+xml;base64,PHN2Zy8+");
     const compatKey = `assets/${"a".repeat(155)}.svg`;
@@ -77,6 +161,108 @@ describe("portable media", () => {
     const overCap = await prepareFmd(`![TooLong](<${overCapKey}>)\n`, "content://com.example.provider/document/doc-42", { portable: true });
     expect(overCap.content).toMatch(/!\[TooLong\]\(<assets\/image-.*\.svg>\)/);
     expect(Object.keys(overCap.assets)).not.toContain(overCapKey);
+  });
+  it("uses the first duplicate reference definition in imageRanges and prepareFmd while preserving source offsets", async () => {
+    const firstPng = `data:image/png;base64,${btoa("first-png")}`;
+    const earlySvg = `data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0L4 4"/></svg>')}`;
+    const slideFirstPng = `data:image/png;base64,${btoa("slide-first-png")}`;
+    native.mockImplementation(async (command: string, args: { source?: string; url?: string }) => {
+      if (command === "load_asset" && args.source === "local/first.png") return firstPng;
+      if (command === "load_asset" && args.source === "local/early-first.svg") return earlySvg;
+      if (command === "load_asset" && args.source === "local/slide-first.png") return slideFirstPng;
+      throw new Error(`Unexpected load for shadowed definition: ${command} ${JSON.stringify(args)}`);
+    });
+
+    const deck = {
+      title: "Duplicate slide refs",
+      steps: [
+        {
+          label: "Step 1",
+          markdown: "![Slide][s]\n\n[s]: local/slide-first.png\n[s]: local/slide-second.png",
+        },
+      ],
+    };
+    const md = [
+      "---",
+      'title: "😀 Portable Duplicate Definitions"',
+      "---",
+      "",
+      "$$\\begin{aligned}",
+      "a &= b \\\\",
+      "\\end{aligned}$$",
+      "",
+      "[early]: local/early-first.svg",
+      "[early]: https://untrusted.example/shadowed-early.svg",
+      "",
+      "Lead 😀 prose before ![Early][early] and ![Hero][Fig   Ref] plus ![Sibling](local/first.png).",
+      "",
+      '[Fig   Ref]: local/first.png "First caption"',
+      '[fig ref]: local/second.png "Shadowed caption"',
+      "",
+      "![[wiki.png|Wiki Tail]]",
+      "",
+      "```smd-steps",
+      JSON.stringify(deck, null, 2),
+      "```",
+      "",
+      "## Tail 😀",
+      "Keep [Anchor](#tail) exact.",
+      "",
+    ].join("\n");
+
+    const ranges = imageRanges(md);
+    expect(ranges.map((range) => ({ source: range.source, text: md.slice(range.from, range.to), from: range.from }))).toEqual([
+      { source: "local/early-first.svg", text: "![Early][early]", from: md.indexOf("![Early][early]") },
+      { source: "local/first.png", text: "![Hero][Fig   Ref]", from: md.indexOf("![Hero][Fig   Ref]") },
+      { source: "local/first.png", text: "![Sibling](local/first.png)", from: md.indexOf("![Sibling](local/first.png)") },
+      { source: "wiki.png", text: "![[wiki.png|Wiki Tail]]", from: md.indexOf("![[wiki.png|Wiki Tail]]") },
+    ]);
+
+    const wikiPng = `data:image/png;base64,${btoa("wiki-png")}`;
+    native.mockImplementation(async (command: string, args: { source?: string; url?: string }) => {
+      if (command === "load_asset" && args.source === "local/first.png") return firstPng;
+      if (command === "load_asset" && args.source === "local/early-first.svg") return earlySvg;
+      if (command === "load_asset" && args.source === "local/slide-first.png") return slideFirstPng;
+      if (command === "load_asset" && args.source === "wiki.png") return wikiPng;
+      throw new Error(`Unexpected load for shadowed definition: ${command} ${JSON.stringify(args)}`);
+    });
+
+    const packed = await prepareFmd(md, "/notes/portable.smd");
+    expect(Object.values(packed.assets).sort()).toEqual([earlySvg, firstPng, slideFirstPng, wikiPng].sort());
+
+    const earlyAsset = Object.entries(packed.assets).find(([, data]) => data === earlySvg)![0];
+    const firstAsset = Object.entries(packed.assets).find(([, data]) => data === firstPng)![0];
+    const slideAsset = Object.entries(packed.assets).find(([, data]) => data === slideFirstPng)![0];
+    const wikiAsset = Object.entries(packed.assets).find(([, data]) => data === wikiPng)![0];
+
+    expect(packed.content).toContain(`[early]: <${earlyAsset}>`);
+    expect(packed.content).toContain("[early]: https://untrusted.example/shadowed-early.svg");
+    expect(packed.content).toContain(`[Fig   Ref]: <${firstAsset}> "First caption"`);
+    expect(packed.content).toContain('[fig ref]: local/second.png "Shadowed caption"');
+
+    // Verify exact source offsets before the first edit and across the rewritten document.
+    const earlyDefStart = md.indexOf("[early]: local/early-first.svg");
+    expect(packed.content.slice(0, earlyDefStart)).toBe(md.slice(0, earlyDefStart));
+    const earlyDelta = `[early]: <${earlyAsset}>`.length - "[early]: local/early-first.svg".length;
+    expect(packed.content.indexOf("![Early][early]")).toBe(md.indexOf("![Early][early]") + earlyDelta);
+    expect(packed.content.indexOf("![Hero][Fig   Ref]")).toBe(md.indexOf("![Hero][Fig   Ref]") + earlyDelta);
+
+    const packedRanges = imageRanges(packed.content);
+    expect(packedRanges.map((range) => ({
+      source: range.source,
+      text: packed.content.slice(range.from, range.to),
+    }))).toEqual([
+      { source: earlyAsset, text: "![Early][early]" },
+      { source: firstAsset, text: "![Hero][Fig   Ref]" },
+      { source: firstAsset, text: `![Sibling](<${firstAsset}>)` },
+      { source: wikiAsset, text: `![Wiki Tail](<${wikiAsset}>)` },
+    ]);
+
+    const packedDeck = JSON.parse(/```smd-steps\n([\s\S]*?)\n```/.exec(packed.content)![1]);
+    expect(packedDeck.steps[0].markdown).toBe(
+      `![Slide][s]\n\n[s]: <${slideAsset}>\n[s]: local/slide-second.png`,
+    );
+    expect(packed.content.endsWith("\n## Tail 😀\nKeep [Anchor](#tail) exact.\n")).toBe(true);
   });
   it("recognizes real YouTube hosts and uses oEmbed titles and optional thumbnails", async () => {
     expect(youtubeUrl("https://youtu.be/dQw4w9WgXcQ?t=10")).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");

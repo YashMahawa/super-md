@@ -3,8 +3,6 @@ import { parseFrontmatter, type ParsedFrontmatter } from "./frontmatter";
 export type SourceRange = { from: number; to: number };
 
 const MAX_SOURCE_INDEX_HOSTS = 8;
-const MAX_HIDDEN_SCAN_CHARS = 200_000;
-const INLINE_HTML_TAG_TOKEN = /<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/yi;
 export const SOURCE_CANDIDATE_SELECTOR = ".live-block,[data-windowed-block],[data-source-start],.code-container";
 const SOURCE_INDEX_ATTR_FILTER = ["data-source-start", "data-source-end", "data-windowed-mounted", "data-windowed-block", "class"];
 
@@ -45,98 +43,8 @@ const sourceRangeIndexCache = new Map<Element, SourceRangeIndex>();
 let cachedFmContent: string | null = null, cachedFmResult: ParsedFrontmatter | null = null;
 
 export function getParsedFrontmatter(content: string): ParsedFrontmatter | null {
-  if (cachedFmContent !== content) {
-    cachedFmContent = content;
-    cachedFmResult = parseFrontmatter(content, { includeSpans: true });
-  }
+  if (cachedFmContent !== content) { cachedFmContent = content; cachedFmResult = parseFrontmatter(content, { includeSpans: true }); }
   return cachedFmResult;
-}
-
-export function firstSourceRangeFrom(ranges: SourceRange[], minFrom: number, end = ranges.length): number {
-  let lo = 0, hi = Math.min(end, ranges.length);
-  while (lo < hi) { const mid = (lo + hi) >>> 1; if (ranges[mid].from < minFrom) lo = mid + 1; else hi = mid; }
-  return lo;
-}
-
-function skipInlineCodeSpan(raw: string, openIndex: number, unclosedTicks?: Set<number>): number {
-  let ticks = 1;
-  while (raw[openIndex + ticks] === "`") ticks++;
-  if (unclosedTicks?.has(ticks)) return openIndex + ticks - 1;
-  for (let pos = openIndex + ticks; pos < raw.length; ) {
-    const hit = raw.indexOf("`", pos);
-    if (hit < 0) break;
-    let run = 1;
-    while (raw[hit + run] === "`") run++;
-    if (run === ticks) return hit + run - 1;
-    pos = hit + run;
-  }
-  unclosedTicks?.add(ticks);
-  return openIndex + ticks - 1;
-}
-
-function scanBalancedInlineDelimiter(raw: string, openIndex: number, openChar: string, closeChar: string, allowCodeSpans: boolean, unclosedTicks?: Set<number>): number {
-  if (raw[openIndex] !== openChar) return raw.length;
-  for (let i = openIndex, depth = 0; i < raw.length; i++) {
-    const ch = raw[i];
-    if (ch === "\\") { i++; continue; }
-    if (allowCodeSpans && ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
-    if (ch === openChar) depth++;
-    else if (ch === closeChar && --depth === 0) return i;
-  }
-  return raw.length;
-}
-
-export const markdownBracketEnd = (raw: string, openIndex = 0): number => scanBalancedInlineDelimiter(raw, openIndex, "[", "]", true);
-
-export function markdownLinkTailEnd(raw: string, afterBracket: number, unclosedTicks?: Set<number>): number {
-  if (raw[afterBracket] === "(") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "(", ")", false); return close < raw.length ? close + 1 : raw.length; }
-  if (raw[afterBracket] === "[") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "[", "]", true, unclosedTicks); return close < raw.length ? close + 1 : raw.length; }
-  return afterBracket;
-}
-
-export function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
-  if (!raw || raw.length > MAX_HIDDEN_SCAN_CHARS) return [];
-  const rawHidden: SourceRange[] = [], stack: Array<{ openIndex: number; isImage: boolean; slot: number }> = [], unclosedTicks = new Set<number>();
-  let noCommentClose = false;
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
-    if (ch === "\\") { i++; continue; }
-    if (ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
-    if (ch === "<") {
-      if (raw.startsWith("<!--", i)) {
-        const close = noCommentClose ? -1 : raw.indexOf("-->", i + 4);
-        if (close >= 0) { rawHidden.push({ from: offset + i, to: offset + close + 3 }); i = close + 2; continue; }
-        noCommentClose = true;
-      } else {
-        INLINE_HTML_TAG_TOKEN.lastIndex = i;
-        const tagMatch = INLINE_HTML_TAG_TOKEN.exec(raw);
-        if (tagMatch) { const end = i + tagMatch[0].length; rawHidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
-      }
-    } else if (ch === "!" && raw[i + 1] === "[") {
-      stack.push({ openIndex: i, isImage: true, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i }); i++;
-    } else if (ch === "[") {
-      stack.push({ openIndex: i, isImage: false, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i });
-    } else if (ch === "]" && stack.length) {
-      const frame = stack.pop()!, end = markdownLinkTailEnd(raw, i + 1, unclosedTicks);
-      if (end > i + 1) {
-        if (frame.isImage) { rawHidden.length = frame.slot; rawHidden.push({ from: offset + frame.openIndex, to: offset + end }); }
-        else { rawHidden[frame.slot].to = offset + frame.openIndex + 1; rawHidden.push({ from: offset + i, to: offset + end }); }
-        i = end - 1;
-      }
-    }
-  }
-  const hidden: SourceRange[] = [];
-  for (const span of rawHidden) {
-    if (span.to <= span.from) continue;
-    const prev = hidden[hidden.length - 1];
-    if (prev && prev.to >= span.from) prev.to = Math.max(prev.to, span.to); else hidden.push(span);
-  }
-  return hidden;
-}
-
-export function isCoveredByHiddenSpan(hidden: SourceRange[], candidate: SourceRange): boolean {
-  const idx = firstSourceRangeFrom(hidden, candidate.from);
-  return (idx < hidden.length && hidden[idx].from === candidate.from && candidate.to <= hidden[idx].to) || (idx > 0 && candidate.to <= hidden[idx - 1].to);
 }
 
 export function sourceBounds(el: Element, content?: string): { start: number; end: number } | null {
@@ -178,28 +86,6 @@ export function sourceBoundsForElement(el: Element, content?: string, sharedInde
     if (entry) return { start: entry.start, end: entry.end };
   }
   return sourceBounds(el, content);
-}
-
-export function visibleSourceSpan(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): { start: number; end: number } | null {
-  const bounds = sourceBoundsForElement(owner, content, sharedIndex);
-  if (!bounds) return null;
-  const { start, end } = bounds, raw = content.slice(start, end);
-  if (owner.tagName === "A" && raw.startsWith("[")) {
-    const close = markdownBracketEnd(raw, 0);
-    return close < raw.length ? { start: start + 1, end: start + close } : bounds;
-  }
-  if (owner.matches("details.callout,aside.callout")) {
-    const marker = raw.match(/^\s*(?:>[ \t]*)?\[![\w-]+\][+-]?[ \t]*/i);
-    if (marker) return { start: start + marker[0].length, end };
-  }
-  if (owner.matches(".code-container,.python-cell")) {
-    const firstBreak = raw.indexOf("\n");
-    if (firstBreak < 0) return { start: end, end };
-    const trimmed = raw.replace(/\s+$/, ""), lastBreak = trimmed.lastIndexOf("\n");
-    const bodyEnd = lastBreak >= firstBreak && /^\s*(?:`{3,}|~{3,})\s*$/.test(trimmed.slice(lastBreak + 1)) ? start + lastBreak : end;
-    return { start: Math.min(start + firstBreak + 1, bodyEnd), end: bodyEnd };
-  }
-  return bounds;
 }
 
 function upperBoundSourceStart(entries: SourceIndexEntry[], maxStart: number): number {
@@ -264,7 +150,7 @@ function rebuildSourceRangeIndex(record: SourceRangeIndex, content?: string): vo
   record.buildVersion++;
 }
 
-function refreshSourceRangeIndex(record: SourceRangeIndex, content?: string): SourceRangeIndex {
+export function refreshSourceRangeIndex(record: SourceRangeIndex, content?: string): SourceRangeIndex {
   const nextWindowTarget = record.host.closest(".android-reading,.reading-scroll") ?? record.host;
   if (record.windowTarget !== nextWindowTarget) {
     record.windowTarget.removeEventListener("supermd-window-change", record.onWindowChange);
@@ -281,7 +167,7 @@ function refreshSourceRangeIndex(record: SourceRangeIndex, content?: string): So
   return record;
 }
 
-function findAncestorSourceIndex(el: Element, content?: string): SourceRangeIndex | undefined {
+export function findAncestorSourceIndex(el: Element, content?: string): SourceRangeIndex | undefined {
   for (let anc: Element | null = el; anc; anc = anc.parentElement) {
     const hit = sourceRangeIndexCache.get(anc);
     if (hit) return refreshSourceRangeIndex(hit, content);
@@ -380,31 +266,6 @@ export function deepestSourceOwner(block: HTMLElement, range: SourceRange, conte
     if (bounds && bounds.start <= range.from && range.to <= bounds.end && bounds.end - bounds.start <= ownerLen) { owner = el; ownerLen = bounds.end - bounds.start; }
   }
   return owner;
-}
-
-export function getCachedOwnerSpans(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): CachedOwnerSpans {
-  const index = sharedIndex ? refreshSourceRangeIndex(sharedIndex, content) : findAncestorSourceIndex(owner, content);
-  if (index && index.lastContent === content) {
-    const hit = index.ownerSpans.get(owner);
-    if (hit) return hit;
-    const visible = visibleSourceSpan(owner, content, index);
-    const hidden = visible && !owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= MAX_HIDDEN_SCAN_CHARS
-      ? hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start) : null;
-    const computed: CachedOwnerSpans = { visible, hidden };
-    index.ownerSpans.set(owner, computed);
-    return computed;
-  }
-  const visible = visibleSourceSpan(owner, content, index);
-  const hidden = visible && !owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= MAX_HIDDEN_SCAN_CHARS
-    ? hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start) : null;
-  return { visible, hidden };
-}
-
-export function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, sharedIndex?: SourceRangeIndex): boolean {
-  const { visible, hidden } = getCachedOwnerSpans(owner, content, sharedIndex);
-  if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
-  if (deepestSourceOwner(owner, candidate, content, sharedIndex) !== owner) return false;
-  return !(hidden && isCoveredByHiddenSpan(hidden, candidate));
 }
 
 export function resolveSourceBlock(host: Element, range: SourceRange, content?: string): HTMLElement | null {

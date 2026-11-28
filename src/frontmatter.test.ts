@@ -1,5 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { frontmatterVisibleValueSpans, maskFrontmatter, parseFrontmatter } from "./frontmatter";
+import conformanceJson from "../test-fixtures/frontmatter-conformance.json";
+import { frontmatterVisibleValueSpans, maskFrontmatter, parseFrontmatter, type YamlValue } from "./frontmatter";
+
+interface ConformanceCase {
+  id: string;
+  valid: boolean;
+  markdown: string;
+  body: string;
+  entries?: Record<string, YamlValue>;
+  metadata?: {
+    title: string | null;
+    authors: string[];
+    description: string | null;
+    keywords: string[];
+    tags: string[];
+  } | null;
+}
+
+const conformance = conformanceJson as { version: number; cases: ConformanceCase[] };
 
 describe("YAML frontmatter parser", () => {
   it("recognizes UTF-8 BOM, trailing spaces, dot closers, empty blocks, CRLF, and EOF closers", () => {
@@ -229,6 +247,78 @@ describe("YAML frontmatter parser", () => {
     ]) {
       expect(parseFrontmatter(malformed, { includeSpans: true })).toBeNull();
       expect(frontmatterVisibleValueSpans(malformed)).toEqual([]);
+    }
+  });
+
+  it("matches shared cross-runtime frontmatter conformance vectors and preserves single-parser Find/Replace spans", () => {
+    expect(conformance.version).toBe(1);
+    expect(conformance.cases.length).toBeGreaterThanOrEqual(20);
+    for (const item of conformance.cases) {
+      const parsed = parseFrontmatter(item.markdown);
+      const parsedWithSpans = parseFrontmatter(item.markdown, { includeSpans: true });
+      const masked = maskFrontmatter(item.markdown);
+      expect(masked, item.id).toHaveLength(item.markdown.length);
+      for (let i = 0; i < item.markdown.length; i++) {
+        if (item.markdown[i] === "\r" || item.markdown[i] === "\n") {
+          expect(masked[i], item.id).toBe(item.markdown[i]);
+        }
+      }
+      if (!item.valid) {
+        expect(parsed, item.id).toBeNull();
+        expect(parsedWithSpans, item.id).toBeNull();
+        expect(frontmatterVisibleValueSpans(item.markdown), item.id).toEqual([]);
+        expect(masked, item.id).toBe(item.markdown);
+        continue;
+      }
+      expect(parsed, item.id).not.toBeNull();
+      expect(parsedWithSpans, item.id).not.toBeNull();
+      expect(item.markdown.slice(parsed!.end), item.id).toBe(item.body);
+      expect(parsed!.raw + item.body, item.id).toBe(item.markdown);
+      expect(masked.slice(parsed!.end), item.id).toBe(item.body);
+      expect(parsed!.entries, item.id).toEqual(item.entries);
+      expect(parsedWithSpans!.end, item.id).toBe(parsed!.end);
+      expect(parsedWithSpans!.entries, item.id).toEqual(parsed!.entries);
+      expect(parsedWithSpans!.properties, item.id).toEqual(parsed!.properties);
+      const spans = frontmatterVisibleValueSpans(item.markdown);
+      expect(parsedWithSpans!.visibleSpans, item.id).toEqual(spans);
+      for (const s of spans) {
+        expect(s.start, item.id).toBeGreaterThanOrEqual(0);
+        expect(s.end, item.id).toBeGreaterThan(s.start);
+        expect(s.end, item.id).toBeLessThanOrEqual(parsed!.end);
+      }
+      if (item.metadata === null) {
+        expect(parsed!.properties, item.id).toBeNull();
+        expect(spans, item.id).toEqual([]);
+      } else if (item.metadata) {
+        expect(parsed!.properties, item.id).not.toBeNull();
+        expect(parsed!.properties!.title, item.id).toBe(item.metadata.title ?? undefined);
+        expect(parsed!.properties!.authors, item.id).toEqual(item.metadata.authors);
+        expect(parsed!.properties!.description, item.id).toBe(item.metadata.description ?? undefined);
+        expect(parsed!.properties!.tags, item.id).toEqual(item.metadata.tags);
+      }
+      if (item.id === "metadata_case_insensitive_authors") {
+        expect(spans.map((s) => ({ field: s.field, fieldOrdinal: s.fieldOrdinal, text: item.markdown.slice(s.start, s.end) }))).toEqual([
+          { field: "title", fieldOrdinal: 0, text: "Statistical Mechanics" },
+          { field: "author", fieldOrdinal: 0, text: "Ludwig Boltzmann" },
+          { field: "author", fieldOrdinal: 0, text: "Josiah" },
+          { field: "author", fieldOrdinal: 0, text: "Gibbs" },
+          { field: "author", fieldOrdinal: 0, text: "Emmy" },
+          { field: "author", fieldOrdinal: 0, text: "Noether" },
+          { field: "author", fieldOrdinal: 0, text: "Paul Dirac" },
+          { field: "tag", fieldOrdinal: 0, text: "physics" },
+          { field: "tag", fieldOrdinal: 1, text: "entropy" },
+          { field: "tag", fieldOrdinal: 2, text: "ensembles" },
+        ]);
+      }
+      if (item.id === "unicode_nbsp_whitespace") {
+        expect(spans.map((s) => ({ field: s.field, fieldOrdinal: s.fieldOrdinal, text: item.markdown.slice(s.start, s.end) }))).toEqual([
+          { field: "title", fieldOrdinal: 0, text: "Conservation Laws" },
+          { field: "author", fieldOrdinal: 0, text: "Emmy Noether" },
+          { field: "tag", fieldOrdinal: 0, text: "flow-alpha" },
+          { field: "tag", fieldOrdinal: 1, text: "flow-beta" },
+          { field: "tag", fieldOrdinal: 2, text: "seq-gamma" },
+        ]);
+      }
     }
   });
 

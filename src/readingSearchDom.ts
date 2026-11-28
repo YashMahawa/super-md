@@ -4,22 +4,19 @@ import { type FrontmatterVisibleField, type FrontmatterVisibleSpan } from "./fro
 import { cancelHeadingNavigation } from "./documentNavigation";
 import { refreshDocumentExtent } from "./documentZoom";
 import {
-  SOURCE_CANDIDATE_SELECTOR, deepestSourceOwner, findContainingBlock, findContainingBlockInIndex,
-  firstSourceRangeFrom, getParsedFrontmatter, getSourceRangeIndex, hiddenSpansInSlice, invalidateSourceRangeIndex,
-  isDirectVisibleMatch, markdownBracketEnd, markdownLinkTailEnd, resolveSourceBlock, sourceBoundsForElement,
-  type SourceRange, type SourceRangeIndex,
+  SOURCE_CANDIDATE_SELECTOR, deepestSourceOwner, findAncestorSourceIndex, findContainingBlock, findContainingBlockInIndex,
+  getParsedFrontmatter, getSourceRangeIndex, invalidateSourceRangeIndex, refreshSourceRangeIndex, resolveSourceBlock,
+  sourceBoundsForElement, type SourceRange, type SourceRangeIndex,
 } from "./readingSearchSourceIndex";
 export type { SearchMatchConfig, SearchMatchOptions, SourceRange };
-export {
-  deepestSourceOwner, findContainingBlock, firstSourceRangeFrom, hiddenSpansInSlice,
-  invalidateSourceRangeIndex, markdownBracketEnd, markdownLinkTailEnd, resolveSourceBlock,
-};
+export { deepestSourceOwner, findContainingBlock, invalidateSourceRangeIndex, resolveSourceBlock };
 
 export const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 export const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
 export type HighlightRegistry = Map<string, unknown>;
 
-const MAX_SEARCH_MATCHES = 5000;
+const MAX_SEARCH_MATCHES = 5000, MAX_HIDDEN_SCAN_CHARS = 200_000;
+const INLINE_HTML_TAG_TOKEN = /<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/yi;
 const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
 const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|is-offstage)(?:\s|$)/;
 const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
@@ -65,6 +62,11 @@ export function getSearchDomVersion(el: Element): { root: Element; version: numb
 function searchOptionKey(query: string, options: SearchMatchConfig): string {
   const { caseSensitive, wholeWord, regexp } = normalizeSearchOptions(options);
   return `${query}\0${caseSensitive ? 1 : 0}${wholeWord ? 1 : 0}${regexp ? 1 : 0}`;
+}
+export function firstSourceRangeFrom(ranges: SourceRange[], minFrom: number, end = ranges.length): number {
+  let lo = 0, hi = Math.min(end, ranges.length);
+  while (lo < hi) { const mid = (lo + hi) >>> 1; if (ranges[mid].from < minFrom) lo = mid + 1; else hi = mid; }
+  return lo;
 }
 export function findMatchingSourceRangeIndex(ranges: SourceRange[], target: SourceRange): number {
   for (let i = firstSourceRangeFrom(ranges, target.from); i < ranges.length && ranges[i].from === target.from; i++) if (ranges[i].to === target.to) return i;
@@ -112,6 +114,78 @@ function expandRegexReplacement(replacement: string, match: RegExpExecArray, sou
   });
 }
 
+function skipInlineCodeSpan(raw: string, openIndex: number, unclosedTicks?: Set<number>): number {
+  let ticks = 1;
+  while (raw[openIndex + ticks] === "`") ticks++;
+  if (unclosedTicks?.has(ticks)) return openIndex + ticks - 1;
+  for (let pos = openIndex + ticks; pos < raw.length; ) {
+    const hit = raw.indexOf("`", pos);
+    if (hit < 0) break;
+    let run = 1;
+    while (raw[hit + run] === "`") run++;
+    if (run === ticks) return hit + run - 1;
+    pos = hit + run;
+  }
+  unclosedTicks?.add(ticks);
+  return openIndex + ticks - 1;
+}
+function scanBalancedInlineDelimiter(raw: string, openIndex: number, openChar: string, closeChar: string, allowCodeSpans: boolean, unclosedTicks?: Set<number>): number {
+  if (raw[openIndex] !== openChar) return raw.length;
+  for (let i = openIndex, depth = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === "\\") { i++; continue; }
+    if (allowCodeSpans && ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
+    if (ch === openChar) depth++;
+    else if (ch === closeChar && --depth === 0) return i;
+  }
+  return raw.length;
+}
+export const markdownBracketEnd = (raw: string, openIndex = 0): number => scanBalancedInlineDelimiter(raw, openIndex, "[", "]", true);
+export function markdownLinkTailEnd(raw: string, afterBracket: number, unclosedTicks?: Set<number>): number {
+  if (raw[afterBracket] === "(") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "(", ")", false); return close < raw.length ? close + 1 : raw.length; }
+  if (raw[afterBracket] === "[") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "[", "]", true, unclosedTicks); return close < raw.length ? close + 1 : raw.length; }
+  return afterBracket;
+}
+export function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
+  if (!raw || raw.length > MAX_HIDDEN_SCAN_CHARS) return [];
+  const rawHidden: SourceRange[] = [], stack: Array<{ openIndex: number; isImage: boolean; slot: number }> = [], unclosedTicks = new Set<number>();
+  let noCommentClose = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === "\\") { i++; continue; }
+    if (ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
+    if (ch === "<") {
+      if (raw.startsWith("<!--", i)) {
+        const close = noCommentClose ? -1 : raw.indexOf("-->", i + 4);
+        if (close >= 0) { rawHidden.push({ from: offset + i, to: offset + close + 3 }); i = close + 2; continue; }
+        noCommentClose = true;
+      } else {
+        INLINE_HTML_TAG_TOKEN.lastIndex = i;
+        const tagMatch = INLINE_HTML_TAG_TOKEN.exec(raw);
+        if (tagMatch) { const end = i + tagMatch[0].length; rawHidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
+      }
+    } else if (ch === "!" && raw[i + 1] === "[") {
+      stack.push({ openIndex: i, isImage: true, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i }); i++;
+    } else if (ch === "[") {
+      stack.push({ openIndex: i, isImage: false, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i });
+    } else if (ch === "]" && stack.length) {
+      const frame = stack.pop()!, end = markdownLinkTailEnd(raw, i + 1, unclosedTicks);
+      if (end > i + 1) {
+        if (frame.isImage) { rawHidden.length = frame.slot; rawHidden.push({ from: offset + frame.openIndex, to: offset + end }); }
+        else { rawHidden[frame.slot].to = offset + frame.openIndex + 1; rawHidden.push({ from: offset + i, to: offset + end }); }
+        i = end - 1;
+      }
+    }
+  }
+  const hidden: SourceRange[] = [];
+  for (const span of rawHidden) {
+    if (span.to <= span.from) continue;
+    const prev = hidden[hidden.length - 1];
+    if (prev && prev.to >= span.from) prev.to = Math.max(prev.to, span.to); else hidden.push(span);
+  }
+  return hidden;
+}
+
 export function openDisclosuresFor(target: Element | null, scope?: Element | null, range?: Range | null, sourceRange?: SourceRange): boolean {
   let opened = false;
   for (const anchor of [rangeStartElement(range ?? null), target, scope]) {
@@ -131,8 +205,52 @@ export function openDisclosuresFor(target: Element | null, scope?: Element | nul
   }
   return opened;
 }
+function visibleSourceSpan(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): { start: number; end: number } | null {
+  const bounds = sourceBoundsForElement(owner, content, sharedIndex);
+  if (!bounds) return null;
+  const { start, end } = bounds, raw = content.slice(start, end);
+  if (owner.tagName === "A" && raw.startsWith("[")) { const close = markdownBracketEnd(raw, 0); return close < raw.length ? { start: start + 1, end: start + close } : bounds; }
+  if (owner.matches("details.callout,aside.callout")) { const marker = raw.match(/^\s*(?:>[ \t]*)?\[![\w-]+\][+-]?[ \t]*/i); if (marker) return { start: start + marker[0].length, end }; }
+  if (owner.matches(".code-container,.python-cell")) {
+    const firstBreak = raw.indexOf("\n");
+    if (firstBreak < 0) return { start: end, end };
+    const trimmed = raw.replace(/\s+$/, ""), lastBreak = trimmed.lastIndexOf("\n");
+    const bodyEnd = lastBreak >= firstBreak && /^\s*(?:`{3,}|~{3,})\s*$/.test(trimmed.slice(lastBreak + 1)) ? start + lastBreak : end;
+    return { start: Math.min(start + firstBreak + 1, bodyEnd), end: bodyEnd };
+  }
+  return bounds;
+}
 
 const ownerDomScope = (owner: HTMLElement): Element => owner.matches(".code-container,.python-cell") ? (owner.querySelector("pre.python-source,pre") ?? owner) : owner;
+
+const ownerHiddenSpans = (owner: HTMLElement, content: string, visible: { start: number; end: number }): SourceRange[] =>
+  !owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= MAX_HIDDEN_SCAN_CHARS
+    ? hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start) : [];
+
+function isCoveredByHiddenSpan(hidden: SourceRange[], candidate: SourceRange): boolean {
+  const idx = firstSourceRangeFrom(hidden, candidate.from);
+  return (idx < hidden.length && hidden[idx].from === candidate.from && candidate.to <= hidden[idx].to) || (idx > 0 && candidate.to <= hidden[idx - 1].to);
+}
+
+function getCachedOwnerSpans(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): { visible: { start: number; end: number } | null; hidden: SourceRange[] } {
+  const index = sharedIndex ? refreshSourceRangeIndex(sharedIndex, content) : findAncestorSourceIndex(owner, content);
+  if (index && index.lastContent === content) {
+    const hit = index.ownerSpans.get(owner);
+    if (hit) return { visible: hit.visible, hidden: hit.hidden ?? [] };
+    const visible = visibleSourceSpan(owner, content, index), hidden = visible ? ownerHiddenSpans(owner, content, visible) : [];
+    index.ownerSpans.set(owner, { visible, hidden });
+    return { visible, hidden };
+  }
+  const visible = visibleSourceSpan(owner, content, index);
+  return { visible, hidden: visible ? ownerHiddenSpans(owner, content, visible) : [] };
+}
+
+function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, sharedIndex?: SourceRangeIndex): boolean {
+  const { visible, hidden } = getCachedOwnerSpans(owner, content, sharedIndex);
+  if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
+  return deepestSourceOwner(owner, candidate, content, sharedIndex) === owner && !isCoveredByHiddenSpan(hidden, candidate);
+}
+
 function directOwnerDomRanges(owner: HTMLElement, query: string, options: SearchMatchConfig): Range[] {
   return readingMatches(ownerDomScope(owner), query, options).filter(r => {
     if (owner.matches(".code-container,.python-cell") && r.startContainer.parentElement?.closest("summary")) return false;
@@ -191,13 +309,6 @@ export function mapFrontmatterSourceRangeToDomRange(host: Element, content: stri
   return ordinal >= 0 ? (domRanges[ordinal] ?? null) : null;
 }
 
-function resolveSourceHighlightRangeWithIndex(host: Element, content: string, ranges: SourceRange[], activeIndex: number, query: string, options: SearchMatchConfig, index: SourceRangeIndex, knownBlock?: HTMLElement | null): Range | null {
-  const target = ranges[activeIndex];
-  if (!target) return null;
-  const block = knownBlock !== undefined ? knownBlock : findContainingBlockInIndex(index, target);
-  return block ? mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options, index) : mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
-}
-
 export function mapDomRangeToSourceIndex(host: Element, content: string, ranges: SourceRange[], domRange: Range, query: string, options: SearchMatchConfig = false, sharedIndex?: SourceRangeIndex): number {
   const common = domRange.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? domRange.commonAncestorContainer as Element : domRange.commonAncestorContainer.parentElement;
   const fmFieldEl = common?.closest<HTMLElement>("[data-frontmatter-field]");
@@ -233,7 +344,11 @@ export function mapDomRangeToSourceIndex(host: Element, content: string, ranges:
   for (let i = scopeBounds ? firstSourceRangeFrom(ranges, scopeBounds.start) : 0; i < ranges.length; i++) {
     const candidate = ranges[i];
     if (scopeBounds && candidate.from > scopeBounds.end) break;
-    const resolved = resolveSourceHighlightRangeWithIndex(host, content, ranges, i, query, options, index);
+    const block = findContainingBlockInIndex(index, candidate);
+    if (block && !block.contains(domRange.startContainer)) continue;
+    const resolved = block
+      ? mapSourceRangeToDomRange(block, content, ranges, i, query, options, index)
+      : (!scopeBlock ? mapFrontmatterSourceRangeToDomRange(host, content, ranges, i, query, options) : null);
     if (resolved && sameDomRange(resolved, domRange)) return i;
   }
   return -1;
@@ -250,7 +365,8 @@ export function resolveSourceHighlightRange(host: Element, content: string, rang
     cached.activeIndex === activeIndex && cached.key === key && cached.knownBlock === knownBlock &&
     (!cached.range || isLiveMatchRange(cached.range, host))
   ) return cached.range;
-  const range = resolveSourceHighlightRangeWithIndex(host, content, ranges, activeIndex, query, options, index, knownBlock);
+  const block = knownBlock !== undefined ? knownBlock : findContainingBlockInIndex(index, target);
+  const range = block ? mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options, index) : mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
   if (!Number.isNaN(version)) sourceHighlightCache.set(host, { root, version, indexVersion: index.buildVersion, connected: host.isConnected, content, ranges, activeIndex, key, knownBlock, range });
   return range;
 }
@@ -374,7 +490,6 @@ export function insertDomRangeInOrder(ranges: Range[], target: Range): { ranges:
   augmented.splice(index, 0, target);
   return { ranges: augmented, index };
 }
-
 function findWindowedDomMatch(liveWindowed: WindowedMatch[], domRange: Range, query: string, options: SearchMatchConfig, scope?: Element): number {
   const targetWindowEl = scope?.closest<HTMLElement>("[data-windowed-block]") ?? null;
   let cachedEl: Element | null = null, cachedRanges: Range[] = [], checkedOverlapEl: Element | null = null, checkedOverlaps = false;

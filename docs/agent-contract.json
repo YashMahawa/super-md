@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "revision": {
+    "length": 64,
+    "lowercaseHexPattern": "^[0-9a-f]{64}$",
+    "wireHexPattern": "^[0-9a-fA-F]{64}$"
+  },
+  "identifiers": {
+    "requestIdMax": 96,
+    "requestIdPattern": "^[a-zA-Z0-9_-]{1,96}$",
+    "tabIdMax": 512,
+    "desktopIdentifierMax": 128,
+    "jobIdMax": 128,
+    "diagramIdPrefix": "diagram:",
+    "diagramIdMin": 9,
+    "diagramIdMax": 128
+  },
+  "heading": {
+    "minIndex": 0,
+    "desktopMaxChars": 300,
+    "relayMaxBytes": 512
+  },
+  "filenames": {
+    "portableAssetNewMax": 150,
+    "portableAssetCompatMax": 159,
+    "portableAssetCharsetPattern": "^(?:assets/)?[A-Za-z0-9._-]+$",
+    "disallowedBasenames": [".", ".."],
+    "desktopExportFilenameMax": 160,
+    "relayFilenameMax": 256,
+    "titleHintMax": 200
+  },
+  "exportFormats": {
+    "live": ["pdf", "smd", "md", "mdzip"],
+    "disk": ["pdf", "smd", "md"],
+    "createAndSave": ["md", "smd"]
+  },
+  "pagination": {
+    "readPageMaxChars": 12000,
+    "outlineMaxLimit": 80,
+    "diagramListMaxLimit": 80,
+    "assetListMaxLimit": 50,
+    "assetListMaxOffset": 512,
+    "relayAssetSourceMaxOffset": 1048576,
+    "textMaxOffset": 20000000,
+    "exportChunkMaxBytes": 524288
+  },
+  "search": {
+    "queryMinChars": 1,
+    "queryMaxChars": 500,
+    "rpcQueryMaxBytes": 2048,
+    "limitMin": 1,
+    "limitMax": 25,
+    "contextMin": 0,
+    "contextMax": 500,
+    "booleanFlags": ["caseSensitive", "wholeWord", "regex", "excludeDiagrams"]
+  },
+  "mutations": {
+    "maxPatchOperations": 100,
+    "maxContentChars": 60000,
+    "maxTextBytes": 65536,
+    "repairIndicesMin": 1,
+    "repairIndicesMax": 40,
+    "maxRelayAssetBytes": 1048576,
+    "maxRelayAssetBase64Chars": 1400000,
+    "maxDesktopExportOptionsBytes": 8000,
+    "maxRelayOptionsBytes": 16384
+  },
+  "viewport": {
+    "minWidth": 64,
+    "maxWidth": 1600,
+    "rpcMinWidth": 1,
+    "imageFormats": ["png", "jpeg"],
+    "qualities": ["standard", "high"],
+    "defaultStandardWidth": 1000,
+    "defaultHighWidth": 1600
+  },
+  "viewCurrent": {
+    "modeMaxChars": 64,
+    "readingHeadingMaxChars": 300,
+    "readingVisibleTextMaxChars": 2000,
+    "selectionTextMaxChars": 2000,
+    "visibleSourceMaxChars": 12000,
+    "maxDiagrams": 30,
+    "diagramFieldMaxChars": 128,
+    "diagramPreviewMaxChars": 160,
+    "stepTitleMaxChars": 200,
+    "assetReferenceMaxChars": 512,
+    "maxPythonCells": 8,
+    "pythonOutputMaxChars": 500,
+    "maxPythonFigureIds": 16,
+    "pythonFigurePrefix": "diagram:python:",
+    "properties": {
+      "allowedKeys": ["title", "author", "authors", "tags"],
+      "titleMaxChars": 300,
+      "authorMaxChars": 500,
+      "maxAuthors": 20,
+      "authorItemMaxChars": 200,
+      "maxTags": 50,
+      "tagItemMaxChars": 100
+    },
+    "fixtures": [
+      {
+        "name": "legacy_pagination_repair",
+        "readingContextInput": {
+          "tabId": "tab-1",
+          "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sourceLength": 240,
+          "visibleSource": { "start": 10, "end": 60, "text": "Visible paragraph", "truncated": false }
+        },
+        "expectedVisibleSource": {
+          "start": 10,
+          "end": 60,
+          "text": "Visible paragraph",
+          "total_chars": 240,
+          "next_offset": 60,
+          "truncated": true
+        }
+      },
+      {
+        "name": "coherent_viewport_capture",
+        "requestedTab": "window-1:tab-1",
+        "expectedRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "imageInput": {
+          "context": {
+            "tabId": "tab-1",
+            "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "mode": "reading",
+            "zoom": 1.25,
+            "sourceLength": 100,
+            "reading": { "heading": "Intro", "offset": 0, "endOffset": 40, "visibleText": "Hello world" },
+            "visibleSource": { "start": 0, "end": 40, "text": "# Intro\nHello world", "previewTruncated": false }
+          }
+        },
+        "expectedHasCoherentCapturedSource": true,
+        "expectedCaptureSourceRange": { "start": 0, "end": 40, "total_chars": 100, "next_offset": 40, "truncated": true },
+        "expectedNativeTabId": "tab-1"
+      },
+      {
+        "name": "stale_revision_viewport_capture",
+        "requestedTab": "tab-1",
+        "expectedRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "imageInput": {
+          "context": {
+            "tabId": "tab-1",
+            "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "mode": "live",
+            "sourceLength": 100,
+            "visibleSource": { "start": 0, "end": 40, "text": "Stale text", "previewTruncated": false }
+          }
+        },
+        "expectedHasCoherentCapturedSource": false,
+        "expectedContextRevisionMatches": false
+      }
+    ]
+  }
+}

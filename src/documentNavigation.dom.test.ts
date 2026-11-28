@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import {afterEach,expect,it,vi} from 'vitest';
-import {cancelHeadingNavigation,isLocalHref,navigateToHeading,parseRelativeNoteLink} from './documentNavigation';
+import {cancelHeadingNavigation,isLocalHref,navigateToHeading,parseRelativeNoteLink,readingKeyboardScrollDelta} from './documentNavigation';
 
 afterEach(()=>{
   document.documentElement.style.removeProperty('--native-visible-chrome-inset');
@@ -54,3 +54,114 @@ it.each([[undefined,16],['209.5px',225.5],['0px',16],['-30px',16],['invalid',16]
     }finally{cancelHeadingNavigation(root);}
   },
 );
+
+it('cancels active heading-lock settling on vertical keyboard scroll keys without snapping back on ResizeObserver',()=>{
+  let resizeCallback:ResizeObserverCallback|undefined;
+  class FakeResizeObserver {
+    disconnected=false;
+    static last:FakeResizeObserver|undefined;
+    constructor(cb:ResizeObserverCallback){resizeCallback=cb;FakeResizeObserver.last=this;}
+    observe(){}
+    disconnect(){this.disconnected=true;}
+  }
+  const frames:FrameRequestCallback[]=[];
+  vi.stubGlobal('requestAnimationFrame',(cb:FrameRequestCallback)=>{frames.push(cb);return frames.length;});
+  vi.stubGlobal('cancelAnimationFrame',vi.fn());
+  vi.stubGlobal('ResizeObserver',FakeResizeObserver);
+
+  const root=document.createElement('section');
+  root.className='android-reading';
+  Object.defineProperty(root,'clientHeight',{configurable:true,value:800});
+  const page=document.createElement('div');
+  page.className='document-page';
+  page.dataset.scale='1';
+  const heading=document.createElement('h2');
+  heading.id='chapter-500';
+  heading.dataset.headingKey='chapter-500';
+  heading.textContent='Chapter 500';
+  page.append(heading);
+  root.append(page);
+  document.body.append(root);
+
+  let headingLayoutTop=4200;
+  root.getBoundingClientRect=()=>({top:0,left:0,width:800,height:800,bottom:800,right:800,x:0,y:0,toJSON(){}});
+  heading.getBoundingClientRect=()=>({top:headingLayoutTop-root.scrollTop,left:16,width:600,height:32,bottom:headingLayoutTop+32-root.scrollTop,right:616,x:16,y:headingLayoutTop-root.scrollTop,toJSON(){}});
+
+  for(const keyEvent of [
+    new KeyboardEvent('keydown',{key:'PageDown',bubbles:true}),
+    new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}),
+    new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true}),
+    new KeyboardEvent('keydown',{key:' ',shiftKey:true,bubbles:true}),
+    new KeyboardEvent('keydown',{key:'End',bubbles:true}),
+  ]){
+    headingLayoutTop=4200;
+    root.scrollTop=0;
+    frames.length=0;
+    expect(navigateToHeading(root,'chapter-500')).toBe(true);
+    expect(root.dataset.navigating).toBe('true');
+    expect(root.scrollTop).toBe(4184);
+
+    // Non-scroll keys and modified shortcuts leave heading navigation intact.
+    heading.dispatchEvent(new KeyboardEvent('keydown',{key:'a',bubbles:true}));
+    heading.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',ctrlKey:true,bubbles:true}));
+    heading.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',shiftKey:true,bubbles:true}));
+    expect(root.dataset.navigating).toBe('true');
+
+    // Vertical scroll key immediately cancels heading lock and disconnects ResizeObserver.
+    heading.dispatchEvent(keyEvent);
+    expect(root.dataset.navigating).toBeUndefined();
+    expect(FakeResizeObserver.last?.disconnected).toBe(true);
+
+    // Simulate user scroll + lazy block height growth above the viewport.
+    root.scrollTop=4900;
+    headingLayoutTop=4500;
+    resizeCallback?.([],FakeResizeObserver.last as unknown as ResizeObserver);
+    while(frames.length)frames.shift()!(16);
+    expect(root.scrollTop).toBe(4900);
+  }
+});
+
+it('ignores editable controls, buttons, and open modal overlays in readingKeyboardScrollDelta',()=>{
+  const root=document.createElement('div');
+  root.className='reading-scroll';
+  Object.defineProperty(root,'clientHeight',{configurable:true,value:800});
+  const input=document.createElement('input');
+  const button=document.createElement('button');
+  const editable=document.createElement('div');
+  editable.contentEditable='true';
+  Object.defineProperty(editable,'isContentEditable',{configurable:true,value:true});
+  const paragraph=document.createElement('p');
+  root.append(input,button,editable,paragraph);
+  document.body.append(root);
+
+  const down=()=>new KeyboardEvent('keydown',{key:'PageDown',bubbles:true,cancelable:true});
+  input.dispatchEvent(down());
+  expect(readingKeyboardScrollDelta(Object.assign(down(),{}),root)).toBe(700);
+
+  const fromTarget=(el:Element,init:KeyboardEventInit={key:'PageDown',bubbles:true,cancelable:true})=>{
+    let captured!:KeyboardEvent;
+    docListener:{
+      const fn=(e:KeyboardEvent)=>{captured=e;};
+      document.addEventListener('keydown',fn,{once:true});
+      el.dispatchEvent(new KeyboardEvent('keydown',init));
+      break docListener;
+    }
+    return readingKeyboardScrollDelta(captured,root);
+  };
+
+  expect(fromTarget(paragraph,{key:'PageDown',bubbles:true})).toBe(700);
+  expect(fromTarget(paragraph,{key:'PageUp',bubbles:true})).toBe(-700);
+  expect(fromTarget(paragraph,{key:' ',bubbles:true})).toBe(700);
+  expect(fromTarget(paragraph,{key:' ',shiftKey:true,bubbles:true})).toBe(-700);
+  expect(fromTarget(paragraph,{key:'Home',bubbles:true})).toBe(0);
+  expect(fromTarget(input,{key:'PageDown',bubbles:true})).toBeNull();
+  expect(fromTarget(button,{key:' ',bubbles:true})).toBeNull();
+  expect(fromTarget(editable,{key:'ArrowDown',bubbles:true})).toBeNull();
+
+  const overlay=document.createElement('div');
+  overlay.className='reading-search';
+  document.body.append(overlay);
+  expect(fromTarget(document.body,{key:'PageDown',bubbles:true})).toBeNull();
+  overlay.remove();
+  expect(fromTarget(document.body,{key:'PageDown',bubbles:true})).toBe(700);
+});

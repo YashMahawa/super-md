@@ -15,24 +15,39 @@ export { nextSearchIndex, readingMatches, replaceSourceMatches, resolveSourceBlo
 const MANUAL_SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
 const SEARCH_SETTLE_WINDOW_MS = 800;
 const UNICODE_SEARCH_FOLDS = new Map<number, string>([
-  [0xdf, "ss"], [0x1e9e, "ss"], [0x130, "i\u0307"], [0x149, "\u02bcn"], [0x1f0, "j\u030c"], [0x390, "\u03b9\u0308\u0301"], [0x3b0, "\u03c5\u0308\u0301"], [0x3c2, "\u03c3"],
-  [0xb5, "\u03bc"], [0x345, "\u03b9"], [0x587, "\u0565\u0582"], [0x1e96, "h\u0331"], [0x1e97, "t\u0308"], [0x1e98, "w\u030a"], [0x1e99, "y\u030a"], [0x1e9a, "a\u02be"],
-  [0xfb00, "ff"], [0xfb01, "fi"], [0xfb02, "fl"], [0xfb03, "ffi"], [0xfb04, "ffl"], [0xfb05, "st"], [0xfb06, "st"], [0xfb13, "\u0574\u0576"], [0xfb14, "\u0574\u0565"], [0xfb15, "\u0574\u056b"], [0xfb16, "\u057e\u0576"], [0xfb17, "\u0574\u056d"],
+  [0xdf, "ss"], [0x1e9e, "ss"], [0x130, "i\u0307"], [0x149, "\u02bcn"], [0x1f0, "j\u030c"], [0x390, "\u03b9\u0308\u0301"],
+  [0x3b0, "\u03c5\u0308\u0301"], [0x3c2, "\u03c3"], [0xb5, "\u03bc"], [0x345, "\u03b9"], [0x587, "\u0565\u0582"],
+  [0x1e96, "h\u0331"], [0x1e97, "t\u0308"], [0x1e98, "w\u030a"], [0x1e99, "y\u030a"], [0x1e9a, "a\u02be"],
+  [0xfb00, "ff"], [0xfb01, "fi"], [0xfb02, "fl"], [0xfb03, "ffi"], [0xfb04, "ffl"], [0xfb05, "st"], [0xfb06, "st"],
+  [0xfb13, "\u0574\u0576"], [0xfb14, "\u0574\u0565"], [0xfb15, "\u0574\u056b"], [0xfb16, "\u057e\u0576"], [0xfb17, "\u0574\u056d"],
 ]);
 
-export interface ReadingSearchSeed { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number }
+export interface ReadingSearchSeed {
+  query: string;
+  caseSensitive?: boolean;
+  sourceStart?: number;
+  sourceEnd?: number;
+  matchText?: string;
+  nonce: number;
+}
 
 function extractSeedRange(seed?: ReadingSearchSeed | null): SourceRange | null {
   if (!seed) return null;
   const { sourceStart, sourceEnd } = seed;
-  return typeof sourceStart === "number" && typeof sourceEnd === "number" && Number.isInteger(sourceStart) && Number.isInteger(sourceEnd) && sourceStart >= 0 && sourceEnd >= sourceStart ? { from: sourceStart, to: sourceEnd } : null;
+  return typeof sourceStart === "number" && typeof sourceEnd === "number" && Number.isInteger(sourceStart) && Number.isInteger(sourceEnd) && sourceStart >= 0 && sourceEnd >= sourceStart
+    ? { from: sourceStart, to: sourceEnd } : null;
 }
 
-const extractSeedMatchText = (seed?: ReadingSearchSeed | null): string | undefined => typeof seed?.matchText === "string" && seed.matchText.length > 0 ? seed.matchText : undefined;
+const extractSeedMatchText = (seed?: ReadingSearchSeed | null): string | undefined =>
+  typeof seed?.matchText === "string" && seed.matchText.length > 0 ? seed.matchText : undefined;
 
 export function foldUnicodeForSearch(text: string): string {
   let out = "";
-  for (let i = 0; i < text.length; ) { const cp = text.codePointAt(i)!; out += UNICODE_SEARCH_FOLDS.get(cp) ?? String.fromCodePoint(cp).toLowerCase(); i += cp > 0xffff ? 2 : 1; }
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i)!;
+    out += UNICODE_SEARCH_FOLDS.get(cp) ?? String.fromCodePoint(cp).toLowerCase();
+    i += cp > 0xffff ? 2 : 1;
+  }
   return out;
 }
 
@@ -56,8 +71,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const [query, setQuery] = useState(() => seed ? seed.query.slice(0, 200) : window.getSelection()?.toString().slice(0, 200) || "");
   const [matches, setMatches] = useState<Range[]>([]), [index, setIndex] = useState(-1);
   const indexRef = useRef(index); indexRef.current = index;
-  const customCurrentRangeRef = useRef<Range | null>(null);
-  const customCurrentSourceRef = useRef<{ ranges: SourceRange[]; index: number; query: string; options: SearchMatchConfig } | null>(null);
+  const customCurrentRangeRef = useRef<Range | null>(null), customCurrentSourceRef = useRef<{ ranges: SourceRange[]; index: number; query: string; options: SearchMatchConfig } | null>(null);
   const clearCustomCurrent = () => { customCurrentRangeRef.current = null; customCurrentSourceRef.current = null; };
   const updateIndex = (next: number, keepCustomCurrent = false) => {
     if (!keepCustomCurrent) clearCustomCurrent();
@@ -223,11 +237,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const host = findReadingHost();
     if (!host) return;
     const customSliceMatch = matchQuery !== query || matchOptions !== filterOptions;
-    const recordCustom = (r: Range | null) => {
-      if (!customSliceMatch) return;
-      customCurrentRangeRef.current = r;
-      customCurrentSourceRef.current = { ranges, index: targetIndex, query: matchQuery, options: matchOptions };
-    };
+    const recordCustom = (r: Range | null) => { if (customSliceMatch) { customCurrentRangeRef.current = r; customCurrentSourceRef.current = { ranges, index: targetIndex, query: matchQuery, options: matchOptions }; } };
     const allForHost = (targetHost: Element, extra: Range | null) => () => {
       const visible = readingMatches(targetHost, query, filterOptions);
       return customSliceMatch && extra ? [...visible, extra] : visible;
@@ -239,8 +249,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       syncSearchHighlights({ all: scroll ? allForHost(host, fmDomRange) : undefined, current: fmDomRange });
       if (scroll) {
         const fallback = rangeStartElement(fmDomRange) ?? host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
-        if (fallback) revealMountedBlock(fallback);
-        scrollTargetIntoView(fallback, host);
+        if (fallback) { revealMountedBlock(fallback); scrollTargetIntoView(fallback, host); }
       }
       return;
     }
@@ -669,13 +678,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         clearSettleFrames();
         const fallback = block ? null : (host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, targetRange, content));
         const fallbackWasUnmounted = Boolean(fallback?.closest('[data-windowed-mounted="false"]'));
-        if (block) {
-          openDisclosuresFor(owner, block, null, targetRange);
-          scrollTargetIntoView(owner ?? block, host);
-        } else if (fallback) {
-          revealMountedBlock(fallback);
-          scrollTargetIntoView(fallback, host);
-        }
+        if (block) { openDisclosuresFor(owner, block, null, targetRange); scrollTargetIntoView(owner ?? block, host); }
+        else if (fallback) { revealMountedBlock(fallback); scrollTargetIntoView(fallback, host); }
         updateIndex(-1);
         setHiddenSourceHit(true);
         hiddenSourceAnchorRef.current = targetRange;
@@ -699,10 +703,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         }
         return;
       }
-      if (runAutoSelect) {
-        setHiddenSourceHit(false);
-        hiddenSourceAnchorRef.current = null;
-      }
+      if (runAutoSelect) { setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null; }
       if (nextWindowed !== null) {
         setWindowed(nextWindowed);
         setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
@@ -713,10 +714,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
           updateIndex(nextWindowed.length - 1);
         }
         if (host) {
-          syncSearchHighlights({
-            all: () => (nextWindowed.length ? readingMatches(host, query, filterOptions) : []),
-            current: indexRef.current < 0 ? null : undefined,
-          });
+          syncSearchHighlights({ all: () => (nextWindowed.length ? readingMatches(host, query, filterOptions) : []), current: indexRef.current < 0 ? null : undefined });
         }
         return;
       }
@@ -755,17 +753,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         let customCurrent = active < 0 ? customCurrentRangeRef.current : null;
         if (active < 0 && !isLiveMatchRange(customCurrent, host) && customCurrentSourceRef.current) {
           const src = customCurrentSourceRef.current;
-          customCurrent = resolveSourceHighlightRange(host, content, src.ranges, src.index, src.query, src.options);
-          customCurrentRangeRef.current = customCurrent;
+          customCurrent = customCurrentRangeRef.current = resolveSourceHighlightRange(host, content, src.ranges, src.index, src.query, src.options);
         }
         const liveCustom = isLiveMatchRange(customCurrent, host) ? customCurrent : null;
         syncSearchHighlights({
-          all: () => {
-            const visible = readingMatches(host, query, filterOptions);
-            return liveCustom ? [...visible, liveCustom] : visible;
-          },
-          current: active < 0 ? liveCustom
-            : () => resolveActiveHighlightRange(host, active, { sourceSearch, content, sourceRanges, windowed, matches: [], query, filterOptions }),
+          all: () => { const visible = readingMatches(host, query, filterOptions); return liveCustom ? [...visible, liveCustom] : visible; },
+          current: active < 0 ? liveCustom : () => resolveActiveHighlightRange(host, active, { sourceSearch, content, sourceRanges, windowed, matches: [], query, filterOptions }),
         });
       });
     };
