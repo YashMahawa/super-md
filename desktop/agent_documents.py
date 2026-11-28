@@ -230,8 +230,10 @@ class DocumentStore:
         self._max_cache_bytes = self.MAX_CACHE_BYTES if max_cache_bytes is None else max(0, max_cache_bytes)
 
     def resolve(self, value: str | os.PathLike[str], *, must_exist: bool = True) -> Path:
-        """Resolve a caller path under one configured root; reject symlinks."""
+        """Resolve a caller path under one configured root; reject symlinks and hidden entries."""
         raw = Path(value).expanduser()
+        if not raw.is_absolute() and any(part not in (".", "..") and part.startswith(".") for part in raw.parts):
+            raise AgentDocumentError("Hidden files and directories are not allowed")
         candidates = [raw] if raw.is_absolute() else [root / raw for root in self.roots]
         for candidate in candidates:
             absolute = Path(os.path.abspath(candidate))
@@ -248,6 +250,8 @@ class DocumentStore:
             linked = _symlink_component(absolute)
             if linked is not None:
                 raise AgentDocumentError(f"Symlink paths are not allowed: {linked}")
+            if any(part.startswith(".") for part in absolute.relative_to(root).parts):
+                raise AgentDocumentError("Hidden files and directories are not allowed")
             if must_exist and not absolute.exists():
                 continue
             if not must_exist and not absolute.parent.is_dir():
@@ -259,6 +263,8 @@ class DocumentStore:
             except (OSError, RuntimeError):
                 continue
             if resolved == root or root in resolved.parents:
+                if any(part.startswith(".") for part in resolved.relative_to(root).parts):
+                    raise AgentDocumentError("Hidden files and directories are not allowed")
                 return absolute
         raise AgentDocumentError("Path is outside the configured workspace roots or does not exist")
 
