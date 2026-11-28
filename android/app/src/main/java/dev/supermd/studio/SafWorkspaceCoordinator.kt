@@ -8,7 +8,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -17,6 +21,7 @@ internal class SafWorkspaceCoordinator(
     private val owner: StudioViewModel, private val scope: CoroutineScope,
     private val prefs: SharedPreferences, private val windowPrefs: SharedPreferences,
     private val resolver: ContentResolver, private val readDocumentAccess: () -> DocumentAccess,
+    private val documentWrites: Mutex, private val isOwnerRetired: () -> Boolean,
     private val confirmedTreeDocumentKeys: MutableSet<String>,
     private val readState: () -> StudioState, private val writeState: (StudioState) -> Unit,
     private val changeState: ((StudioState) -> StudioState) -> Unit,
@@ -75,11 +80,15 @@ internal class SafWorkspaceCoordinator(
             try {
                 require(!invalidPath) { "Invalid folder path" }
                 val targetFolder = Uri.parse(readState().folder ?: uri.toString())
-                val pass = SafProjectionPass(resolver)
-                val listing = withContext(Dispatchers.IO) {
-                    listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass)
-                }
-                confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                val (listing, confirmedKeys) = withContext(Dispatchers.IO) {
+                    documentWrites.withLock {
+                        currentCoroutineContext().ensureActive()
+                        if (isOwnerRetired() || seq != readListFolderSeq()) return@withLock null
+                        val pass = SafProjectionPass(resolver)
+                        listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass) to pass.confirmedTreeKeys
+                    }
+                } ?: return@launch
+                confirmedTreeDocumentKeys.addAll(confirmedKeys)
                 if (seq == readListFolderSeq() && readState().folder != null) {
                     writeListedRelative(listing.effectiveRelative)
                     if (listing.effectiveRelative != requestedRelative) {
@@ -130,7 +139,12 @@ internal class SafWorkspaceCoordinator(
     }
 
     fun resolveOpenFolderRelativeOnIo(uri: Uri, folderTreeRaw: String? = readState().folder): String? {
-        relativeInOpenFolder(uri, folderTreeRaw)?.let { return it }
+        relativeInOpenFolder(uri, folderTreeRaw)?.let { rel ->
+            if (DocumentsContract.isTreeUri(uri)) {
+                canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+            }
+            return rel
+        }
         val treeRaw = folderTreeRaw?.takeIf { it.isNotBlank() } ?: return null
         val folderUri = runCatching { Uri.parse(treeRaw) }.getOrNull() ?: return null
         val pass = SafProjectionPass(resolver)
@@ -143,6 +157,9 @@ internal class SafWorkspaceCoordinator(
         )
         if (pass.confirmedTreeKeys.isNotEmpty()) {
             confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+        }
+        if (found != null && DocumentsContract.isTreeUri(uri)) {
+            canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
         }
         return found
     }
