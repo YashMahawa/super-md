@@ -24,7 +24,7 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
 });
 
 import Editor from "./Editor";
-import LiveEditor from "./LiveEditor";
+import LiveEditor, { formatActiveLiveBlock } from "./LiveEditor";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
@@ -1454,6 +1454,226 @@ it("toggles only the clicked nested task checkbox and keeps slider-containing ta
   expect(markdown).toContain("- [x] Review unit\n  - [x] Complete nested exercise\n  - [x] Verify slider response");
 
   await act(async () => root.unmount());
+  host.remove();
+});
+
+it("formats single-block Live rendered selections across upstream draft shifts, nested lists, inline code/math, and existing/partial formatting while preserving direction, undo, and protected blocks", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let doc = [
+    "---",
+    "title: Live Selection Fixture",
+    "---",
+    "",
+    "Intro block.",
+    "",
+    "Study **Fourier** [docs](https://example.com) and selected rendered range near `cmd_flag` and $k + 1$.",
+    "",
+    "- Parent list item",
+    "  - Nested bullet target",
+    "    1. Deep ordered target",
+    "",
+    "```python",
+    "protected_code = 1",
+    "```",
+    "",
+    "Trailing paragraph stays separate.",
+  ].join("\n");
+  const renderDoc = () =>
+    root.render(
+      <LiveEditor
+        markdown={doc}
+        documentPath={null}
+        dark={false}
+        python=""
+        fullDocumentAccessibility
+        onChange={(next) => {
+          doc = next;
+          renderDoc();
+        }}
+      />,
+    );
+  await act(async () => { renderDoc(); });
+
+  const selectRenderedText = (container: Element, target: string, reversed = false) => {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const nodes: Array<{ node: Text; start: number; end: number }> = [];
+    let full = "";
+    let current: Node | null;
+    while ((current = walker.nextNode())) {
+      const textNode = current as Text;
+      if (textNode.parentElement?.closest(".katex-mathml")) continue;
+      const start = full.length;
+      full += textNode.data;
+      nodes.push({ node: textNode, start, end: full.length });
+    }
+    const idx = full.indexOf(target);
+    if (idx < 0) throw new Error(`Missing rendered substring: ${target}`);
+    const endIdx = idx + target.length;
+    const startEntry = nodes.find((n) => idx >= n.start && idx <= n.end)!;
+    const endEntry = nodes.find((n) => endIdx >= n.start && endIdx <= n.end)!;
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    if (reversed && typeof sel.setBaseAndExtent === "function") {
+      sel.setBaseAndExtent(endEntry.node, endIdx - endEntry.start, startEntry.node, idx - startEntry.start);
+    } else {
+      const range = document.createRange();
+      range.setStart(startEntry.node, idx - startEntry.start);
+      range.setEnd(endEntry.node, endIdx - endEntry.start);
+      sel.addRange(range);
+    }
+  };
+
+  // 1. Open block 0 ("Intro block.") and lengthen it so downstream rendered block DOM offsets are shifted
+  let blocks = host.querySelectorAll<HTMLElement>(".live-block");
+  act(() => blocks[0]!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const introArea = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  await act(async () => {
+    typeInTextarea(introArea, "Intro block with extra draft prose.");
+  });
+  expect(doc).toContain("Intro block with extra draft prose.");
+
+  // 2. Select "selected rendered range" backward in rendered block 1 and format via Ctrl+B
+  const secondPara = blocks[1]!.querySelector("p")!;
+  selectRenderedText(secondPara, "selected rendered range", true);
+  const ctrlB = new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true });
+  act(() => { secondPara.dispatchEvent(ctrlB); });
+  expect(ctrlB.defaultPrevented).toBe(true);
+
+  let area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toBe(
+    "Study **Fourier** [docs](https://example.com) and **selected rendered range** near `cmd_flag` and $k + 1$.",
+  );
+  const innerSelStart = area.value.indexOf("selected rendered range");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([
+    innerSelStart,
+    innerSelStart + "selected rendered range".length,
+  ]);
+  expect(area.selectionDirection).toBe("backward");
+
+  // Single-step Undo restores unformatted block text, exact selection offsets, and backward direction
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe(
+    "Study **Fourier** [docs](https://example.com) and selected rendered range near `cmd_flag` and $k + 1$.",
+  );
+  expect([area.selectionStart, area.selectionEnd]).toEqual([
+    area.value.indexOf("selected rendered range"),
+    area.value.indexOf("selected rendered range") + "selected rendered range".length,
+  ]);
+  expect(area.selectionDirection).toBe("backward");
+
+  // Close editor to return to rendered Live view
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  const runFormat = (action: string): boolean => {
+    let applied = false;
+    act(() => {
+      applied = formatActiveLiveBlock(action);
+    });
+    return applied;
+  };
+
+  // 3. Existing formatted text & partial selection inside **Fourier**:
+  //    Selecting substring "rier" in rendered **Fourier** and running bold unwraps **Fourier** -> Fourier without splitting
+  const renderedPara = host.querySelectorAll(".live-document p")[1]!;
+  selectRenderedText(renderedPara, "rier");
+  expect(runFormat("bold")).toBe(true);
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toBe(
+    "Study Fourier [docs](https://example.com) and selected rendered range near `cmd_flag` and $k + 1$.",
+  );
+  expect(area.value.slice(area.selectionStart, area.selectionEnd)).toBe("rier");
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+
+  // Boundary-straddling rendered selection ("rier docs") is a safe no-op
+  const snapshotBeforeGuards = doc;
+  selectRenderedText(host.querySelectorAll(".live-document p")[1]!, "rier docs");
+  expect(runFormat("bold")).toBe(false);
+  expect(doc).toBe(snapshotBeforeGuards);
+
+  // 4. Rendered inline code & inline math: guarded against bold, unwrapped cleanly by matching action
+  const codeSpan = host.querySelector(".live-document p code")!;
+  selectRenderedText(codeSpan, "cmd_flag");
+  expect(runFormat("bold")).toBe(false);
+  expect(doc).toBe(snapshotBeforeGuards);
+  expect(runFormat("inline_code")).toBe(true);
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toContain("near cmd_flag and $k + 1$.");
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+
+  const katexSpan = host.querySelector(".live-document p .katex")!;
+  const mathRange = document.createRange();
+  mathRange.selectNode(katexSpan);
+  const sel = window.getSelection()!;
+  sel.removeAllRanges();
+  sel.addRange(mathRange);
+  expect(runFormat("bold")).toBe(false);
+  expect(runFormat("inline_math")).toBe(true);
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toContain("near `cmd_flag` and k + 1.");
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+
+  // 5. Nested list items: formats deeply nested item cleanly and rejects cross-item parent->child selection
+  const listItems = host.querySelectorAll(".live-document li");
+  expect(listItems.length).toBe(3);
+  const crossItemRange = document.createRange();
+  crossItemRange.setStart(listItems[0]!.firstChild!, 0);
+  crossItemRange.setEnd(listItems[1]!.firstChild!, 6);
+  sel.removeAllRanges();
+  sel.addRange(crossItemRange);
+  expect(runFormat("bold")).toBe(false);
+  expect(doc).toBe(snapshotBeforeGuards);
+
+  selectRenderedText(listItems[2]!, "ordered target");
+  expect(runFormat("italic")).toBe(true);
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toContain("    1. Deep *ordered target*");
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+
+  // 6. Protected fenced code block (rendered <pre> AND open protected <textarea>) and multi-paragraph selection stay untouched
+  const preEl = host.querySelector(".live-document pre")!;
+  selectRenderedText(preEl, "protected_code");
+  expect(runFormat("bold")).toBe(false);
+  expect(doc).toBe(snapshotBeforeGuards);
+
+  blocks = host.querySelectorAll<HTMLElement>(".live-block");
+  act(() => { blocks[3]!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  act(() => { area.setSelectionRange(10, 24); });
+  expect(runFormat("bold")).toBe(false);
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+
+  const allParas = host.querySelectorAll(".live-document p");
+  const multiRange = document.createRange();
+  multiRange.setStart(allParas[1]!.firstChild!, 0);
+  multiRange.setEnd(allParas[2]!.firstChild!, 8);
+  sel.removeAllRanges();
+  sel.addRange(multiRange);
+  expect(runFormat("bold")).toBe(false);
+  expect(doc).toBe(snapshotBeforeGuards);
+
+  sel.removeAllRanges();
+  act(() => root.unmount());
   host.remove();
 });
 
