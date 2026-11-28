@@ -297,10 +297,13 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         real_atomic_write = documents.atomic_write
         atomic_calls: list[Path] = []
         invalidations: list[object] = []
+        index_invalidations: list[object] = []
         orig_invalidate = self.session.workspace_links.invalidate
+        orig_index_invalidate = self.session.folder_note_index.invalidate
         with (
             patch("studio.atomic_write", side_effect=lambda p, data: (atomic_calls.append(Path(p)), real_atomic_write(p, data))[1]),
             patch.object(self.session.workspace_links, "invalidate", side_effect=lambda root=None: (invalidations.append(root), orig_invalidate(root))[1]),
+            patch.object(self.session.folder_note_index, "invalidate", side_effect=lambda root=None: (index_invalidations.append(root), orig_index_invalidate(root))[1]),
         ):
             self.studio.createFolderNote(str(self.open_root), "Patched Note", "md")
             self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "Patched Note.md").is_file())
@@ -316,7 +319,26 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
                 and (self.open_root / "RenamedSub").is_dir()
                 and any(item["name"] == "RenamedSub" for item in self.studio.files)
             )
-        self.assertEqual(invalidations, [self.studio.folder, self.studio.folder, None])
+        patched_canon = folder_ops.canonical_path_str(self.open_root / "Patched Note.md")
+        sub_canon = folder_ops.canonical_path_str(self.open_root / "Subfolder")
+        renamed_sub_canon = folder_ops.canonical_path_str(self.open_root / "RenamedSub")
+        self.assertEqual(
+            invalidations,
+            [patched_canon, patched_canon, self.studio.folder, sub_canon, sub_canon, self.studio.folder, None, sub_canon, renamed_sub_canon],
+        )
+        self.assertEqual(
+            index_invalidations,
+            [patched_canon, patched_canon, self.studio.folder, sub_canon, sub_canon, self.studio.folder, None, sub_canon, renamed_sub_canon],
+        )
+        dead_watcher_win = SimpleNamespace(
+            retired=False, note_watch_paths={"keep"},
+            note_watcher=SimpleNamespace(files=lambda: (_ for _ in ()).throw(RuntimeError("deleted C++ watcher"))),
+        )
+        studio_assets_rename.suspend_watches_for_prefix(
+            SimpleNamespace(session=SimpleNamespace(windows={"dead": dead_watcher_win})),
+            str(self.open_root / "RenamedSub"), is_dir=True, watcher_alive_fn=lambda _w: False,
+        )
+        self.assertEqual(dead_watcher_win.note_watch_paths, {"keep"})
         self.assertIn((self.open_root / "Patched Note.md").resolve(), [p.resolve() for p in atomic_calls])
         search_restarts: list[str] = []
         seeded_win = SimpleNamespace(
