@@ -55,9 +55,9 @@ internal class SafWorkspaceCoordinator(
 
     fun navigateFolderUp(): Boolean {
         val folderUri = readState().folder ?: return false
-        val current = normalizeFolderRelative(readListedRelative())
+        val current = normalizeRelativePath(readListedRelative())
         if (current.isEmpty()) return false
-        val parent = parentFolderRelative(current)
+        val parent = parentRelativePath(current)
         listFolder(Uri.parse(folderUri), parent)
         return true
     }
@@ -66,7 +66,7 @@ internal class SafWorkspaceCoordinator(
         val seq = readListFolderSeq() + 1
         writeListFolderSeq(seq)
         val invalidPath = hasInvalidSafFolderRelative(relative)
-        val requestedRelative = if (invalidPath) readListedRelative() else normalizeFolderRelative(relative)
+        val requestedRelative = if (invalidPath) readListedRelative() else normalizeRelativePath(relative)
         if (!invalidPath) {
             writeListedRelative(requestedRelative)
             val updated = readState().copy(folderRelative = requestedRelative)

@@ -42,7 +42,6 @@ internal data class UriRemap(
     val oldUri: String,
     val newUri: String,
     val newName: String? = null,
-    val oldRelative: String? = null,
     val newRelative: String? = null,
 )
 
@@ -990,7 +989,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     if (viewModelRetired.get()) return@withLock null
                     val beforeIo = mutable.value
                     val folderSnapshot = beforeIo.folder
-                    val relativeSnapshot = normalizeFolderRelative(beforeIo.folderRelative.ifEmpty { listedRelative })
+                    val relativeSnapshot = normalizeRelativePath(beforeIo.folderRelative.ifEmpty { listedRelative })
                     val listSeqSnapshot = listFolderSeq
                     val uris = (beforeIo.tabs.mapNotNull { it.uri } + recentMutable.value.map { it.uri }).distinct()
                     val relativeHints = buildMap {
@@ -1045,7 +1044,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(recents!=recentMutable.value)storeRecent(recents)
             val currentFolder=mutable.value.folder
             if(currentFolder!=null) {
-                val currentRelative=normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { listedRelative })
+                val currentRelative=normalizeRelativePath(mutable.value.folderRelative.ifEmpty { listedRelative })
                 if(currentFolder==folderSnapshot&&currentRelative==relativeSnapshot&&listFolderSeq==listSeqSnapshot&&refreshSnapshot.folderListing!=null) {
                     refreshSnapshot.folderListing.fold(
                         onSuccess = {listing->
@@ -1396,7 +1395,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun restore(): StudioState {
         val restoredFolder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null)
-        val restoredRelative = if (restoredFolder != null) normalizeFolderRelative(windowPrefs.getString("folderRelative", "") ?: "") else ""
+        val restoredRelative = if (restoredFolder != null) normalizeRelativePath(windowPrefs.getString("folderRelative", "") ?: "") else ""
         listedRelative = restoredRelative
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = restoredFolder, folderRelative = restoredRelative, pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
         s = s.copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
@@ -2008,7 +2007,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         clearDocumentAccessFailure(existingUri)
                         clearDocumentAccessFailure(renamedUri)
                         applyUriRemaps(
-                            listOf(UriRemap(existingUri, renamedUri, name, note.relative, newRelative)),
+                            listOf(UriRemap(existingUri, renamedUri, name, newRelative)),
                             folderTreeRaw = if (currentFolderUri != null && !openFolderReadable) "" else null,
                             statusMessage = "Renamed to $name",
                         )
@@ -3259,7 +3258,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     Triple(
                         finalName,
                         finalRelative,
-                        listOf(UriRemap(entryUri.toString(), renamedUri.toString(), finalName, cleanRelative, finalRelative)),
+                        listOf(UriRemap(entryUri.toString(), renamedUri.toString(), finalName, finalRelative)),
                     )
                 } else {
                     beforeSubtreeNodes.filter { !it.isDirectory }.forEach { oldNode ->
@@ -3285,7 +3284,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             documentAccess.persist(afterNode.treeDocumentUri)
                             canonicalTreeDocumentKey(afterNode.treeDocumentUri)?.let(confirmedTreeDocumentKeys::add)
                         }
-                        UriRemap(oldUri, afterNode.treeDocumentUri.toString(), afterNode.displayName, oldRel, updatedRel)
+                        UriRemap(oldUri, afterNode.treeDocumentUri.toString(), afterNode.displayName, updatedRel)
                     }
                     Triple(finalName, finalRelative, childRemaps)
                 }

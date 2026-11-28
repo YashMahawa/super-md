@@ -2,12 +2,6 @@
 package dev.supermd.studio
 
 import android.graphics.Color as AndroidColor
-import android.graphics.Bitmap
-import android.graphics.Rect
-import android.os.Handler
-import android.os.Looper
-import android.view.PixelCopy
-import java.io.ByteArrayOutputStream
 import android.os.Build
 import android.os.Bundle
 import android.content.Intent
@@ -88,7 +82,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.first
 import org.json.JSONObject
-import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
