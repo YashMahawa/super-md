@@ -110,12 +110,15 @@ class ExportShareCoordinatorTest {
     @Test fun failClearsPendingShareFileSoSubsequentExportDoesNotTriggerFinishShare() {
         val model = StudioViewModel(app, "export-share-${UUID.randomUUID()}")
         val noteId = model.state.value.active.id
+        model.edit(noteId, "# Clean\n")
         var shareCalls = 0
         model.shareReady = { shareCalls++ }
         assertTrue(model.prepareShare("smd"))
-        assertNotNull(model.portableOutput)
-        val exportedSmd = java.io.File(model.portableOutput!!.path!!)
+        val shareTarget = model.portableOutput!!
+        val exportedSmd = java.io.File(shareTarget.path!!)
         model.fail("Simulated reader failure")
+        assertNull(model.portableOutput)
+        model.setPortableDestination(shareTarget)
         awaitSuspend { model.writePortable(noteId, "# Clean\n", JSONObject(), save = false, originalContent = "# Clean\n") }
         assertEquals(0, shareCalls)
         assertEquals("Portable .smd exported", model.state.value.message)

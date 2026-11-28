@@ -27,7 +27,8 @@ internal class ExportShareCoordinator(
     private val app: Application, private val scope: CoroutineScope,
     private val media: MediaStorage, private val fonts: FontLibrary,
     private val documentAccess: DocumentAccess, private val documentWrites: Mutex,
-    private val autosavePending: MutableSet<String>, private val savedPortableAssets: ConcurrentHashMap<String, JSONObject>,
+    private val autosavePending: MutableSet<String>, private val closingNoteIds: Set<String>,
+    private val savedPortableAssets: ConcurrentHashMap<String, JSONObject>,
     private val readState: () -> StudioState, private val updateState: (StudioState) -> Unit,
     private val changeState: ((StudioState) -> StudioState) -> Unit,
     private val busy: (Boolean) -> Unit, private val fail: (String) -> Unit,
@@ -35,6 +36,8 @@ internal class ExportShareCoordinator(
     private val readPortableSaveAsNoteId: () -> String?, private val writePortableSaveAsNoteId: (String?) -> Unit,
     private val readPortableForceOverwrite: () -> Boolean, private val writePortableForceOverwrite: (Boolean) -> Unit,
     private val readCloseAfterSaveNoteId: () -> String?, private val writeCloseAfterSaveNoteId: (String?) -> Unit,
+    private val clearPendingPortableWriteState: () -> Unit,
+    private val collectNativePortableAssets: (Note) -> JSONObject,
     private val readListedRelative: () -> String,
     private val resolveVerifiedWriteDestination: (Uri) -> Uri, private val clearDocumentAccessFailure: (String) -> Unit,
     private val diskMatchesBaseline: (Uri, Note) -> Boolean, private val recordPortableBaseline: (String, String?) -> Unit,
@@ -208,12 +211,27 @@ internal class ExportShareCoordinator(
         clearReaderFolderIndex()
     }
 
-    suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) {
+    suspend fun writePortable(
+        id: String, content: String, assets: JSONObject,
+        save: Boolean, originalContent: String, mergeLocalAssets: Boolean = false,
+    ) {
         var closeTargetId: String? = null
         withContext(Dispatchers.IO) { documentWrites.withLock {
             val rebindId = if (!save) readPortableSaveAsNoteId() else null
             val effectiveId = rebindId ?: id
-            val note = readState().tabs.find { it.id == effectiveId } ?: error("The note is no longer open")
+            if (rebindId != null && id.isNotEmpty() && id != rebindId) {
+                clearPendingPortableWriteState()
+                error("The export note changed")
+            }
+            val note = readState().tabs.find { it.id == effectiveId }
+            if (closingNoteIds.contains(effectiveId) || note == null) {
+                clearPendingPortableWriteState()
+                error("The note is no longer open")
+            }
+            if (note.content != originalContent) {
+                clearPendingPortableWriteState()
+                error("The note changed while preparing the portable save; try saving again")
+            }
             val target = if (save) note.uri?.let { resolveVerifiedWriteDestination(Uri.parse(it)) } else portableOutput
             require(target != null) { "Choose a portable file destination" }
             val force = readPortableForceOverwrite()
@@ -225,6 +243,11 @@ internal class ExportShareCoordinator(
                 }
                 return@withLock
             }
+            val effectiveAssets = if (mergeLocalAssets) {
+                val combined = collectNativePortableAssets(note.copy(content = content))
+                assets.keys().forEach { key -> combined.put(key, assets.getString(key)) }
+                combined
+            } else assets
             val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
             val staged = File(app.cacheDir, "fmd-${UUID.randomUUID()}.tmp")
             var materializedDirectory: String? = null
@@ -234,11 +257,11 @@ internal class ExportShareCoordinator(
                 val rebinding = save || rebindId != null
                 val nextDirectory = if (rebinding) {
                     val reuseExisting = save && rebindId == null && note.assetDirectory != null &&
-                        media.hasExactLocalPortableAssets(note.assetDirectory, assets)
+                        media.hasExactLocalPortableAssets(note.assetDirectory, effectiveAssets)
                     if (reuseExisting) note.assetDirectory!!
-                    else media.materializePortableDirectory(assets, reuseFromDirectory = note.assetDirectory).also { materializedDirectory = it }
+                    else media.materializePortableDirectory(effectiveAssets, reuseFromDirectory = note.assetDirectory).also { materializedDirectory = it }
                 } else null
-                staged.outputStream().use { media.writeFmd(it, content, assets, savedPortableAssets[effectiveId]) }
+                staged.outputStream().use { media.writeFmd(it, content, effectiveAssets, savedPortableAssets[effectiveId]) }
                 verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
                 resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
                 documentAccess.persist(destination)
@@ -257,7 +280,7 @@ internal class ExportShareCoordinator(
                                         name = if (rebindId != null) savedName else it.name,
                                         content = if (it.content == originalContent) content else it.content,
                                         saved = content, assetsDirty = false, uri = destination.toString(),
-                                        relative = openRel ?: it.relative, assetDirectory = nextDirectory,
+                                        relative = if (rebindId != null) openRel else (openRel ?: it.relative), assetDirectory = nextDirectory,
                                     ) else it
                                 },
                                 conflictedTabIds = s.conflictedTabIds - effectiveId,
