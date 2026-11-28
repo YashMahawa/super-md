@@ -14,21 +14,109 @@ import {parseFrontmatter,type ParsedFrontmatter} from './frontmatter';
 import {headingSlug} from './headingSlug';
 
 export interface SourceBlock {start:number;end:number;text:string}
+export interface SourceBlockRange {start:number;end:number}
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export interface PythonCellSource {source:string;ordinal:number;offset:number}
 export interface DocumentAnalysis {tree:Root;blocks:SourceBlock[];bodyBlocks:SourceBlock[];frontmatter:ParsedFrontmatter|null;outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
+export interface CompactDocumentAnalysis {tree:Root;blockRanges:SourceBlockRange[];bodyBlockRanges:SourceBlockRange[];frontmatter:ParsedFrontmatter|null;outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
 export interface SourceDocumentAnalysis {source:string;analysis:DocumentAnalysis}
-const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use([remarkImageAttributes,remarkSvgBlocks,remarkBracedFences,remarkStudySyntax,remarkEquationReferences]);
+
+function createLazySourceBlock(source:string,start:number,end:number):SourceBlock {
+  let sliced:string|undefined;
+  return {
+    start,
+    end,
+    get text():string {
+      return sliced ?? (sliced=source.slice(start,end));
+    },
+  };
+}
+
+/** Strip duplicate block source slices before posting analysis across threads. */
+export function toCompactAnalysis(analysis:DocumentAnalysis):CompactDocumentAnalysis {
+  return {
+    tree:analysis.tree,
+    blockRanges:analysis.blocks.map(({start,end})=>({start,end})),
+    bodyBlockRanges:analysis.bodyBlocks.map(({start,end})=>({start,end})),
+    frontmatter:analysis.frontmatter,
+    outline:analysis.outline,
+    tasks:analysis.tasks,
+    pythonCells:analysis.pythonCells,
+  };
+}
+
+/** Reattach lazy source-backed blocks on the UI thread without copying slices. */
+export function hydrateDocumentAnalysis(source:string,compact:CompactDocumentAnalysis):SourceDocumentAnalysis {
+  const fmEnd=compact.frontmatter?.end??0;
+  const blocks=compact.blockRanges.length
+    ? compact.blockRanges.map(({start,end})=>createLazySourceBlock(source,start,end))
+    : [createLazySourceBlock(source,0,source.length)];
+  const bodyBlocks=compact.bodyBlockRanges.length
+    ? compact.bodyBlockRanges.map(({start,end})=>createLazySourceBlock(source,start,end))
+    : [createLazySourceBlock(source,fmEnd,source.length)];
+  return {
+    source,
+    analysis:{
+      tree:compact.tree,
+      blocks,
+      bodyBlocks,
+      frontmatter:compact.frontmatter,
+      outline:compact.outline,
+      tasks:compact.tasks,
+      pythonCells:compact.pythonCells,
+    },
+  };
+}
+
+const sharedTailPlugins=[remarkImageAttributes,remarkSvgBlocks,remarkBracedFences,remarkStudySyntax,remarkEquationReferences];
+const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use(sharedTailPlugins);
+const plainProcessor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkMath).use(remarkObsidianMath).use(sharedTailPlugins);
+const PLAIN_PARAGRAPH_EXCLUDED=/[\0#=\-*_+>`~<\[\\\]!&$%:|@.){\r\t]/;
+const GFM_SYNTAX_CANDIDATE=/[|~[:@]|www\./i;
 const cache=new Map<string,{value:DocumentAnalysis;weight:number}>();let retained=0;
 const LIMIT=8_000_000;
 function textOf(node:any):string{return typeof node.value==='string'?node.value:(node.children||[]).map(textOf).join('');}
+
+function analyzePlainParagraph(source:string):DocumentAnalysis|null {
+  const len=source.length;
+  if(!len||source[0]===' '||source[0]==='\n'||source[len-1]===' '||source[len-1]==='\n')return null;
+  if(PLAIN_PARAGRAPH_EXCLUDED.test(source)||source.includes('\n\n')||source.includes('\n ')||source.includes(' \n'))return null;
+  let lines=1,lastNewline=-1,idx=source.indexOf('\n');
+  while(idx!==-1){
+    lines++;
+    lastNewline=idx;
+    idx=source.indexOf('\n',idx+1);
+  }
+  const position={
+    start:{line:1,column:1,offset:0},
+    end:{line:lines,column:len-lastNewline,offset:len},
+  };
+  const tree:Root={
+    type:'root',
+    children:[{
+      type:'paragraph',
+      children:[{type:'text',value:source,position}],
+      position,
+    }],
+    position,
+  };
+  const block=createLazySourceBlock(source,0,len);
+  return {tree,blocks:[block],bodyBlocks:[block],frontmatter:null,outline:[],tasks:[],pythonCells:[]};
+}
 
 /** One bounded immutable analysis shared by outline, Live and rendering. Only
  * derived syntax is cached; source remains owned by the document/revision. */
 export function analyzeDocument(source:string):DocumentAnalysis {
   const hit=cache.get(source);if(hit){cache.delete(source);cache.set(source,hit);return hit.value;}
+  const plain=source.length>4096?analyzePlainParagraph(source):null;
+  if(plain){
+    const weight=source.length*2+480;
+    if(weight<=LIMIT){cache.set(source,{value:plain,weight});retained+=weight;while(retained>LIMIT||cache.size>16){const first=cache.keys().next().value!;retained-=cache.get(first)!.weight;cache.delete(first);}}
+    return plain;
+  }
   const frontmatter=parseFrontmatter(source),fmEnd=frontmatter?.end??0;
-  const tree=processor.runSync(processor.parse(source),source) as Root;
+  const activeProcessor=GFM_SYNTAX_CANDIDATE.test(source)?processor:plainProcessor;
+  const tree=activeProcessor.runSync(activeProcessor.parse(source),source) as Root;
   const outline:OutlineEntry[]=[],tasks:number[]=[],pythonCells:PythonCellSource[]=[],counts=new Map<string,number>(),pythonCounts=new Map<string,number>();let weight=source.length*2;
   visit(tree,(node:any)=>{
     weight+=160+(typeof node.value==='string'?node.value.length*2:0);
