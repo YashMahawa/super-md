@@ -203,8 +203,7 @@ internal class AgentWindowController(
         val script = "if(window.supermdAgentCompute)window.supermdAgentCompute($payload,$callback);else window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},'null','The native document computation helper is unavailable');true"
         web.evaluateJavascript(script, null)
     }
-    internal fun agentRevision(value: String): String = MessageDigest.getInstance("SHA-256")
-        .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    internal fun agentRevision(value: String): String = agentContentRevision(value)
     internal fun agentSourceLength(value: String): Int = value.codePointCount(0, value.length)
     internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png", model: StudioViewModel): JSONObject {
         require(imageFormat in setOf("png", "jpeg")) { "Unsupported viewport image format" }
