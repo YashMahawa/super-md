@@ -20,7 +20,6 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.zip.Deflater
 import java.util.zip.GZIPOutputStream
 
 internal const val PORTABLE_GZIP_LEVEL = 3
@@ -431,38 +430,33 @@ class MediaStorage(private val context: Context) {
                 ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
         }
 
-    fun importUris(uris: List<Uri>): JSONArray {
+    internal fun importUris(
+        uris: List<Uri>,
+        documentAccess: DocumentAccess? = null,
+    ): JSONArray {
         require(uris.size in 1..32)
         var total = 0L
         val result = JSONArray()
         try {
             for (uri in uris) {
-                val (name, type, bytes) = when (uri.scheme?.lowercase()) {
-                    "content" -> {
-                        ExternalDocumentEntryGuard.validatePickedMediaUri(context, uri)
-                        val resolvedName = resolveUriDisplayName(uri) ?: "Image"
-                        val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
-                        val resolvedType = imageMime(resolvedName, providerMime)
-                        val readBytes = ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
-                            context = context,
-                            resolver = context.contentResolver,
-                            uri = uri,
-                        ).use { input -> readLimited(input, 25_000_000) }
-                        Triple(resolvedName, resolvedType, readBytes)
+                val (name, type, bytes) = ExternalDocumentEntryGuard.admitUserAuthorizedMediaUri(
+                    context = context,
+                    resolver = context.contentResolver,
+                    uri = uri,
+                    documentAccess = documentAccess,
+                ).use { admitted ->
+                    val resolvedUri = admitted.uri
+                    val resolvedName = resolveUriDisplayName(resolvedUri) ?: "Image"
+                    val providerMime = if (resolvedUri.scheme.equals("content", ignoreCase = true)) {
+                        runCatching { context.contentResolver.getType(resolvedUri) }.getOrNull()
+                    } else {
+                        null
                     }
-                    "file" -> {
-                        ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
-                            context = context,
-                            resolver = context.contentResolver,
-                            uri = uri,
-                        ).use { input ->
-                            val resolvedName = resolveUriDisplayName(uri) ?: "Image"
-                            val resolvedType = imageMime(resolvedName, null)
-                            val readBytes = readLimited(input, 25_000_000)
-                            Triple(resolvedName, resolvedType, readBytes)
-                        }
+                    val resolvedType = imageMime(resolvedName, providerMime)
+                    val readBytes = admitted.openInputStream().use { input ->
+                        readLimited(input, 25_000_000)
                     }
-                    else -> throw IllegalArgumentException("Unsupported image URI")
+                    Triple(resolvedName, resolvedType, readBytes)
                 }
                 requireMediaSignature(type, bytes)
                 total += bytes.size

@@ -2,12 +2,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-
-const { bridgeInvoke } = vi.hoisted(() => ({
-  bridgeInvoke: vi.fn(async (_command: string, _args?: unknown) => ({ opened: true })),
-}));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: bridgeInvoke }));
-
 import { EditorView } from "@codemirror/view";
 import { Reader } from "./androidReader";
 import Editor from "./components/Editor";
@@ -24,7 +18,6 @@ const postSpy = vi.fn((id: string, command: string, rawArgs: string) => {
 });
 
 beforeEach(() => {
-  bridgeInvoke.mockClear();
   postCalls.length = 0;
   postSpy.mockClear();
   window.SuperMD = { post: postSpy };

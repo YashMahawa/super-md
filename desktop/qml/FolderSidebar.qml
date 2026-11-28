@@ -6,6 +6,12 @@ ColumnLayout {
     id: root
     objectName: "folderSidebar"
     required property var viewState
+    property var tabs: typeof studio !== "undefined" && studio && studio.tabsSnapshot !== undefined
+        ? JSON.parse(studio.tabsSnapshot)
+        : (viewState && viewState.tabs ? viewState.tabs : [])
+    property string activeTabId: typeof studio !== "undefined" && studio && studio.activeTabId !== undefined
+        ? String(studio.activeTabId)
+        : (sidebarState && sidebarState.active ? String(sidebarState.active) : (viewState && viewState.active ? String(viewState.active) : ""))
     property var sidebarState: typeof studio !== "undefined" && studio && studio.sidebarSnapshot !== undefined ? JSON.parse(studio.sidebarSnapshot) : viewState
     property var shortcutLabels: ({})
     readonly property string currentFolder: sidebarState.folder || ""
@@ -13,12 +19,12 @@ ColumnLayout {
     property string selectedName: ""
     property bool selectedDirectory: false
     readonly property string activeTabPath: {
-        const tabs = root.viewState && root.viewState.tabs ? root.viewState.tabs : []
-        const activeId = root.sidebarState && root.sidebarState.active !== undefined
-            ? root.sidebarState.active
-            : (root.viewState ? root.viewState.active : "")
-        for (let i = 0; i < tabs.length; i += 1) {
-            if (tabs[i].id === activeId) return tabs[i].path || ""
+        const list = root.tabs || []
+        const activeId = root.activeTabId || (root.sidebarState && root.sidebarState.active !== undefined
+            ? String(root.sidebarState.active)
+            : (root.viewState && root.viewState.active ? String(root.viewState.active) : ""))
+        for (let i = 0; i < list.length; i += 1) {
+            if (list[i].id === activeId) return list[i].path || ""
         }
         return ""
     }
@@ -135,8 +141,8 @@ ColumnLayout {
             openRenameFor(selectedEntry.path, selectedEntry.name, Boolean(selectedEntry.directory))
             return
         }
-        const activeId = sidebarState.active || viewState.active
-        const activeTab = (viewState.tabs || []).find(t => t.id === activeId)
+        const activeId = sidebarState.active || root.activeTabId || viewState.active
+        const activeTab = (root.tabs || []).find(t => t.id === activeId)
         if (activeTab && activeTab.path && root.isInsideOpenFolder(activeTab.path)) {
             openRenameFor(activeTab.path, activeTab.name, false)
             return
@@ -158,7 +164,7 @@ ColumnLayout {
     ActionButton {
         objectName: "sidebarFolderSearchButton"
         text: "Search across notes"
-        glyph: "MagnifyingGlass"
+        glyph: "FolderSearch"
         compact: true
         tonal: true
         Layout.fillWidth: true

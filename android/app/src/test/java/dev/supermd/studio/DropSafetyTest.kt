@@ -932,4 +932,111 @@ class DropSafetyTest {
         assertEquals(openCountBefore, streamProvider.openCount.get())
         assertEquals(MediaStorage.UNGRANTED_DROP_IMAGE_MESSAGE, model.state.value.message)
     }
+
+    @Test fun sharedMediaGuardVerifiesPermissionAndDescriptorTypeBeforeMetadataOrByteIo() {
+        val privateSecret = File(app.filesDir, "redirected-drop-secret.png").apply { writeBytes(VALID_PNG_BYTES) }
+        val safUnAuthUri = DocumentsContract.buildDocumentUri(AUTHORITY, "vault/unauth.png")
+        val redirectedDropUri = DocumentsContract.buildDocumentUri(AUTHORITY, "vault/redirected.png")
+
+        provider.entries["unauth.png"] = FakeDropProvider.Entry("unauth.png", "image/png", VALID_PNG_BYTES)
+        provider.entries["redirected.png"] = FakeDropProvider.Entry("redirected.png", "image/png", VALID_PNG_BYTES, backingFile = privateSecret)
+
+        grantRead(redirectedDropUri)
+
+        val model = StudioViewModel(app)
+        drainMain()
+        val activeId = model.state.value.active.id
+
+        // 1. Redirected app-private descriptor on drag-and-drop is rejected BEFORE query or getType runs.
+        provider.queryCount = 0
+        provider.getTypeCount = 0
+        provider.openCount = 0
+        var dropDone = false
+        var dropResult: JSONArray? = JSONArray().put("sentinel")
+        model.importDropped(listOf(redirectedDropUri), activeId, dragReadPermissionGranted = true) {
+            dropResult = it
+            dropDone = true
+        }
+        drainMain { dropDone }
+        assertNull(dropResult)
+        assertEquals(1, provider.openCount)
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.getTypeCount)
+        assertEquals(MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE, model.state.value.message)
+
+        // 2. Ungranted SAF document URI on picker (importPickedImages) is rejected BEFORE query, getType, or openFile.
+        provider.queryCount = 0
+        provider.getTypeCount = 0
+        provider.openCount = 0
+        var ungrantedPickDone = false
+        var ungrantedPickResult: JSONArray? = JSONArray().put("sentinel")
+        model.importPickedImages(listOf(safUnAuthUri), activeId) {
+            ungrantedPickResult = it
+            ungrantedPickDone = true
+        }
+        drainMain { ungrantedPickDone }
+        assertNull(ungrantedPickResult)
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.getTypeCount)
+        assertEquals(0, provider.openCount)
+        assertTrue(model.state.value.error?.contains("Image permission is unavailable") == true)
+        model.dismissError()
+
+        // 3. Redirected app-private descriptor on picker is rejected BEFORE query or getType runs.
+        provider.queryCount = 0
+        provider.getTypeCount = 0
+        provider.openCount = 0
+        var redirectPickDone = false
+        var redirectPickResult: JSONArray? = JSONArray().put("sentinel")
+        model.importPickedImages(listOf(redirectedDropUri), activeId) {
+            redirectPickResult = it
+            redirectPickDone = true
+        }
+        drainMain { redirectPickDone }
+        assertNull(redirectPickResult)
+        assertEquals(1, provider.openCount)
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.getTypeCount)
+        assertTrue(model.state.value.error?.contains("App-private paths cannot be opened externally") == true)
+        model.dismissError()
+
+        // 4. Existing Android workspace SAF folder grant authorizes child SAF media picker imports cleanly.
+        val safAuthority = "com.android.externalstorage.documents"
+        val safProvider = FakeDropProvider().apply {
+            entries["folder-img.png"] = FakeDropProvider.Entry("folder-img.png", "image/png", VALID_PNG_BYTES)
+            attachInfo(
+                rawApp,
+                ProviderInfo().apply {
+                    authority = safAuthority
+                    exported = true
+                    grantUriPermissions = true
+                },
+            )
+        }
+        ShadowContentResolver.registerProviderInternal(safAuthority, safProvider)
+        TestAuthorityGrants.registerAuthority(safAuthority)
+        try {
+            val safTreeUri = DocumentsContract.buildTreeDocumentUri(safAuthority, "primary:Vault")
+            val safChildImgUri = DocumentsContract.buildDocumentUri(safAuthority, "primary:Vault/folder-img.png")
+            val grantFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            app.grantUriPermission(app.packageName, safTreeUri, grantFlags)
+            TestAuthorityGrants.grant(safTreeUri, grantFlags, persistable = true)
+            model.documentAccess.persist(safTreeUri)
+
+            var workspacePickDone = false
+            var workspacePickResult: JSONArray? = null
+            model.importPickedImages(listOf(safChildImgUri), activeId) {
+                workspacePickResult = it
+                workspacePickDone = true
+            }
+            drainMain { workspacePickDone }
+            assertNotNull("Expected workspace-granted SAF image to import, error=${model.state.value.error}", workspacePickResult)
+            assertEquals(1, workspacePickResult!!.length())
+            assertEquals("folder-img", workspacePickResult!!.getJSONObject(0).getString("alt"))
+        } finally {
+            TestAuthorityGrants.clear()
+        }
+
+        privateSecret.delete()
+    }
 }

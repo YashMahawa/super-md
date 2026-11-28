@@ -192,14 +192,54 @@ private class OwnedFileDescriptorInputStream(
     }
 }
 
+internal class OpenedContentDescriptorHandle(
+    private val pfd: ParcelFileDescriptor,
+) : Closeable {
+    private val consumed = AtomicBoolean(false)
+    private val closed = AtomicBoolean(false)
+
+    fun consumeInputStream(): InputStream {
+        check(consumed.compareAndSet(false, true)) { "Content descriptor handle was already consumed" }
+        check(!closed.get()) { "Content descriptor handle is already closed" }
+        return ParcelFileDescriptor.AutoCloseInputStream(pfd)
+    }
+
+    override fun close() {
+        if (!consumed.get() && closed.compareAndSet(false, true)) {
+            runCatching { pfd.close() }
+        }
+    }
+}
+
+internal class AdmittedUserAuthorizedUri(
+    val uri: Uri,
+    private val fileHandle: OpenedRegularFileHandle? = null,
+    private val contentHandle: OpenedContentDescriptorHandle? = null,
+) : Closeable {
+    fun openInputStream(): InputStream {
+        if (fileHandle != null) return fileHandle.consumeInputStream()
+        if (contentHandle != null) return contentHandle.consumeInputStream()
+        error("Admitted URI handle has no backing descriptor")
+    }
+
+    override fun close() {
+        fileHandle?.close()
+        contentHandle?.close()
+    }
+}
+
 internal class AdmittedExternalDrop(
     val uri: Uri,
     val intentFlags: Int,
     private val fileHandle: OpenedRegularFileHandle? = null,
+    private val contentHandle: OpenedContentDescriptorHandle? = null,
 ) : Closeable {
     fun openInputStream(context: Context, resolver: ContentResolver): InputStream {
         if (fileHandle != null) {
             return fileHandle.consumeInputStream()
+        }
+        if (contentHandle != null) {
+            return contentHandle.consumeInputStream()
         }
         return ExternalDocumentEntryGuard.openVerifiedExternalInputStream(
             context = context,
@@ -212,6 +252,7 @@ internal class AdmittedExternalDrop(
 
     override fun close() {
         fileHandle?.close()
+        contentHandle?.close()
     }
 }
 
@@ -238,12 +279,12 @@ internal sealed interface ExternalDropUriDecision : Closeable {
 }
 
 /**
- * Validates untrusted external document and media entry points (MainActivity incoming Intents,
- * drag-and-drop URIs, and picked image URIs) before persisting permissions, resolving URIs, or
- * reading bytes.
+ * Shared defensive entry guard for untrusted external document/media entry points (incoming
+ * Intents and drag-and-drop URIs) and user-authorized note/media entry points (SAF/picker opens,
+ * access restoration, reload-from-disk, and linked reader assets).
  *
- * Normal system document picker selections (ACTION_OPEN_DOCUMENT / RestoreDocumentAccess) and
- * internal workspace/folder/recent restores do not pass through this gate.
+ * Enforces permission and descriptor-type/containment validation before metadata or byte I/O while
+ * preserving bounded provider streams (`S_ISFIFO` / `S_ISSOCK`) and existing Android workspace grants.
  */
 internal object ExternalDocumentEntryGuard {
     @Volatile
@@ -390,10 +431,46 @@ internal object ExternalDocumentEntryGuard {
                 if (!dragReadPermissionGranted || !hasDirectReadUriPermission(context, uri)) {
                     return ExternalDropUriDecision.MissingGrant(uri)
                 }
-                ExternalDropUriDecision.Allowed(
-                    uri = uri,
-                    admitted = AdmittedExternalDrop(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION),
-                )
+                val pfd = try {
+                    context.contentResolver.openFileDescriptor(uri, "r")
+                } catch (_: SecurityException) {
+                    return ExternalDropUriDecision.MissingGrant(uri)
+                } catch (error: Throwable) {
+                    return ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = error.message ?: "Dropped file could not be opened",
+                    )
+                } ?: return ExternalDropUriDecision.Rejected(uri, "Dropped file could not be opened")
+                try {
+                    verifyOpenedContentDescriptor(
+                        context = context,
+                        uri = uri,
+                        pfd = pfd,
+                        allowGrantedShareFile = false,
+                    )
+                    ExternalDropUriDecision.Allowed(
+                        uri = uri,
+                        admitted = AdmittedExternalDrop(
+                            uri = uri,
+                            intentFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                            contentHandle = OpenedContentDescriptorHandle(pfd),
+                        ),
+                    )
+                } catch (folder: ExternalFolderUriException) {
+                    runCatching { pfd.close() }
+                    ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = folder.message ?: "Folder drops are not supported",
+                        isFolder = true,
+                    )
+                } catch (error: Throwable) {
+                    runCatching { pfd.close() }
+                    ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = error.message ?: "Dropped file was rejected",
+                        isFolder = false,
+                    )
+                }
             }
             "file" -> {
                 try {
@@ -457,35 +534,158 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
-    fun validatePickedMediaUri(context: Context, uri: Uri) {
+    fun canPersistUserAuthorizedDocumentGrant(context: Context, uri: Uri): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val authority = providerAuthority(uri) ?: return false
+        if (authority.equals("${context.packageName}.share", ignoreCase = true)) return false
+        return !isBareTreeUri(uri)
+    }
+
+    fun validateUserAuthorizedDocumentUri(
+        context: Context,
+        uri: Uri,
+        allowOwnShareNote: Boolean = false,
+        unsupportedMessage: String = "Unsupported document URI",
+        bareTreeMessage: String = "Folder URIs are not supported",
+    ) {
         when (uri.scheme?.lowercase()) {
             "content" -> {
-                val authority = providerAuthority(uri) ?: throw IllegalArgumentException("Unsupported image URI")
-                require(!authority.equals("${context.packageName}.share", ignoreCase = true)) {
-                    "Unsupported image URI"
+                val authority = providerAuthority(uri) ?: throw IllegalArgumentException(unsupportedMessage)
+                if (authority.equals("${context.packageName}.share", ignoreCase = true)) {
+                    require(allowOwnShareNote && uri.authority == "${context.packageName}.share") {
+                        unsupportedMessage
+                    }
                 }
-                require(!isBareTreeUri(uri)) { "Unsupported image URI" }
+                require(!isBareTreeUri(uri)) { bareTreeMessage }
             }
             "file" -> {
-                openSafeRegularFileHandle(context, uri).use { }
+                require(uri.authority.isNullOrEmpty() || uri.authority.equals("localhost", ignoreCase = true)) {
+                    "Remote file URIs are not supported"
+                }
+                val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
+                    ?: throw IllegalArgumentException("Invalid file path")
+                val normalizedLexical = File(rawPath).absoluteFile.toPath().normalize().toString()
+                require(!isForbiddenExternalPath(context, normalizedLexical)) {
+                    "App-private paths cannot be opened externally"
+                }
             }
-            else -> throw IllegalArgumentException("Unsupported image URI")
+            else -> throw IllegalArgumentException(unsupportedMessage)
         }
     }
 
-    fun openVerifiedPickedMediaInputStream(
+    fun hasUserAuthorizedContentReadPermission(
+        context: Context,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+    ): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val authority = providerAuthority(uri) ?: return false
+        if (authority.equals("${context.packageName}.share", ignoreCase = true)) {
+            return allowOwnShareNote && uri.authority == "${context.packageName}.share"
+        }
+        if (isBareTreeUri(uri)) return false
+        if (TestAuthorityGrants.check(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) == true) {
+            return true
+        }
+        if (hasDirectReadUriPermission(context, uri, ExternalIntentCaller(allowGrantedShareFile = false))) {
+            return true
+        }
+        if (documentAccess?.hasAnyReadOrPendingGrant(uri) == true) {
+            return true
+        }
+        if (
+            allowExportedNonSafPickerProvider &&
+            !DocumentsContract.isTreeUri(uri) &&
+            runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() == null
+        ) {
+            return isReadableExportedProvider(context, authority)
+        }
+        return false
+    }
+
+    fun requireUserAuthorizedContentReadPermission(
+        context: Context,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+        deniedMessage: String = "Document permission is unavailable; choose it again",
+    ) {
+        if (
+            !hasUserAuthorizedContentReadPermission(
+                context = context,
+                uri = uri,
+                documentAccess = documentAccess,
+                allowOwnShareNote = allowOwnShareNote,
+                allowExportedNonSafPickerProvider = allowExportedNonSafPickerProvider,
+            )
+        ) {
+            throw SecurityException(deniedMessage)
+        }
+    }
+
+    fun verifyUserAuthorizedContentDescriptor(
+        context: Context,
+        uri: Uri,
+        pfd: ParcelFileDescriptor,
+        allowOwnShareNote: Boolean = false,
+    ) {
+        verifyOpenedContentDescriptor(
+            context = context,
+            uri = uri,
+            pfd = pfd,
+            allowGrantedShareFile = allowOwnShareNote && uri.authority == "${context.packageName}.share",
+        )
+    }
+
+    fun admitUserAuthorizedUri(
         context: Context,
         resolver: ContentResolver,
         uri: Uri,
-    ): InputStream {
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+        unsupportedMessage: String = "Unsupported document URI",
+        bareTreeMessage: String = "Folder URIs are not supported",
+        deniedMessage: String = "Document permission is unavailable; choose it again",
+    ): AdmittedUserAuthorizedUri {
+        validateUserAuthorizedDocumentUri(
+            context = context,
+            uri = uri,
+            allowOwnShareNote = allowOwnShareNote,
+            unsupportedMessage = unsupportedMessage,
+            bareTreeMessage = bareTreeMessage,
+        )
         return when (uri.scheme?.lowercase()) {
             "content" -> {
-                validatePickedMediaUri(context, uri)
-                val pfd = resolver.openFileDescriptor(uri, "r")
-                    ?: throw SecurityException("Image permission is unavailable")
+                val resolved = if (uri.authority == "${context.packageName}.share") {
+                    uri
+                } else {
+                    documentAccess?.resolve(uri) ?: uri
+                }
+                requireUserAuthorizedContentReadPermission(
+                    context = context,
+                    uri = resolved,
+                    documentAccess = documentAccess,
+                    allowOwnShareNote = allowOwnShareNote,
+                    allowExportedNonSafPickerProvider = allowExportedNonSafPickerProvider,
+                    deniedMessage = deniedMessage,
+                )
+                val pfd = resolver.openFileDescriptor(resolved, "r")
+                    ?: throw SecurityException(deniedMessage)
                 try {
-                    verifyOpenedContentDescriptor(context, uri, pfd, allowGrantedShareFile = false)
-                    ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                    verifyUserAuthorizedContentDescriptor(
+                        context = context,
+                        uri = resolved,
+                        pfd = pfd,
+                        allowOwnShareNote = allowOwnShareNote,
+                    )
+                    AdmittedUserAuthorizedUri(
+                        uri = resolved,
+                        contentHandle = OpenedContentDescriptorHandle(pfd),
+                    )
                 } catch (error: Throwable) {
                     runCatching { pfd.close() }
                     throw error
@@ -493,14 +693,105 @@ internal object ExternalDocumentEntryGuard {
             }
             "file" -> {
                 val handle = openSafeRegularFileHandle(context, uri)
-                try {
-                    handle.consumeInputStream()
-                } catch (error: Throwable) {
-                    handle.close()
-                    throw error
-                }
+                AdmittedUserAuthorizedUri(uri = uri, fileHandle = handle)
             }
-            else -> throw IllegalArgumentException("Unsupported image URI")
+            else -> throw IllegalArgumentException(unsupportedMessage)
+        }
+    }
+
+    fun openVerifiedUserAuthorizedInputStream(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+        unsupportedMessage: String = "Unsupported document URI",
+        bareTreeMessage: String = "Folder URIs are not supported",
+        deniedMessage: String = "Document permission is unavailable; choose it again",
+    ): InputStream {
+        val admitted = admitUserAuthorizedUri(
+            context = context,
+            resolver = resolver,
+            uri = uri,
+            documentAccess = documentAccess,
+            allowOwnShareNote = allowOwnShareNote,
+            allowExportedNonSafPickerProvider = allowExportedNonSafPickerProvider,
+            unsupportedMessage = unsupportedMessage,
+            bareTreeMessage = bareTreeMessage,
+            deniedMessage = deniedMessage,
+        )
+        return try {
+            admitted.openInputStream()
+        } catch (error: Throwable) {
+            admitted.close()
+            throw error
+        }
+    }
+
+    fun validatePickedMediaUri(context: Context, uri: Uri) {
+        validateUserAuthorizedDocumentUri(
+            context = context,
+            uri = uri,
+            allowOwnShareNote = false,
+            unsupportedMessage = "Unsupported image URI",
+            bareTreeMessage = "Unsupported image URI",
+        )
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            openSafeRegularFileHandle(context, uri).use { }
+        }
+    }
+
+    fun admitUserAuthorizedMediaUri(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+    ): AdmittedUserAuthorizedUri = admitUserAuthorizedUri(
+        context = context,
+        resolver = resolver,
+        uri = uri,
+        documentAccess = documentAccess,
+        allowOwnShareNote = false,
+        allowExportedNonSafPickerProvider = true,
+        unsupportedMessage = "Unsupported image URI",
+        bareTreeMessage = "Unsupported image URI",
+        deniedMessage = "Image permission is unavailable",
+    )
+
+    fun openVerifiedPickedMediaInputStream(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+    ): InputStream = openVerifiedUserAuthorizedInputStream(
+        context = context,
+        resolver = resolver,
+        uri = uri,
+        documentAccess = documentAccess,
+        allowOwnShareNote = false,
+        allowExportedNonSafPickerProvider = true,
+        unsupportedMessage = "Unsupported image URI",
+        bareTreeMessage = "Unsupported image URI",
+        deniedMessage = "Image permission is unavailable",
+    )
+
+    private fun isReadableExportedProvider(context: Context, authority: String): Boolean {
+        val providerInfo = runCatching { context.packageManager.resolveContentProvider(authority, 0) }.getOrNull()
+        if (providerInfo != null) {
+            if (!providerInfo.exported) return false
+            val readPerm = providerInfo.readPermission
+            return readPerm.isNullOrEmpty() ||
+                context.checkPermission(readPerm, Process.myPid(), Process.myUid()) == PackageManager.PERMISSION_GRANTED
+        }
+        val client = runCatching { context.contentResolver.acquireUnstableContentProviderClient(authority) }.getOrNull()
+            ?: return false
+        return client.use {
+            val local = it.localContentProvider ?: return@use false
+            if (local is androidx.core.content.FileProvider) return@use false
+            val readPerm = local.readPermission
+            readPerm.isNullOrEmpty() ||
+                context.checkPermission(readPerm, Process.myPid(), Process.myUid()) == PackageManager.PERMISSION_GRANTED
         }
     }
 
@@ -715,14 +1006,19 @@ internal object ExternalDocumentEntryGuard {
         allowGrantedShareFile: Boolean,
     ) {
         val stat = runCatching { fileSyscalls.fstat(pfd.fileDescriptor) }.getOrNull()
-        if (stat != null && stat.st_mode != 0) {
-            require(
-                OsConstants.S_ISREG(stat.st_mode) ||
-                    OsConstants.S_ISFIFO(stat.st_mode) ||
-                    OsConstants.S_ISSOCK(stat.st_mode),
-            ) {
-                "Document is not a regular file"
-            }
+            ?: throw IllegalArgumentException("Could not confirm file descriptor status")
+        if (stat.st_mode == 0) {
+            throw IllegalArgumentException("Could not confirm file descriptor status")
+        }
+        if (OsConstants.S_ISDIR(stat.st_mode)) {
+            throw ExternalFolderUriException("Folder URIs are not supported")
+        }
+        require(
+            OsConstants.S_ISREG(stat.st_mode) ||
+                OsConstants.S_ISFIFO(stat.st_mode) ||
+                OsConstants.S_ISSOCK(stat.st_mode),
+        ) {
+            "Document is not a regular file"
         }
         val fdPath = fileSyscalls.resolveDescriptorPath(pfd.fileDescriptor)
             ?: resolveParcelDescriptorPath(pfd)
