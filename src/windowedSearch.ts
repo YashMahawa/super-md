@@ -38,15 +38,19 @@ function currentScrollSource(root:HTMLElement):ScrollSource|undefined {
 function scrollSourceAlive(root:HTMLElement,source:ScrollSource):boolean {
   return source.input===scrollInputVersion()&&source.node.isConnected&&root.contains(source.node)&&source.range.startContainer===source.node&&source.range.startOffset===source.offset;
 }
-/** Mount/unmount one observer batch before paint. A deferred RAF correction
+/** Mount/unmount one observer slice before paint. A deferred RAF correction
  * loses the anchor when another wheel/momentum step arrives before React
- * commits. Keep the latest viewport, change only layout, and restore its source
- * synchronously; never replay an earlier scrollTop or scroll gesture. */
-export function commitWindowedLayout(root:Element|Document|null,update:()=>void):void {
+ * commits. Keep the latest viewport, flush budgeted layout steps synchronously,
+ * and restore its source once per slice; never replay an earlier scrollTop. */
+export function commitWindowedLayout(
+  root:Element|Document|null,
+  update:(flush?:(work:()=>void)=>void)=>void,
+):void {
   const host=root instanceof HTMLElement?root:null;
   const beforeTop=host?.scrollTop;
   const restore=host?captureWindowedScrollAnchor(host):undefined;
-  flushSync(update);
+  if(update.length>0)update(work=>flushSync(work));
+  else flushSync(()=>update());
   if(host)refreshDocumentExtent(host);
   restore?.();
   if(host&&beforeTop!==undefined&&Math.abs(host.scrollTop-beforeTop)>.5)(host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=host.scrollTop;
@@ -104,7 +108,7 @@ function windowedViewportAnchor(root:HTMLElement,changing?:HTMLElement):HTMLElem
 }
 /** Preserve one viewport anchor for a batch of lazy mount/unmount changes. */
 export function preserveWindowedScroll(element:HTMLElement):void {
-  const root=element.closest<HTMLElement>('.android-reading');if(!root||root.dataset.navigating||pendingAnchors.has(root)||root.scrollTop<1)return;
+  const root=element.closest<HTMLElement>('.android-reading,.reading-scroll');if(!root||root.dataset.navigating||pendingAnchors.has(root)||root.scrollTop<1)return;
   const rect=root.getBoundingClientRect(),x=rect.left+rect.width*.5,y=rect.top+Math.min(160,rect.height*.35);
   const anchor=document.elementFromPoint(x,y)?.closest<HTMLElement>('[data-windowed-block]');if(!anchor)return;
   const top=anchor.getBoundingClientRect().top,scroll=root.scrollTop;pendingAnchors.add(root);

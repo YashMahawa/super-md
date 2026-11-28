@@ -20,7 +20,7 @@ import CodeBlockBoundary from "./CodeBlockBoundary";
 import DocumentProperties from "./DocumentProperties";
 import type { ParsedFrontmatter } from "../frontmatter";
 import {DocumentAppearance} from '../documentAppearance';
-import {parseValidatedSvg} from '../svgImage';
+import {parseValidatedSvg,svgSizingStyle} from '../svgImage';
 import {adaptValidatedSvg,decodeSvgDataUri} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
@@ -148,6 +148,7 @@ function AssetImage({ noteId, src = "", alt = "", documentPath, trustedImageHost
     catch(reason){return {svg:null,error:reason instanceof Error?reason.message:String(reason)};}
   },[resolved,isSvgData]);
   const svgBacking=validatedSvg?.svg?.backing;
+  const svgSizing=useMemo(()=>svgSizingStyle(validatedSvg?.svg?.dimensions),[validatedSvg]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
   const adapted=useMemo(()=>{
@@ -208,7 +209,8 @@ function AssetImage({ noteId, src = "", alt = "", documentPath, trustedImageHost
   if (displayError) return <span ref={mediaElement} className="image-error" data-note-id={noteIdAttr} data-note-image-source={src} data-note-image-readonly={readonlyAttr} role={editable ? "group" : "img"} aria-label={alt || "Image unavailable"}><span>Image unavailable: {alt || src}<small>{displayError}</small></span>{editable && <span className="image-error-actions"><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}</span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" data-note-id={noteIdAttr} role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
-  return <span ref={mediaElement} className={`note-image ${isSvgData?'note-image--diagram':''} ${sizing?'image-loading':''}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-id={noteIdAttr} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
+  const wrapperStyle=sizing?{width:'100%',maxWidth:'100%',boxSizing:'border-box'}:isSvgData?svgSizing:undefined;
+  return <span ref={mediaElement} className={`note-image ${isSvgData?'note-image--diagram':''} ${sizing?'image-loading':''}`} data-svg-sized={!sizing&&isSvgData&&svgSizing?'true':undefined} style={wrapperStyle as React.CSSProperties|undefined} data-note-id={noteIdAttr} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
     {sizing&&<span role="status">Loading image…</span>}
     <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={isSvgData?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
   </span>;
