@@ -2890,138 +2890,41 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         portable: Boolean = false,
         onComplete: ((Note?) -> Unit)? = null,
     ) {
-        val folderRaw = mutable.value.folder
-        if (folderRaw.isNullOrBlank()) {
-            fail("Open a folder first to create a folder note")
-            onComplete?.invoke(null)
-            return
-        }
-        openRequests.invalidate()
-        val expectedActiveId = mutable.value.active.id
-        viewModelScope.launch {
-            var createdDirCleanup: String? = null
-            try {
-                val fileName = validateFolderEntryName(
-                    rawName = rawName,
-                    isDirectory = false,
-                    currentExtension = if (portable) "smd" else "md",
-                )
-                val cleanParent = normalizeRelativePath(parentRelative)
-                val folderUri = Uri.parse(folderRaw)
-                val createdNote = withContext(Dispatchers.IO) {
-                    documentWrites.withLock {
-                        val pass = SafProjectionPass(resolver)
-                        val resolvedParent = resolveSafParentDirectory(documentAccess, pass, folderUri, cleanParent)
-                        confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
-                        require(findDuplicateProjectedChild(resolvedParent.children, resolvedParent.treeUri, fileName) == null) {
-                            "'$fileName' already exists in this folder"
-                        }
-                        val mime = if (portable) "application/vnd.supermd.smd" else "text/markdown"
-                        val staged = if (portable) File(getApplication<Application>().cacheDir, "create-smd-${UUID.randomUUID()}.smd") else null
-                        try {
-                            val assetDir = if (staged != null) {
-                                staged.outputStream().use { media.writeFmd(it, "", JSONObject()) }
-                                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
-                                staged.inputStream().use(media::openFmd).directory.also { createdDirCleanup = it }
-                            } else null
-                            val rawCreatedUri = DocumentsContract.createDocument(resolver, resolvedParent.parentDocumentUri, mime, fileName)
-                                ?: error("The selected folder could not create '$fileName'")
-                            val createdUri = canonicalTreeScopedUri(resolvedParent.treeUri, rawCreatedUri)
-                            try {
-                                resolver.openOutputStream(createdUri, "wt")?.use { out ->
-                                    staged?.inputStream()?.use { it.copyTo(out) }
-                                    out.flush()
-                                } ?: error("Could not write to '$fileName'")
-                            } catch (writeError: Exception) {
-                                runCatching { DocumentsContract.deleteDocument(resolver, createdUri) }
-                                throw writeError
-                            }
-                            documentAccess.persist(createdUri)
-                            canonicalTreeDocumentKey(createdUri)?.let(confirmedTreeDocumentKeys::add)
-                            val actualName = (querySingleDocumentMetadata(resolver, createdUri) as? ProviderMetadata.Found)
-                                ?.name?.takeIf { it.isNotBlank() } ?: fileName
-                            Note(
-                                name = actualName,
-                                uri = createdUri.toString(),
-                                content = "",
-                                saved = "",
-                                relative = childRelativePath(cleanParent, actualName),
-                                assetDirectory = assetDir,
-                            )
-                        } finally {
-                            staged?.delete()
-                        }
-                    }
-                }
-                createdDirCleanup = null
-                workspaceLinks.invalidate()
-                // Expand and display the parent folder before activating the tab so state.files and folderRelative are already in sync.
-                listFolder(folderUri, cleanParent).join()
-                val accepted = performReaderBarrier(expectedActiveId) {
-                    retainOpenedNote(createdNote, activate = true)
-                }
-                if (!accepted) {
-                    retainOpenedNote(createdNote, activate = false)
-                }
-                mutable.value = mutable.value.copy(message = "Created ${createdNote.name}")
-                onComplete?.invoke(createdNote)
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                createdDirCleanup?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
-                fail("Could not create note: ${error.message}")
-                onComplete?.invoke(null)
-            }
-        }
+        safFolderMutation.createFolderNote(parentRelative, rawName, portable, onComplete)
     }
+
+    private lateinit var safFolderMutationCache: SafFolderMutationCoordinator
+    private val safFolderMutation: SafFolderMutationCoordinator
+        get() = if (::safFolderMutationCache.isInitialized) safFolderMutationCache else synchronized(this) {
+            if (!::safFolderMutationCache.isInitialized) {
+                safFolderMutationCache = SafFolderMutationCoordinator(
+                    app = getApplication(),
+                    scope = viewModelScope,
+                    resolver = resolver,
+                    media = media,
+                    readDocumentAccess = { documentAccess },
+                    documentWrites = documentWrites,
+                    confirmedTreeDocumentKeys = confirmedTreeDocumentKeys,
+                    openRequests = openRequests,
+                    readWorkspaceLinks = { workspaceLinks },
+                    readState = { mutable.value },
+                    writeState = { mutable.value = it },
+                    fail = ::fail,
+                    verifyExportHeader = ::verifyExportHeader,
+                    listFolder = ::listFolder,
+                    performReaderBarrier = ::performReaderBarrier,
+                    retainOpenedNote = ::retainOpenedNote,
+                )
+            }
+            safFolderMutationCache
+        }
 
     fun createSubfolder(
         parentRelative: String = listedRelative,
         rawName: String,
         onComplete: ((FileEntry?) -> Unit)? = null,
     ) {
-        val folderRaw = mutable.value.folder
-        if (folderRaw.isNullOrBlank()) {
-            fail("Open a folder first to create a subfolder")
-            onComplete?.invoke(null)
-            return
-        }
-        viewModelScope.launch {
-            try {
-                val folderName = validateFolderEntryName(rawName, isDirectory = true)
-                val cleanParent = normalizeRelativePath(parentRelative)
-                val folderUri = Uri.parse(folderRaw)
-                val entry = withContext(Dispatchers.IO) {
-                    documentWrites.withLock {
-                        val pass = SafProjectionPass(resolver)
-                        val resolvedParent = resolveSafParentDirectory(documentAccess, pass, folderUri, cleanParent)
-                        confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
-                        require(findDuplicateProjectedChild(resolvedParent.children, resolvedParent.treeUri, folderName) == null) {
-                            "'$folderName' already exists in this folder"
-                        }
-                        val rawCreatedUri = DocumentsContract.createDocument(
-                            resolver,
-                            resolvedParent.parentDocumentUri,
-                            DocumentsContract.Document.MIME_TYPE_DIR,
-                            folderName,
-                        ) ?: error("The selected folder could not create '$folderName'")
-                        val createdUri = canonicalTreeScopedUri(resolvedParent.treeUri, rawCreatedUri)
-                        val actualName = (querySingleDocumentMetadata(resolver, createdUri) as? ProviderMetadata.Found)
-                            ?.name?.takeIf { it.isNotBlank() } ?: folderName
-                        FileEntry(actualName, createdUri.toString(), true, childRelativePath(cleanParent, actualName))
-                    }
-                }
-                workspaceLinks.invalidate()
-                listFolder(folderUri, cleanParent).join()
-                mutable.value = mutable.value.copy(message = "Created folder ${entry.name}")
-                onComplete?.invoke(entry)
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                fail("Could not create subfolder: ${error.message}")
-                onComplete?.invoke(null)
-            }
-        }
+        safFolderMutation.createSubfolder(parentRelative, rawName, onComplete)
     }
 
     fun renameFolderEntry(
