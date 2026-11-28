@@ -2262,11 +2262,18 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
     val pairingImport = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
             val raw = runCatching { withContext(Dispatchers.IO) {
-                activity.contentResolver.openInputStream(uri)?.use { input ->
+                ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                    context = activity,
+                    resolver = activity.contentResolver,
+                    uri = uri,
+                    allowExportedNonSafPickerProvider = true,
+                    allowAppCacheFiles = true,
+                    deniedMessage = "The pairing file cannot be read",
+                ).use { input ->
                     val bytes = ByteArray(8 * 1024 + 1); val count = input.read(bytes)
                     require(count in 1..8 * 1024) { "Pairing file is empty or too large" }
                     String(bytes, 0, count, Charsets.UTF_8)
-                } ?: error("The pairing file cannot be read")
+                }
             } }
             raw.onSuccess { text ->
                 if (activity.agentAccessState.currentConfig() != null) revokeThen { joinWorkspace(text) }

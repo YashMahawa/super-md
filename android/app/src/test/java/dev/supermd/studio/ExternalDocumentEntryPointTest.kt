@@ -587,6 +587,112 @@ class ExternalDocumentEntryPointTest {
         privateSecret.delete()
     }
 
+    @Test
+    fun inProcessCacheStagingAndDebugTestDocsPreserveContainmentAndPreQueryFontThemeGuards() {
+        val model = newModel(attachOpenHandler = true)
+
+        // 1. In-process user-authorized open allows regular non-symlink staged files in app.cacheDir,
+        // while external Intents, drops, symlinks into filesDir, and third-party content:// redirects to cacheDir remain rejected.
+        val stagedCacheNote = File(app.cacheDir, "staged-relay-${System.nanoTime()}.md").apply {
+            writeText("# Staged cache note\n")
+        }
+        val stagedUri = Uri.fromFile(stagedCacheNote)
+        assertTrue(
+            ExternalDocumentEntryGuard.validateIncomingIntent(app, Intent(Intent.ACTION_VIEW, stagedUri))
+                is ExternalDocumentDecision.Rejected,
+        )
+        ExternalDocumentEntryGuard.admitDroppedUri(app, stagedUri, dragReadPermissionGranted = true).use { dropDecision ->
+            assertTrue(dropDecision is ExternalDropUriDecision.Rejected)
+        }
+        model.open(stagedUri)
+        await { model.state.value.active.uri == stagedUri.toString() }
+        assertEquals("# Staged cache note\n", model.state.value.active.content)
+
+        val privateTarget = File(app.filesDir, "hidden-workspace-${System.nanoTime()}.md").apply {
+            writeText("SECRET WORKSPACE")
+        }
+        val aliasDir = File(app.cacheDir, "files-alias-${System.nanoTime()}")
+        Files.createSymbolicLink(aliasDir.toPath(), app.filesDir.toPath())
+        val aliasedFileUri = Uri.fromFile(File(aliasDir, privateTarget.name))
+        model.dismissError()
+        model.open(aliasedFileUri)
+        await { model.state.value.error != null }
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        model.dismissError()
+
+        val cacheRedirectAuth = "com.attacker.cache.redirect.${System.nanoTime()}"
+        val cacheRedirectProvider = PrivateFileRedirectProvider(stagedCacheNote).also { it.attach(rawApp, cacheRedirectAuth) }
+        ShadowContentResolver.registerProviderInternal(cacheRedirectAuth, cacheRedirectProvider)
+        val cacheRedirectUri = DocumentsContract.buildDocumentUri(cacheRedirectAuth, "staged.md")
+        app.grantUriPermission(app.packageName, cacheRedirectUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        model.open(cacheRedirectUri)
+        await { model.state.value.error != null }
+        assertEquals(0, cacheRedirectProvider.queryCount)
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        model.dismissError()
+
+        // 2. Registered debug ${packageName}.testdocs SAF provider under cacheDir/revocable-test-docs works when registered,
+        // while non-testdocs providers pointing into revocable-test-docs remain rejected.
+        val testDocsDir = File(app.cacheDir, "revocable-test-docs").apply { mkdirs() }
+        val testDocFile = File(testDocsDir, "RevocableNote.md").apply { writeText("# Revocable test doc\n") }
+        val testDocsAuth = "${app.packageName}.testdocs"
+        val testDocsProvider = PrivateFileRedirectProvider(testDocFile).also { it.attach(rawApp, testDocsAuth) }
+        ShadowContentResolver.registerProviderInternal(testDocsAuth, testDocsProvider)
+        val testDocUri = DocumentsContract.buildDocumentUri(testDocsAuth, "RevocableNote.md")
+
+        val spoofedTestDocsAuth = "com.attacker.spoofed.testdocs.${System.nanoTime()}"
+        val spoofedProvider = PrivateFileRedirectProvider(testDocFile).also { it.attach(rawApp, spoofedTestDocsAuth) }
+        ShadowContentResolver.registerProviderInternal(spoofedTestDocsAuth, spoofedProvider)
+        val spoofedTestDocUri = DocumentsContract.buildDocumentUri(spoofedTestDocsAuth, "RevocableNote.md")
+        app.grantUriPermission(app.packageName, spoofedTestDocUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        model.open(spoofedTestDocUri)
+        await { model.state.value.error != null }
+        assertEquals(0, spoofedProvider.queryCount)
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        model.dismissError()
+
+        TestAuthorityGrants.registerAuthority(testDocsAuth)
+        try {
+            TestAuthorityGrants.grant(testDocUri, Intent.FLAG_GRANT_READ_URI_PERMISSION, persistable = true)
+            model.open(testDocUri)
+            await { model.state.value.active.uri == testDocUri.toString() }
+            assertEquals("# Revocable test doc\n", model.state.value.active.content)
+        } finally {
+            TestAuthorityGrants.clear()
+        }
+
+        // 3. FontLibrary.import and importCustomTheme enforce permission and descriptor checks BEFORE provider queries.
+        val fontLibrary = FontLibrary(app)
+        val ungrantedFontUri = DocumentsContract.buildDocumentUri(authority, "Custom.ttf")
+        provider.queryCount = 0
+        provider.openCount = 0
+        org.junit.Assert.assertThrows(SecurityException::class.java) {
+            fontLibrary.import(ungrantedFontUri)
+        }
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.openCount)
+
+        val redirectFontUri = DocumentsContract.buildDocumentUri(cacheRedirectAuth, "Secret.ttf")
+        app.grantUriPermission(app.packageName, redirectFontUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        cacheRedirectProvider.queryCount = 0
+        val redirectFontErr = org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            fontLibrary.import(redirectFontUri)
+        }
+        assertEquals(0, cacheRedirectProvider.queryCount)
+        assertTrue(redirectFontErr.message!!.contains("App-private paths cannot be opened externally"))
+
+        model.dismissError()
+        model.importCustomTheme(redirectFontUri)
+        await { model.state.value.error != null }
+        assertEquals(0, cacheRedirectProvider.queryCount)
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+
+        stagedCacheNote.delete()
+        aliasDir.delete()
+        privateTarget.delete()
+        testDocFile.delete()
+    }
+
     private fun newModel(attachOpenHandler: Boolean): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = "entry-guard-${System.nanoTime()}".also(workspaceKeys::add)

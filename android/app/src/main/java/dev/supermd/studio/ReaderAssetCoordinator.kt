@@ -28,7 +28,11 @@ internal class ReaderAssetCoordinator(
     private val openWorkspaceLink: suspend (documentPath: String, target: String, fragment: String, wikilink: Boolean) -> JSONObject,
 ) {
     private fun resolveAuthorizedAssetUri(rawUri: Uri): Uri {
-        ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(context, rawUri)
+        ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(
+            context = context,
+            uri = rawUri,
+            allowAppCacheFiles = true,
+        )
         return if (rawUri.scheme.equals("content", ignoreCase = true)) {
             val resolved = documentAccess().resolve(rawUri)
             ExternalDocumentEntryGuard.requireUserAuthorizedContentReadPermission(
@@ -50,6 +54,7 @@ internal class ReaderAssetCoordinator(
             uri = uri,
             documentAccess = documentAccess(),
             allowExportedNonSafPickerProvider = true,
+            allowAppCacheFiles = true,
         )
 
     fun attachReaderCapabilities(capabilities: ReaderAssetCapabilities) {
@@ -105,6 +110,7 @@ internal class ReaderAssetCoordinator(
             uri = uri,
             documentAccess = documentAccess(),
             allowExportedNonSafPickerProvider = true,
+            allowAppCacheFiles = true,
             deniedMessage = "Cannot read diagram source",
         ).use { admitted ->
             if (admitted.uri.scheme.equals("content", ignoreCase = true)) {
@@ -127,6 +133,7 @@ internal class ReaderAssetCoordinator(
             uri = uri,
             documentAccess = documentAccess(),
             allowExportedNonSafPickerProvider = true,
+            allowAppCacheFiles = true,
             deniedMessage = "Cannot read image",
         ).use { admitted ->
             val metadata = if (admitted.uri.scheme.equals("content", ignoreCase = true)) {
@@ -148,7 +155,7 @@ internal class ReaderAssetCoordinator(
         val meta = if (uri.scheme.equals("content", ignoreCase = true)) {
             querySafAssetMetadata(resolver, uri)
         } else {
-            ExternalDocumentEntryGuard.openSafeRegularFileHandle(context, uri).use { handle ->
+            ExternalDocumentEntryGuard.openSafeRegularFileHandle(context, uri, allowAppCacheFiles = true).use { handle ->
                 val rawFile = File(handle.rawPath)
                 SafAssetMetadata(rawFile.name, null, -1L, 0L)
             }
@@ -184,13 +191,13 @@ internal class ReaderAssetCoordinator(
                 val meta = if (verifiedUri.scheme.equals("content", ignoreCase = true)) {
                     querySafAssetMetadata(resolver, verifiedUri) { IllegalStateException("Image not found") }
                 } else {
-                    ExternalDocumentEntryGuard.openSafeRegularFileHandle(context, verifiedUri).use { handle ->
+                    ExternalDocumentEntryGuard.openSafeRegularFileHandle(context, verifiedUri, allowAppCacheFiles = true).use { handle ->
                         SafAssetMetadata(File(handle.rawPath).name, null, -1L, 0L)
                     }
                 }
                 if (meta.size >= 0L) require(meta.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
-                val mime = media.imageMime(meta.displayName ?: Uri.decode(capability.source).substringAfterLast('/'), meta.mimeType)
                 val open = { openAuthorizedAssetStream(verifiedUri) }
+                val mime = media.imageMime(meta.displayName ?: Uri.decode(capability.source).substringAfterLast('/'), meta.mimeType)
                 val currentFingerprint = readerAssetFingerprint(target.identity, meta.size, meta.lastModified, open)
                 require(currentFingerprint == capability.fingerprint && mime == capability.mime) {
                     "The image changed; reload the document image"

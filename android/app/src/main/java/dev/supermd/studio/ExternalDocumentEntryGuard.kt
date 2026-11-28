@@ -296,6 +296,13 @@ internal object ExternalDocumentEntryGuard {
         Intent.ACTION_MAIN,
     )
 
+    private val alwaysRestrictedSystemRoots = listOf(
+        "/proc",
+        "/sys",
+        "/dev",
+        "/data/misc",
+    )
+
     private val restrictedSystemRoots = listOf(
         "/proc",
         "/sys",
@@ -545,6 +552,7 @@ internal object ExternalDocumentEntryGuard {
         context: Context,
         uri: Uri,
         allowOwnShareNote: Boolean = false,
+        allowAppCacheFiles: Boolean = false,
         unsupportedMessage: String = "Unsupported document URI",
         bareTreeMessage: String = "Folder URIs are not supported",
     ) {
@@ -565,7 +573,7 @@ internal object ExternalDocumentEntryGuard {
                 val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
                     ?: throw IllegalArgumentException("Invalid file path")
                 val normalizedLexical = File(rawPath).absoluteFile.toPath().normalize().toString()
-                require(!isForbiddenExternalPath(context, normalizedLexical)) {
+                require(!isForbiddenExternalPath(context, normalizedLexical, allowAppCacheFiles = allowAppCacheFiles)) {
                     "App-private paths cannot be opened externally"
                 }
             }
@@ -647,6 +655,7 @@ internal object ExternalDocumentEntryGuard {
         documentAccess: DocumentAccess? = null,
         allowOwnShareNote: Boolean = false,
         allowExportedNonSafPickerProvider: Boolean = false,
+        allowAppCacheFiles: Boolean = false,
         unsupportedMessage: String = "Unsupported document URI",
         bareTreeMessage: String = "Folder URIs are not supported",
         deniedMessage: String = "Document permission is unavailable; choose it again",
@@ -655,6 +664,7 @@ internal object ExternalDocumentEntryGuard {
             context = context,
             uri = uri,
             allowOwnShareNote = allowOwnShareNote,
+            allowAppCacheFiles = allowAppCacheFiles,
             unsupportedMessage = unsupportedMessage,
             bareTreeMessage = bareTreeMessage,
         )
@@ -692,7 +702,7 @@ internal object ExternalDocumentEntryGuard {
                 }
             }
             "file" -> {
-                val handle = openSafeRegularFileHandle(context, uri)
+                val handle = openSafeRegularFileHandle(context, uri, allowAppCacheFiles = allowAppCacheFiles)
                 AdmittedUserAuthorizedUri(uri = uri, fileHandle = handle)
             }
             else -> throw IllegalArgumentException(unsupportedMessage)
@@ -706,6 +716,7 @@ internal object ExternalDocumentEntryGuard {
         documentAccess: DocumentAccess? = null,
         allowOwnShareNote: Boolean = false,
         allowExportedNonSafPickerProvider: Boolean = false,
+        allowAppCacheFiles: Boolean = false,
         unsupportedMessage: String = "Unsupported document URI",
         bareTreeMessage: String = "Folder URIs are not supported",
         deniedMessage: String = "Document permission is unavailable; choose it again",
@@ -717,6 +728,7 @@ internal object ExternalDocumentEntryGuard {
             documentAccess = documentAccess,
             allowOwnShareNote = allowOwnShareNote,
             allowExportedNonSafPickerProvider = allowExportedNonSafPickerProvider,
+            allowAppCacheFiles = allowAppCacheFiles,
             unsupportedMessage = unsupportedMessage,
             bareTreeMessage = bareTreeMessage,
             deniedMessage = deniedMessage,
@@ -863,14 +875,18 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
-    internal fun openSafeRegularFileHandle(context: Context, uri: Uri): OpenedRegularFileHandle {
+    internal fun openSafeRegularFileHandle(
+        context: Context,
+        uri: Uri,
+        allowAppCacheFiles: Boolean = false,
+    ): OpenedRegularFileHandle {
         require(uri.authority.isNullOrEmpty() || uri.authority.equals("localhost", ignoreCase = true)) {
             "Remote file URIs are not supported"
         }
         val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
             ?: throw IllegalArgumentException("Invalid file path")
         val normalizedLexical = File(rawPath).absoluteFile.toPath().normalize().toString()
-        require(!isForbiddenExternalPath(context, normalizedLexical)) {
+        require(!isForbiddenExternalPath(context, normalizedLexical, allowAppCacheFiles = allowAppCacheFiles)) {
             "App-private paths cannot be opened externally"
         }
 
@@ -904,7 +920,7 @@ internal object ExternalDocumentEntryGuard {
             if (fdPath != null) {
                 val wasDeleted = fdPath.endsWith(" (deleted)")
                 val cleanFdPath = fdPath.removeSuffix(" (deleted)")
-                require(!isForbiddenExternalPath(context, cleanFdPath)) {
+                require(!isForbiddenExternalPath(context, cleanFdPath, allowAppCacheFiles = allowAppCacheFiles)) {
                     "App-private paths cannot be opened externally"
                 }
                 if (!wasDeleted) {
@@ -917,7 +933,21 @@ internal object ExternalDocumentEntryGuard {
                     if (sameInode) {
                         val canonicalFdPath = runCatching { File(cleanFdPath).canonicalPath }.getOrNull()
                         if (canonicalFdPath != null) {
-                            require(!isForbiddenExternalPath(context, canonicalFdPath)) {
+                            require(!isForbiddenExternalPath(context, canonicalFdPath, allowAppCacheFiles = allowAppCacheFiles)) {
+                                "App-private paths cannot be opened externally"
+                            }
+                        }
+                    }
+                    val rawSameInode = runCatching { syscalls.lstat(rawPath) }.getOrNull()?.let { rawStat ->
+                        rawStat.st_mode != 0 &&
+                            OsConstants.S_ISREG(rawStat.st_mode) &&
+                            rawStat.st_dev == stat.st_dev &&
+                            rawStat.st_ino == stat.st_ino
+                    } ?: false
+                    if (rawSameInode) {
+                        val canonicalRawPath = runCatching { File(rawPath).canonicalPath }.getOrNull()
+                        if (canonicalRawPath != null) {
+                            require(!isForbiddenExternalPath(context, canonicalRawPath, allowAppCacheFiles = allowAppCacheFiles)) {
                                 "App-private paths cannot be opened externally"
                             }
                         }
@@ -927,7 +957,7 @@ internal object ExternalDocumentEntryGuard {
                 val canonical = runCatching { File(rawPath).canonicalFile }.getOrElse {
                     throw IllegalArgumentException("Could not confirm file descriptor path")
                 }
-                require(!isForbiddenExternalPath(context, canonical.path)) {
+                require(!isForbiddenExternalPath(context, canonical.path, allowAppCacheFiles = allowAppCacheFiles)) {
                     "App-private paths cannot be opened externally"
                 }
                 val pathStat = runCatching { syscalls.lstat(canonical.path) }.getOrNull()
@@ -1026,6 +1056,7 @@ internal object ExternalDocumentEntryGuard {
         if (!fdPath.startsWith("/")) return
         val cleanFdPath = fdPath.removeSuffix(" (deleted)")
         if (allowGrantedShareFile && isAllowedGrantedShareFile(context, uri, cleanFdPath)) return
+        if (isAllowedRegisteredTestDocsFile(context, uri, cleanFdPath)) return
         require(!isForbiddenExternalPath(context, cleanFdPath)) {
             "App-private paths cannot be opened externally"
         }
@@ -1045,13 +1076,35 @@ internal object ExternalDocumentEntryGuard {
         return canonicalCandidate.startsWith("$shareRoot${File.separator}")
     }
 
+    private fun isAllowedRegisteredTestDocsFile(context: Context, uri: Uri, resolvedPath: String): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val authority = providerAuthority(uri) ?: return false
+        if (!authority.equals("${context.packageName}.testdocs", ignoreCase = true)) return false
+        if (!TestAuthorityGrants.isRegistered(authority)) return false
+        val testDocsRoot = runCatching { File(context.cacheDir, "revocable-test-docs").canonicalPath }.getOrNull()
+            ?: return false
+        val canonicalCandidate = runCatching { File(resolvedPath).canonicalPath }.getOrDefault(resolvedPath)
+        return canonicalCandidate.startsWith("$testDocsRoot${File.separator}")
+    }
+
     private fun resolveParcelDescriptorPath(pfd: ParcelFileDescriptor): String? {
         val fdNumber = runCatching { pfd.fd }.getOrDefault(-1)
         return AndroidOsFileSyscalls.resolveProcFdPath(fdNumber)
     }
 
-    internal fun isForbiddenExternalPath(context: Context, rawPath: String): Boolean {
+    internal fun isForbiddenExternalPath(
+        context: Context,
+        rawPath: String,
+        allowAppCacheFiles: Boolean = false,
+    ): Boolean {
         val normalized = runCatching { Paths.get(rawPath).normalize().toString() }.getOrDefault(rawPath)
+        for (sysRoot in alwaysRestrictedSystemRoots) {
+            if (isSameOrChildPath(normalized, sysRoot)) return true
+        }
+        if (allowAppCacheFiles && isStrictChildOfAppCache(context, normalized)) {
+            val nonCacheForbidden = nonCacheAppPrivateRoots(context).any { isSameOrChildPath(normalized, it) }
+            if (!nonCacheForbidden) return false
+        }
         for (sysRoot in restrictedSystemRoots) {
             if (isSameOrChildPath(normalized, sysRoot)) return true
         }
@@ -1067,6 +1120,46 @@ internal object ExternalDocumentEntryGuard {
             if (isSameOrChildPath(normalized, privateRoot)) return true
         }
         return false
+    }
+
+    private fun appCacheRoots(context: Context): Set<String> {
+        val roots = LinkedHashSet<String>()
+        fun addDir(dir: File?) {
+            if (dir == null) return
+            roots += dir.absoluteFile.toPath().normalize().toString()
+            runCatching { dir.canonicalPath }.getOrNull()?.let { roots += it }
+        }
+        addDir(context.cacheDir)
+        runCatching { context.externalCacheDirs }.getOrNull()?.forEach(::addDir)
+        return roots
+    }
+
+    private fun isStrictChildOfAppCache(context: Context, normalizedPath: String): Boolean {
+        for (cacheRoot in appCacheRoots(context)) {
+            val cleanRoot = cacheRoot.trimEnd('/')
+            if (cleanRoot.isNotEmpty() && normalizedPath.startsWith("$cleanRoot/")) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun nonCacheAppPrivateRoots(context: Context): Set<String> {
+        val roots = LinkedHashSet<String>()
+        fun addDir(dir: File?) {
+            if (dir == null) return
+            roots += dir.absoluteFile.toPath().normalize().toString()
+            runCatching { dir.canonicalPath }.getOrNull()?.let { roots += it }
+        }
+        addDir(context.filesDir)
+        addDir(context.codeCacheDir)
+        addDir(context.noBackupFilesDir)
+        addDir(File(context.dataDir, "shared_prefs"))
+        addDir(runCatching { context.getDatabasePath("supermd.db")?.parentFile }.getOrNull())
+        addDir(runCatching { context.createDeviceProtectedStorageContext().dataDir }.getOrNull())
+        runCatching { context.getExternalFilesDirs(null) }.getOrNull()?.forEach(::addDir)
+        runCatching { context.obbDirs }.getOrNull()?.forEach(::addDir)
+        return roots
     }
 
     private fun appPrivateRoots(context: Context): Set<String> {

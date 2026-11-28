@@ -150,6 +150,7 @@ internal class ReloadFromDiskCoordinator(
                                 uri = target,
                                 documentAccess = documentAccess(),
                                 allowOwnShareNote = true,
+                                allowAppCacheFiles = true,
                             ).use { stream ->
                                 if (note.portable) {
                                     val opened = media.openFmd(stream)

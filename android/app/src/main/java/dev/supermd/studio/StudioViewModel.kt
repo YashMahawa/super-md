@@ -306,7 +306,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 require(sameDocumentUri(note.uri ?: note.id, request.uri)) { "The note's destination changed; its draft was left intact." }
                 withContext(Dispatchers.IO) {
                     val app = getApplication<Application>()
-                    ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(app, chosen)
+                    ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(app, chosen, allowAppCacheFiles = true)
                     if (ExternalDocumentEntryGuard.canPersistUserAuthorizedDocumentGrant(app, chosen)) {
                         documentAccess.persist(chosen)
                     }
@@ -317,6 +317,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         uri = resolvedChosen,
                         documentAccess = documentAccess,
                         allowExportedNonSafPickerProvider = true,
+                        allowAppCacheFiles = true,
                         deniedMessage = "Android did not grant read access",
                     ).use { }
                     val name = resolveDisplayName(resolvedChosen)
@@ -332,7 +333,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val app = getApplication<Application>()
             val allowOwnShare = Uri.parse(request.uri).authority == "${app.packageName}.share"
-            ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(app, chosen, allowOwnShareNote = allowOwnShare)
+            ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(
+                context = app,
+                uri = chosen,
+                allowOwnShareNote = allowOwnShare,
+                allowAppCacheFiles = true,
+            )
             require(sameDocument(Uri.parse(request.uri), chosen)) { "Choose the original ${request.name}. To use another destination, save a copy instead." }
             val (resolved, writeRestored) = withContext(Dispatchers.IO) {
                 if (ExternalDocumentEntryGuard.canPersistUserAuthorizedDocumentGrant(app, chosen)) {
@@ -344,7 +350,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     chosen
                 }
                 if (target.scheme.equals("file", ignoreCase = true)) {
-                    val writable = ExternalDocumentEntryGuard.openSafeRegularFileHandle(app, target).use { handle ->
+                    val writable = ExternalDocumentEntryGuard.openSafeRegularFileHandle(
+                        context = app,
+                        uri = target,
+                        allowAppCacheFiles = true,
+                    ).use { handle ->
                         File(handle.rawPath).canWrite()
                     }
                     if (request.writing && !writable) {
@@ -954,7 +964,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(!remember)delay(250)
             try {
                 val canonical=withContext(Dispatchers.IO){
-                    val raw = resolver.openInputStream(uri)?.use(::readBoundedThemeStream) ?: error("Cannot read theme")
+                    val raw = ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                        context = getApplication(),
+                        resolver = resolver,
+                        uri = uri,
+                        documentAccess = documentAccess,
+                        allowExportedNonSafPickerProvider = true,
+                        allowAppCacheFiles = true,
+                        deniedMessage = "Cannot read theme",
+                    ).use(::readBoundedThemeStream)
                     validateThemeRaw(raw, themeValidator)
                 }
                 val name = JSONObject(canonical).getString("name")
@@ -2206,7 +2224,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
         val app = getApplication<Application>()
-        ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(app, uri, allowOwnShareNote = true)
+        ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(
+            context = app,
+            uri = uri,
+            allowOwnShareNote = true,
+            allowAppCacheFiles = true,
+        )
         if (ExternalDocumentEntryGuard.canPersistUserAuthorizedDocumentGrant(app, uri)) {
             documentAccess.persist(uri)
         }
@@ -2249,6 +2272,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     uri = target,
                     documentAccess = documentAccess,
                     allowOwnShareNote = true,
+                    allowAppCacheFiles = true,
                 )
             }
             verifyStream.use { }
@@ -2269,6 +2293,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 uri = target,
                 documentAccess = documentAccess,
                 allowOwnShareNote = true,
+                allowAppCacheFiles = true,
             )
         }
         return inputStream.use { stream ->

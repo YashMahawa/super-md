@@ -27,10 +27,27 @@ class FontLibrary(private val context: Context) {
     }.getOrDefault(emptyList())
     val families get() = records().flatMap { it.second }.distinct().sorted()
     fun import(uri: Uri): String = synchronized(lock) {
-        val name = DocumentFile.fromSingleUri(context, uri)?.name ?: "Font.ttf"
-        val extension = name.substringAfterLast('.').lowercase()
-        require(extension in listOf("ttf", "otf")) { "Choose a TTF or OTF font under 20 MB" }
-        val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 20_000_000) } ?: error("Cannot read this font")
+        val (extension, bytes) = ExternalDocumentEntryGuard.admitUserAuthorizedUri(
+            context = context,
+            resolver = context.contentResolver,
+            uri = uri,
+            allowExportedNonSafPickerProvider = true,
+            allowAppCacheFiles = true,
+            unsupportedMessage = "Choose a TTF or OTF font under 20 MB",
+            bareTreeMessage = "Choose a TTF or OTF font under 20 MB",
+            deniedMessage = "Cannot read this font",
+        ).use { admitted ->
+            val resolvedUri = admitted.uri
+            val name = if (resolvedUri.scheme.equals("file", ignoreCase = true)) {
+                resolvedUri.path?.let(::File)?.name ?: "Font.ttf"
+            } else {
+                DocumentFile.fromSingleUri(context, resolvedUri)?.name ?: "Font.ttf"
+            }
+            val ext = name.substringAfterLast('.').lowercase()
+            require(ext in listOf("ttf", "otf")) { "Choose a TTF or OTF font under 20 MB" }
+            val fontBytes = admitted.openInputStream().use { readLimited(it, 20_000_000) }
+            ext to fontBytes
+        }
         require(bytes.isNotEmpty()) { "This font is empty" }
         val hash = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         val file = File(directory, "$hash.$extension")
