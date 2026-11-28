@@ -318,7 +318,11 @@ export default defineConfig(({mode}) => ({
   // These imports are reached only through the lazy writing worker. Discover
   // them before serving a page so first use cannot trigger an optimizer reload
   // and discard the native reader's in-memory workspace.
-  optimizeDeps: {include: ["nspell", "retext-english", "retext-repeated-words", "retext-indefinite-article", "vfile"]},
+  optimizeDeps: {
+    entries: ["index.html", "android-reader.html", "qt-reader.html"],
+    include: ["nspell", "retext-english", "retext-repeated-words", "retext-indefinite-article", "vfile", "pele/lazy", "dompurify"],
+    exclude: ["mermaid"],
+  },
   // The package's browser default allocates a DOM element at import time.
   // Its equivalent table decoder also works in the offline writing worker.
   resolve: {alias:{"decode-named-character-reference":fileURLToPath(new URL("./node_modules/decode-named-character-reference/index.js",import.meta.url))}},
@@ -327,7 +331,7 @@ export default defineConfig(({mode}) => ({
     port: 1420,
     strictPort: true,
     watch: {
-      ignored: ["**/dist/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
+      ignored: ["**/dist/**", "**/coverage/**", "**/playwright-report/**", "**/test-results/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
     },
   },
   envPrefix: ["VITE_"]
