@@ -614,3 +614,41 @@ fn cli_distinguishes_outside_root_from_missing_and_preserves_output_on_oversized
     }
 }
 
+#[test]
+fn cli_exports_smd_steps_nested_tasks_as_checkboxes_while_preserving_source_headings_and_footnotes() {
+    let w = Workspace::new();
+    let deck = serde_json::json!({
+        "title": "CLI Step Tasks",
+        "steps": [
+            {
+                "label": "First Step",
+                "markdown": "### Step Checklist\n\n- [x] Done parent\n  - [ ] Pending child\n  - [x] Done child\n- [ ] Pending parent with `[ ]` code"
+            },
+            {
+                "label": "Second Step",
+                "markdown": "### Follow-up\n\n- [X] Verified item"
+            }
+        ]
+    });
+    let raw_note = format!(
+        "# Main Heading\n\nIntro with footnote[^fn1].\n\n```smd-steps\n{deck}\n```\n\n## Trailing Section\n\nClosing line.\n\n[^fn1]: CLI footnote preserved.\n"
+    );
+    fs::write(w.file("steps.md"), &raw_note).unwrap();
+    success(w.run(&["export", "steps.md", "steps.pdf"]));
+    pdf(&w.file("steps.pdf"));
+    assert_eq!(fs::read_to_string(w.file("steps.md")).unwrap(), raw_note, "CLI export must never modify source Markdown");
+
+    if let Ok(out) = Command::new("pdftotext").arg(w.file("steps.pdf")).arg("-").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(text.matches('☑').count(), 3, "Expected 3 checked boxes in CLI PDF:\n{text}");
+            assert_eq!(text.matches('☐').count(), 2, "Expected 2 unchecked boxes in CLI PDF:\n{text}");
+            for expected in ["Main Heading", "Step Checklist", "Done parent", "Pending child", "Done child", "Verified item", "Trailing Section", "CLI footnote preserved."] {
+                assert!(text.contains(expected), "CLI PDF missing {expected:?}:\n{text}");
+            }
+            for leaked in ["[x] Done", "[ ] Pending", "[X] Verified"] {
+                assert!(!text.contains(leaked), "Raw task bracket {leaked:?} leaked in CLI PDF:\n{text}");
+            }
+        }
+    }
+}

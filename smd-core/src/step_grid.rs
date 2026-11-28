@@ -110,6 +110,40 @@ mod tests {
         assert!(export(&md,&PdfOptions::default(),&assets).unwrap().starts_with(b"%PDF-"));
     }
     #[test]
+    fn step_markdown_renders_task_checkboxes_without_raw_brackets_and_preserves_headings_code_and_footnotes() {
+        let (_, assets) = fixture(2);
+        let deck = serde_json::json!({
+            "title": "Verification Protocol",
+            "steps": [
+                {
+                    "label": "Stage 1",
+                    "image": "frame.svg",
+                    "markdown": "### Checklist\n\n- [x] Checked parent\n  - [ ] Unchecked nested child\n  - [X] Uppercase checked child\n  - Plain nested bullet\n- [ ] Unchecked sibling with `- [ ] literal` code"
+                },
+                {
+                    "label": "Stage 2",
+                    "markdown": "### Checklist\n\n1. [x] Ordered checked\n2. [ ] Ordered unchecked with marker[^stepref]"
+                }
+            ]
+        });
+        let md = format!(
+            "# Checklist\n\nSee [Checklist](#checklist) and note[^docnote].\n\n```smd-steps\n{deck}\n```\n\n## After\n\n[^docnote]: Preserved document footnote.\n"
+        );
+        let generated = source(&md, &PdfOptions::default(), &assets).unwrap();
+        assert_eq!(generated.matches("#text(\"☑ \u{a0}\")").count(), 3, "{generated}");
+        assert_eq!(generated.matches("#text(\"☐ \u{a0}\")").count(), 3, "{generated}");
+        assert!(generated.contains("#raw(\"- [ ] literal\")"), "{generated}");
+        assert!(!generated.contains("[x] Checked parent") && !generated.contains("[ ] Unchecked"), "{generated}");
+        assert!(generated.contains("#heading(level: 1)[#text(\"Checklist\")] <smd-checklist>"), "{generated}");
+        assert!(generated.contains("#link(label(\"smd-checklist\"))[#text(\"Checklist\")]"), "{generated}");
+        assert!(generated.contains("#heading(level: 3)[#text(\"Checklist\")] <smd-fragment-checklist>"), "{generated}");
+        assert!(generated.contains("#heading(level: 2)[#text(\"After\")] <smd-after>"), "{generated}");
+        assert_eq!(generated.matches("#footnote[").count(), 1, "Only document-level footnotes should emit #footnote: {generated}");
+        assert!(generated.contains("Preserved document footnote."), "{generated}");
+        assert!(generated.contains("[^stepref]"), "{generated}");
+        assert!(export(&md, &PdfOptions::default(), &assets).unwrap().starts_with(b"%PDF-"));
+    }
+    #[test]
     fn missing_frames_or_unprepared_diagrams_fail_visibly() {
         let (md, _) = fixture(3);
         assert!(source(&md,&PdfOptions::default(),&HashMap::new()).unwrap_err().to_string().contains("Image unavailable"));
