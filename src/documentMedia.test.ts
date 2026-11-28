@@ -60,6 +60,126 @@ describe("portable media", () => {
     const result = await prepareFmd("# Keep\n\n![Proof][p]\n\n[p]: proof.png \"A title\"\n", "/notes/a.md");
     expect(result.content).toContain("![Proof][p]"); expect(result.content).toMatch(/\[p\]: <assets\/image-.*\.png> "A title"/);
   });
+  it("preserves existing 151 to 159 character safe portable asset names across .smd paths, opaque SAF URIs, and smd-steps", async () => {
+    native.mockReset().mockResolvedValue("data:image/svg+xml;base64,PHN2Zy8+");
+    const compatKey = `assets/${"a".repeat(155)}.svg`;
+    const md = `# Existing Portable\n\n![Legacy](<${compatKey}>)\n\n\`\`\`smd-steps\n${JSON.stringify({ steps: [{ title: "Step 1", markdown: `![Deck](<${compatKey}>)` }] })}\n\`\`\`\n`;
+    const fromExt = await prepareFmd(md, "/notes/existing.smd");
+    expect(fromExt.content).toContain(`![Legacy](<${compatKey}>)`);
+    expect(fromExt.content).toContain(`![Deck](<${compatKey}>)`);
+    expect(fromExt.assets).toEqual({ [compatKey]: "data:image/svg+xml;base64,PHN2Zy8+" });
+
+    const fromOpaqueUri = await prepareFmd(md, "content://com.example.provider/document/doc-42", { portable: true });
+    expect(fromOpaqueUri.content).toBe(fromExt.content);
+    expect(fromOpaqueUri.assets).toEqual({ [compatKey]: "data:image/svg+xml;base64,PHN2Zy8+" });
+
+    const overCapKey = `assets/${"a".repeat(156)}.svg`;
+    const overCap = await prepareFmd(`![TooLong](<${overCapKey}>)\n`, "content://com.example.provider/document/doc-42", { portable: true });
+    expect(overCap.content).toMatch(/!\[TooLong\]\(<assets\/image-.*\.svg>\)/);
+    expect(Object.keys(overCap.assets)).not.toContain(overCapKey);
+  });
+  it("uses the first duplicate reference definition in imageRanges and prepareFmd while preserving source offsets", async () => {
+    const firstPng = `data:image/png;base64,${btoa("first-png")}`;
+    const earlySvg = `data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0L4 4"/></svg>')}`;
+    const slideFirstPng = `data:image/png;base64,${btoa("slide-first-png")}`;
+    native.mockImplementation(async (command: string, args: { source?: string; url?: string }) => {
+      if (command === "load_asset" && args.source === "local/first.png") return firstPng;
+      if (command === "load_asset" && args.source === "local/early-first.svg") return earlySvg;
+      if (command === "load_asset" && args.source === "local/slide-first.png") return slideFirstPng;
+      throw new Error(`Unexpected load for shadowed definition: ${command} ${JSON.stringify(args)}`);
+    });
+
+    const deck = {
+      title: "Duplicate slide refs",
+      steps: [
+        {
+          label: "Step 1",
+          markdown: "![Slide][s]\n\n[s]: local/slide-first.png\n[s]: local/slide-second.png",
+        },
+      ],
+    };
+    const md = [
+      "---",
+      'title: "😀 Portable Duplicate Definitions"',
+      "---",
+      "",
+      "$$\\begin{aligned}",
+      "a &= b \\\\",
+      "\\end{aligned}$$",
+      "",
+      "[early]: local/early-first.svg",
+      "[early]: https://untrusted.example/shadowed-early.svg",
+      "",
+      "Lead 😀 prose before ![Early][early] and ![Hero][Fig   Ref] plus ![Sibling](local/first.png).",
+      "",
+      '[Fig   Ref]: local/first.png "First caption"',
+      '[fig ref]: local/second.png "Shadowed caption"',
+      "",
+      "![[wiki.png|Wiki Tail]]",
+      "",
+      "```smd-steps",
+      JSON.stringify(deck, null, 2),
+      "```",
+      "",
+      "## Tail 😀",
+      "Keep [Anchor](#tail) exact.",
+      "",
+    ].join("\n");
+
+    const ranges = imageRanges(md);
+    expect(ranges.map((range) => ({ source: range.source, text: md.slice(range.from, range.to), from: range.from }))).toEqual([
+      { source: "local/early-first.svg", text: "![Early][early]", from: md.indexOf("![Early][early]") },
+      { source: "local/first.png", text: "![Hero][Fig   Ref]", from: md.indexOf("![Hero][Fig   Ref]") },
+      { source: "local/first.png", text: "![Sibling](local/first.png)", from: md.indexOf("![Sibling](local/first.png)") },
+      { source: "wiki.png", text: "![[wiki.png|Wiki Tail]]", from: md.indexOf("![[wiki.png|Wiki Tail]]") },
+    ]);
+
+    const wikiPng = `data:image/png;base64,${btoa("wiki-png")}`;
+    native.mockImplementation(async (command: string, args: { source?: string; url?: string }) => {
+      if (command === "load_asset" && args.source === "local/first.png") return firstPng;
+      if (command === "load_asset" && args.source === "local/early-first.svg") return earlySvg;
+      if (command === "load_asset" && args.source === "local/slide-first.png") return slideFirstPng;
+      if (command === "load_asset" && args.source === "wiki.png") return wikiPng;
+      throw new Error(`Unexpected load for shadowed definition: ${command} ${JSON.stringify(args)}`);
+    });
+
+    const packed = await prepareFmd(md, "/notes/portable.smd");
+    expect(Object.values(packed.assets).sort()).toEqual([earlySvg, firstPng, slideFirstPng, wikiPng].sort());
+
+    const earlyAsset = Object.entries(packed.assets).find(([, data]) => data === earlySvg)![0];
+    const firstAsset = Object.entries(packed.assets).find(([, data]) => data === firstPng)![0];
+    const slideAsset = Object.entries(packed.assets).find(([, data]) => data === slideFirstPng)![0];
+    const wikiAsset = Object.entries(packed.assets).find(([, data]) => data === wikiPng)![0];
+
+    expect(packed.content).toContain(`[early]: <${earlyAsset}>`);
+    expect(packed.content).toContain("[early]: https://untrusted.example/shadowed-early.svg");
+    expect(packed.content).toContain(`[Fig   Ref]: <${firstAsset}> "First caption"`);
+    expect(packed.content).toContain('[fig ref]: local/second.png "Shadowed caption"');
+
+    // Verify exact source offsets before the first edit and across the rewritten document.
+    const earlyDefStart = md.indexOf("[early]: local/early-first.svg");
+    expect(packed.content.slice(0, earlyDefStart)).toBe(md.slice(0, earlyDefStart));
+    const earlyDelta = `[early]: <${earlyAsset}>`.length - "[early]: local/early-first.svg".length;
+    expect(packed.content.indexOf("![Early][early]")).toBe(md.indexOf("![Early][early]") + earlyDelta);
+    expect(packed.content.indexOf("![Hero][Fig   Ref]")).toBe(md.indexOf("![Hero][Fig   Ref]") + earlyDelta);
+
+    const packedRanges = imageRanges(packed.content);
+    expect(packedRanges.map((range) => ({
+      source: range.source,
+      text: packed.content.slice(range.from, range.to),
+    }))).toEqual([
+      { source: earlyAsset, text: "![Early][early]" },
+      { source: firstAsset, text: "![Hero][Fig   Ref]" },
+      { source: firstAsset, text: `![Sibling](<${firstAsset}>)` },
+      { source: wikiAsset, text: `![Wiki Tail](<${wikiAsset}>)` },
+    ]);
+
+    const packedDeck = JSON.parse(/```smd-steps\n([\s\S]*?)\n```/.exec(packed.content)![1]);
+    expect(packedDeck.steps[0].markdown).toBe(
+      `![Slide][s]\n\n[s]: <${slideAsset}>\n[s]: local/slide-second.png`,
+    );
+    expect(packed.content.endsWith("\n## Tail 😀\nKeep [Anchor](#tail) exact.\n")).toBe(true);
+  });
   it("recognizes real YouTube hosts and uses oEmbed titles and optional thumbnails", async () => {
     expect(youtubeUrl("https://youtu.be/dQw4w9WgXcQ?t=10")).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
     expect(youtubeUrl("https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ")).toBeNull();

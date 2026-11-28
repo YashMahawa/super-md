@@ -303,25 +303,40 @@ test("pendingHeading coexists with shared source anchor mode transitions and ord
   await page.evaluate(() => (window as any).__openTab("/notes/Lecture 2.md", "live"));
   await expect.poll(() =>
     page.locator(".android-reading h2#bayes").evaluate(el => {
+      const scroller = el.closest<HTMLElement>(".android-reading")!;
       const box = el.getBoundingClientRect();
-      const hostBox = el.closest(".android-reading")!.getBoundingClientRect();
-      return box.bottom > hostBox.top && box.top < hostBox.bottom;
+      const hostBox = scroller.getBoundingClientRect();
+      return scroller.dataset.measured === "true" && !scroller.dataset.navigating && box.bottom > hostBox.top && box.top < hostBox.bottom;
     }),
   ).toBe(true);
 
-  // 3. Scroll Lecture 2 down to Appendix 20, switch to Index and back without pendingHeading -> Appendix 20 restores normally.
+  // 3. Scroll Lecture 2 down to Appendix 20, verify it holds past post-transition settle passes, switch to Index and back without pendingHeading -> Appendix 20 restores normally.
   await page.locator(".android-reading h2#appendix-20").evaluate(el => el.scrollIntoView({ block: "start" }));
   await page.evaluate(() => {
     document.querySelector<HTMLElement>(".android-reading")!.dispatchEvent(new Event("scroll", { bubbles: true }));
   });
   const appendixTop = await readingRoot.evaluate(el => el.scrollTop);
+  const appendixHeadingTop = await page.locator(".android-reading h2#appendix-20").evaluate(el => {
+    const scroller = el.closest<HTMLElement>(".android-reading")!;
+    return el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  });
   expect(appendixTop).toBeGreaterThan(2500);
+  await page.waitForTimeout(150);
+  expect(Math.abs((await readingRoot.evaluate(el => el.scrollTop)) - appendixTop)).toBeLessThan(2);
 
   await page.evaluate(() => (window as any).__openTab("/notes/Index.md", "live"));
   await expect(page.locator(".android-reading h1")).toHaveText("Course Index");
 
   await page.evaluate(() => (window as any).__openTab("/notes/Lecture 2.md", "live"));
   await expect.poll(async () => Math.abs((await readingRoot.evaluate(el => el.scrollTop)) - appendixTop)).toBeLessThan(12);
+  await expect.poll(() =>
+    page.locator(".android-reading h2#appendix-20").evaluate((el, expectedTop) => {
+      const scroller = el.closest<HTMLElement>(".android-reading")!;
+      const box = el.getBoundingClientRect();
+      const hostBox = scroller.getBoundingClientRect();
+      return box.bottom > hostBox.top && box.top < hostBox.bottom && Math.abs((box.top - hostBox.top) - expectedTop) < 12;
+    }, appendixHeadingTop),
+  ).toBe(true);
 
   // 4. Direct pendingHeading jump in Split and Source modes aligns both preview and CodeMirror panes to ## Bayes.
   await page.evaluate(() => (window as any).__openTab("/notes/Index.md", "split"));

@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { EditorSelection, EditorState, Transaction, type Extension } from "@codemirror/state";
-import { EditorView, ViewPlugin, type Command, type ViewUpdate } from "@codemirror/view";
+import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 
 export const TYPEWRITER_STORAGE_KEY = "editor.typewriter";
 export const TYPEWRITER_SHORTCUT = "Mod-Alt-t";
@@ -144,11 +144,6 @@ export function typewriterScrollExtension(enabled: boolean): Extension {
 export function isTypewriterShortcutEvent(event: KeyboardEvent): boolean {
   return (event.ctrlKey || event.metaKey) && event.altKey && !event.shiftKey && event.key.toLowerCase() === "t";
 }
-
-export const toggleTypewriterCommand: Command = () => {
-  toggleTypewriterScroll();
-  return true;
-};
 
 /** Compute the vertical scroll delta needed on `scroller` to center the active
  * block (or active caret line when typing / editing tall blocks) in `LiveEditor`. */

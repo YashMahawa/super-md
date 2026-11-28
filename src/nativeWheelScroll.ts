@@ -33,6 +33,8 @@ const EXPLICIT_SCROLL_REGION_SELECTOR = [
   '.step-cards-layout',
   '.katex-display',
   '.mermaid',
+  '.svg-figure:not(.mermaid .svg-figure):not(.cell-output .svg-figure)',
+  '.markdown-body .media-paragraph',
   // Workspace & dialog scroll containers
   '.android-reading',
   '.android-source',
@@ -82,7 +84,7 @@ function canScrollAxis(element: HTMLElement, axis: 'x' | 'y', centerLock: boolea
   // Support explicit scroll regions in lightweight DOM environments where
   // external stylesheets are not attached.
   if (overflow === '' || overflow === 'visible') {
-    if (axis === 'y' && element.matches('.katex-display')) return false;
+    if (axis === 'y' && element.matches('.katex-display,.svg-figure,.media-paragraph')) return false;
     return element.matches(EXPLICIT_SCROLL_REGION_SELECTOR);
   }
   return false;
