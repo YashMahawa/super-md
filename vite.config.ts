@@ -331,9 +331,29 @@ export default defineConfig(({mode}) => ({
     port: 1420,
     strictPort: true,
     watch: {
-      ignored: ["**/dist/**", "**/coverage/**", "**/playwright-report/**", "**/test-results/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
+      ignored: [
+        "**/dist/**",
+        "**/coverage/**",
+        "**/playwright-report/**",
+        "**/test-results/**",
+        "**/*.tsbuildinfo",
+        "**/smd-core/target/**",
+        "**/android/**/build/**",
+        "**/desktop/.venv/**",
+      ],
     },
   },
-  envPrefix: ["VITE_"]
-  ,build: { rollupOptions: { input: buildHtmlEntries(mode) } }
+  envPrefix: ["VITE_"],
+  build: {
+    rollupOptions: {
+      input: buildHtmlEntries(mode),
+      output: {
+        manualChunks(id) {
+          if (id.includes("vite/preload-helper")) return "preload-helper";
+          if (/[\\/]node_modules[\\/]pele[\\/]/.test(id)) return "pele";
+          return undefined;
+        },
+      },
+    },
+  },
 }));
