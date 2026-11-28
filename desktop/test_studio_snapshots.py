@@ -148,13 +148,23 @@ class StudioSnapshotsTests(unittest.TestCase):
         session, win = self._make_window()
         peer = QuietStudio(True, session)
         try:
-            storage_cancel, folder_cancel = threading.Event(), threading.Event()
+            storage_cancel, folder_cancel, quick_cancel = threading.Event(), threading.Event(), threading.Event()
             win._storage_cancel_event, win._folder_search_cancel = storage_cancel, folder_cancel
-            self.assertFalse(win._folder_search_pending)
+            self.assertFalse(win._folder_search_pending or win._quick_switcher_open or win._quick_switcher_loading)
             win._folder_search_pending = True
+            win._quick_switcher_open, win._quick_switcher_query, win._quick_switcher_loading = True, "note", True
+            win._quick_switcher_cancel = quick_cancel
             self.assertIsNone(win._python_pool)
-            python_pool_calls = []
+            python_pool_calls, proc_calls = [], []
             win._python_pool = SimpleNamespace(shutdown=lambda *, wait=True, cancel_futures=False: python_pool_calls.append((wait, cancel_futures)))
+            win.system_preferences.kill()
+            win.system_preferences.waitForFinished(100)
+            win.system_preferences = SimpleNamespace(
+                state=lambda: "running",
+                terminate=lambda: proc_calls.append("terminate"),
+                waitForFinished=lambda ms: (proc_calls.append(("wait", ms)), False)[1],
+                kill=lambda: proc_calls.append("kill"),
+            )
             empty_export, nonempty_export = session.data / "reserved-empty.pdf", session.data / "keep.pdf"
             empty_export.write_bytes(b"")
             nonempty_export.write_bytes(b"pdf")
@@ -171,8 +181,9 @@ class StudioSnapshotsTests(unittest.TestCase):
                 self.assertEqual((save_pos.call_count, peer_recover.call_count), (1, 1))
                 prefs.assert_called_once_with(False)
 
-            self.assertTrue(win.retired and storage_cancel.is_set() and folder_cancel.is_set() and not win._folder_search_pending)
-            self.assertEqual(python_pool_calls, [(False, True)])
+            self.assertTrue(win.retired and storage_cancel.is_set() and folder_cancel.is_set() and quick_cancel.is_set())
+            self.assertFalse(win._folder_search_pending or win._quick_switcher_open or win._quick_switcher_loading or win._quick_switcher_query)
+            self.assertEqual((python_pool_calls, proc_calls), ([(False, True)], ["terminate", ("wait", 300), "kill", ("wait", 100)]))
             self.assertEqual((empty_export.exists(), nonempty_export.exists(), retired_calls, win._opening_paths, rename_cleanups), (False, True, [False], {}, []))
             self.assertEqual((win.note_watcher, win.palette_watcher, win.custom_theme_watcher), (studio._STOPPED_WATCHER,) * 3)
             self.assertFalse(win.theme_timer.isActive() or win.window_id in session.windows)

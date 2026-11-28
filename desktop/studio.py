@@ -35,7 +35,7 @@ from network_tls import client_context
 from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
-    atomic_write, atomic_json, stage_atomic_json, bundle, decode_base64_chunked,
+    atomic_write, atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, is_valid_asset_filename,
     materialize_assets, open_note, stage_atomic_json, write_portable, MIMES, MAX_IMAGE,
 )
@@ -62,12 +62,12 @@ from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import ExactWriteAborted, LatestWriteExecutor
-import updates
-import app_integration
 if __package__:
     from . import studio_runtime
+    from .core import app_integration, updates
 else:
     import studio_runtime
+    from core import app_integration, updates
 import python_runtime
 import pending_python
 from export_jobs import ExportJobRegistry
@@ -83,6 +83,7 @@ try:
 except ImportError:
     import studio_chrome
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
+from quick_switcher import FolderNoteIndex, build_quick_switcher_candidates, coalesce_walk_roots, normalize_workspace_roots, rank_quick_switcher_items
 from workspace_links import WorkspaceLinkCache, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 from core.paths import DESKTOP_DIR, resource_root
@@ -394,8 +395,8 @@ def _extract_local_drop_paths(values) -> list[Path]:
         elif isinstance(raw, Path):
             local_str = str(raw)
         else:
-            text = str(raw).strip()
-            if not text:
+            text = str(raw)
+            if not text or not text.strip():
                 continue
             url = QUrl(text)
             if url.isLocalFile():
@@ -404,7 +405,7 @@ def _extract_local_drop_paths(values) -> list[Path]:
                 local_str = text
             else:
                 continue
-        if not local_str:
+        if not local_str or not local_str.strip() or "\0" in local_str:
             continue
         try:
             resolved = Path(local_str).expanduser().resolve()
@@ -504,6 +505,31 @@ class _StoppedFileWatcher:
 
 
 _STOPPED_WATCHER = _StoppedFileWatcher()
+
+
+def _watcher_alive(watcher) -> bool:
+    if watcher is None or watcher is _STOPPED_WATCHER:
+        return False
+    if shiboken6 is None:
+        return True
+    try:
+        return shiboken6.isValid(watcher)
+    except TypeError:
+        return True
+
+
+class _MutualWorkspaceLinkCache(WorkspaceLinkCache):
+    """WorkspaceLinkCache wrapper that participates in Session mutual cache invalidation."""
+
+    def __init__(self, *, on_invalidate=None) -> None:
+        super().__init__()
+        self._on_invalidate = on_invalidate
+
+    def invalidate(self, folder=None) -> None:
+        raw = "" if folder is None else (os.fspath(folder) if isinstance(folder, os.PathLike) else str(folder))
+        super().invalidate(None if not raw.strip() else raw)
+        if self._on_invalidate is not None:
+            self._on_invalidate(folder)
 
 
 def _matches_media_signature(mime: str, data: bytes) -> bool:
@@ -665,7 +691,72 @@ class Session(QObject):
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
-        self.workspace_links = WorkspaceLinkCache()
+        self._cache_invalidation_local = threading.local()
+        self.folder_note_index = FolderNoteIndex(
+            on_invalidate=self._on_folder_note_index_invalidated,
+        )
+        self.workspace_links = _MutualWorkspaceLinkCache(
+            on_invalidate=self._on_workspace_links_invalidated,
+        )
+
+    def _notify_quick_switcher_windows(self) -> None:
+        windows = [
+            win
+            for win in list(getattr(self, "windows", {}).values())
+            if not getattr(win, "retired", False) and getattr(win, "_quick_switcher_open", False)
+        ]
+        if not windows:
+            return
+        if threading.current_thread() is threading.main_thread():
+            for win in windows:
+                win._refresh_quick_switcher_candidates()
+        else:
+            for win in windows:
+                weak_win = weakref.ref(win)
+                QTimer.singleShot(
+                    0,
+                    win,
+                    lambda ref=weak_win: (
+                        w._refresh_quick_switcher_candidates()
+                        if (w := ref()) is not None
+                        and not getattr(w, "retired", False)
+                        and getattr(w, "_quick_switcher_open", False)
+                        else None
+                    ),
+                )
+
+    def _on_folder_note_index_invalidated(self, target_path=None) -> None:
+        if getattr(self._cache_invalidation_local, "active", False):
+            return
+        self._cache_invalidation_local.active = True
+        try:
+            links = getattr(self, "workspace_links", None)
+            if links is not None:
+                links.invalidate(target_path)
+            self._notify_quick_switcher_windows()
+        finally:
+            self._cache_invalidation_local.active = False
+
+    def _on_workspace_links_invalidated(self, target_path=None) -> None:
+        if getattr(self._cache_invalidation_local, "active", False):
+            return
+        self._cache_invalidation_local.active = True
+        try:
+            index = getattr(self, "folder_note_index", None)
+            if index is not None:
+                index.invalidate(target_path)
+            self._notify_quick_switcher_windows()
+        finally:
+            self._cache_invalidation_local.active = False
+
+    def invalidate_workspace_caches(self, target_path=None) -> None:
+        index = getattr(self, "folder_note_index", None)
+        if index is not None:
+            index.invalidate(target_path)
+        else:
+            links = getattr(self, "workspace_links", None)
+            if links is not None:
+                links.invalidate(target_path)
 
     @Slot(object)
     def _on_rename_completed(self, payload):
@@ -927,6 +1018,8 @@ class Studio(QObject):
     tabsChanged = Signal()
     activeTabChanged = Signal()
     shortcutsChanged = Signal()
+    quickSwitcherChanged = Signal()
+    quickSwitcherIndexed = Signal(int, object)
     workspaceSearchChanged = Signal()
     workspaceSearchBatch = Signal(int, object, int, bool, bool)
     readerLoad = Signal(str)
@@ -968,6 +1061,20 @@ class Studio(QObject):
 
     def _restore_cloud_connection(self):
         studio_agent_setup._restore_cloud_connection(self)
+
+    @property
+    def folder(self) -> str:
+        return getattr(self, "_folder", "")
+
+    @folder.setter
+    def folder(self, value: str) -> None:
+        previous = getattr(self, "_folder", "")
+        updated = value if isinstance(value, str) else str(value or "")
+        self._folder = updated
+        if previous and previous != updated:
+            self._invalidate_folder_index(previous)
+        if updated and updated != previous:
+            self._invalidate_folder_index(updated)
 
     @property
     def files(self): return getattr(self, "_files", [])
@@ -1016,21 +1123,14 @@ class Studio(QObject):
                 "portable": portable, "conflict": False,
                 "agent_staged": False, "agent_unreviewed": False, "agent_edits": []}
 
-    def _is_dirty(self, tab: dict) -> bool:
-        if tab.get("content") != tab.get("saved"):
-            return True
-        if tab.get("assets_dirty"):
-            return True
-        if tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}):
-            return True
-        return False
-
     @staticmethod
     def _bound_agent_edits(edits: list[dict]) -> list[dict]:
         bounded = list(edits[-60:])
-        while len(bounded) > 1 and sum(len(item["before"].encode("utf-8")) + len(item["after"].encode("utf-8")) for item in bounded) > 2_000_000:
+        def _total_bytes(items: list[dict]) -> int:
+            return sum(len(item["before"].encode("utf-8")) + len(item["after"].encode("utf-8")) for item in items)
+        while len(bounded) > 1 and _total_bytes(bounded) > 2_000_000:
             bounded.pop(0)
-        return bounded
+        return bounded if _total_bytes(bounded) <= 4_000_000 else []
 
     def _append_agent_edit(self, tab: dict, before: str, after: str) -> None:
         edits = list(tab.get("agent_edits") or [])
@@ -1039,22 +1139,36 @@ class Studio(QObject):
         tab["agent_edits"] = self._bound_agent_edits(edits)
 
     def _activate_tab_state(self, tab: dict | None) -> None:
-        if tab is None:
+        if not tab:
             return
         if self._agent_jump_tab_id == tab["id"]:
             self._agent_jump_tab_id = ""
         if tab.get("agent_staged"):
             tab["agent_staged"] = False
-            if self.settings.get("autosave") and tab.get("path") and self._is_dirty(tab) and not tab.get("conflict"):
+            if (
+                self.settings.get("autosave")
+                and tab.get("path")
+                and self._is_dirty(tab)
+                and not tab.get("conflict")
+            ):
                 self.autosave_timer.start(900)
 
     def _clear_agent_staging(self, tab: dict | None) -> None:
-        if tab is None:
+        if not tab:
             return
         tab["agent_staged"] = False
         tab["agent_unreviewed"] = False
         if getattr(self, "_agent_jump_tab_id", "") == tab.get("id"):
             self._agent_jump_tab_id = ""
+
+    def _is_dirty(self, tab: dict) -> bool:
+        if tab.get("content") != tab.get("saved"):
+            return True
+        if tab.get("assets_dirty"):
+            return True
+        if tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}):
+            return True
+        return False
 
     def _agent_connection_snapshot(self) -> dict:
         bridge = getattr(self.session, "agent_bridge", None)
@@ -1316,8 +1430,237 @@ class Studio(QObject):
                 return True
         return False
 
+    def _quick_switcher_roots(self) -> list[Path]:
+        windows = [self]
+        if hasattr(self, "session") and hasattr(self.session, "windows"):
+            windows.extend(
+                win for win in self.session.windows.values()
+                if win is not self and not getattr(win, "retired", False)
+            )
+        raw_roots: list[str | Path] = []
+        for win in windows:
+            folder = getattr(win, "folder", "")
+            if folder:
+                raw_roots.append(folder)
+        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
+        if location:
+            raw_roots.append(location)
+        return normalize_workspace_roots(raw_roots)
+
+    def _quick_switcher_snapshots(self):
+        tabs_snap = [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "path": t["path"],
+                "dirty": self._is_dirty(t),
+            }
+            for t in self.tabs
+        ]
+        recent_paths = [p for p in self.recent if p]
+        pinned_paths = [p for p in self.session.pinned if p]
+        roots = self._quick_switcher_roots()
+        return tabs_snap, recent_paths, pinned_paths, roots, self.active
+
+    def _invalidate_folder_index(self, target_path: str | Path | None = None):
+        session = getattr(self, "session", None)
+        if session is not None and hasattr(session, "invalidate_workspace_caches"):
+            session.invalidate_workspace_caches(target_path)
+            return
+        index = getattr(session, "folder_note_index", None)
+        if index is not None:
+            index.invalidate(target_path)
+        links = getattr(session, "workspace_links", None)
+        if links is not None:
+            links.invalidate(target_path)
+        for win in list(getattr(session, "windows", {}).values()):
+            if not getattr(win, "retired", False) and getattr(win, "_quick_switcher_open", False):
+                win._refresh_quick_switcher_candidates()
+
+    def _cancel_quick_switcher(self, close: bool = False):
+        if self._quick_switcher_cancel is not None:
+            self._quick_switcher_cancel.set()
+            self._quick_switcher_cancel = None
+        self._quick_switcher_generation += 1
+        self._quick_switcher_loading = False
+        if close:
+            self._quick_switcher_open = False
+            self._quick_switcher_query = ""
+            self._quick_switcher_items = []
+            self._quick_switcher_candidates = []
+
+    @Property("QVariantMap", notify=quickSwitcherChanged)
+    def quickSwitcherState(self):
+        return {
+            "open": self._quick_switcher_open,
+            "query": self._quick_switcher_query,
+            "items": self._quick_switcher_items,
+            "loading": self._quick_switcher_loading,
+            "hasFolder": bool(self.folder),
+        }
+
+    def _refresh_quick_switcher_candidates(self):
+        if self.retired or not self._quick_switcher_open:
+            return
+        if self._quick_switcher_cancel is not None:
+            self._quick_switcher_cancel.set()
+            self._quick_switcher_cancel = None
+        self._quick_switcher_generation += 1
+        generation = self._quick_switcher_generation
+
+        tabs_snap, recent_paths, pinned_paths, roots, active_id = self._quick_switcher_snapshots()
+        walk_roots = coalesce_walk_roots(roots)
+        folder_index: FolderNoteIndex = self.session.folder_note_index
+
+        warm_entries: dict[str, list[dict]] = {}
+        needs_cold_walk = False
+        for root in walk_roots:
+            root_key = folder_ops.normalize_path_key(root)
+            cached = folder_index.peek_entries(root)
+            if cached is None:
+                needs_cold_walk = True
+                warm_entries[root_key] = []
+            else:
+                warm_entries[root_key] = cached
+
+        self._quick_switcher_candidates = build_quick_switcher_candidates(
+            tabs_snap,
+            recent_paths,
+            pinned_paths,
+            roots,
+            warm_entries,
+            active_id=active_id,
+        )
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self._quick_switcher_loading = needs_cold_walk and bool(walk_roots)
+        self.quickSwitcherChanged.emit()
+
+        if not walk_roots:
+            return
+
+        cancel_event = threading.Event()
+        self._quick_switcher_cancel = cancel_event
+
+        def worker():
+            refreshed: dict[str, list[dict]] = {}
+            changed = needs_cold_walk
+            for root in walk_roots:
+                if cancel_event.is_set() or self.retired:
+                    return
+                root_key = folder_ops.normalize_path_key(root)
+                entries = folder_index.get_entries(root, cancel_event=cancel_event, revalidate=True)
+                if cancel_event.is_set() or self.retired:
+                    return
+                refreshed[root_key] = entries
+                if warm_entries.get(root_key) != entries:
+                    changed = True
+            if not cancel_event.is_set() and not self.retired and (changed or needs_cold_walk):
+                self.quickSwitcherIndexed.emit(generation, refreshed)
+
+        try:
+            self._search_pool.submit(worker)
+        except RuntimeError:
+            self._quick_switcher_loading = False
+            self.quickSwitcherChanged.emit()
+
+    def _on_quick_switcher_indexed(self, generation: int, root_entries):
+        if self.retired or not self._quick_switcher_open or generation != self._quick_switcher_generation:
+            return
+        tabs_snap, recent_paths, pinned_paths, roots, active_id = self._quick_switcher_snapshots()
+        self._quick_switcher_candidates = build_quick_switcher_candidates(
+            tabs_snap,
+            recent_paths,
+            pinned_paths,
+            roots,
+            dict(root_entries),
+            active_id=active_id,
+        )
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self._quick_switcher_loading = False
+        self.quickSwitcherChanged.emit()
+
+    @Slot()
+    def openQuickSwitcher(self):
+        if self.retired:
+            return
+        self._quick_switcher_open = True
+        self._quick_switcher_query = ""
+        self._refresh_quick_switcher_candidates()
+
+    @Slot(str)
+    def setQuickSwitcherQuery(self, query: str):
+        if self.retired:
+            return
+        next_query = query if isinstance(query, str) else ""
+        if not self._quick_switcher_open:
+            self._quick_switcher_open = True
+            self._quick_switcher_query = next_query
+            self._refresh_quick_switcher_candidates()
+            return
+        if next_query == self._quick_switcher_query:
+            return
+        self._quick_switcher_query = next_query
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self.quickSwitcherChanged.emit()
+
+    @Slot()
+    def closeQuickSwitcher(self):
+        if not self._quick_switcher_open and not self._quick_switcher_loading:
+            return
+        self._cancel_quick_switcher(close=True)
+        self.quickSwitcherChanged.emit()
+
+    @Slot(str, str)
+    def activateQuickSwitcherItem(self, tab_id: str, path: str):
+        if self.retired:
+            return
+        self.closeQuickSwitcher()
+        existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
+        if existing is None and path:
+            existing = self._find_open_tab(path, canonicalize_local=True) or next(
+                (t for t in self.tabs if t.get("path") and folder_ops.same_path(t["path"], path)),
+                None,
+            )
+        for tab in self.tabs:
+            tab.pop("pendingHeading", None)
+        if existing is not None:
+            existing_path = existing.get("path") or ""
+            open_target = path or existing_path
+            if existing_path and open_target:
+                try:
+                    resolved_target = local_path(open_target)
+                    can_route_open = (
+                        not resolved_target.is_dir()
+                        and not Path(existing_path).is_symlink()
+                        and (
+                            existing_path == str(resolved_target)
+                            or folder_ops.same_path(existing_path, resolved_target)
+                            or os.path.samefile(existing_path, str(resolved_target))
+                        )
+                    )
+                except OSError:
+                    can_route_open = False
+                if can_route_open:
+                    self.openNote(open_target)
+                    return
+            self.selectTab(existing["id"])
+            self._focus_open_target(self._activation_generation)
+            return
+        if path:
+            self.openNote(path)
+
     def _watch_notes(self,force=False):
-        if self.retired:return
+        if self.retired or not _watcher_alive(self.note_watcher):
+            return
         active_suspensions = self._active_watch_suspensions()
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
         signature=(paths,self.folder,tuple(sorted(self.expanded)))
@@ -1358,7 +1701,7 @@ class Studio(QObject):
         parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
         entry_list = [(target_path, parent_str, is_dir, threading.Event(), new_path)]
         for win in list(self.session.windows.values()):
-            if win.retired:
+            if win.retired or not _watcher_alive(win.note_watcher):
                 continue
             win.note_watch_paths = None
             watched = list(win.note_watcher.files() + win.note_watcher.directories())
@@ -1429,6 +1772,8 @@ class Studio(QObject):
                 path for path in changed if not self._is_watch_target_suspended(path, current_suspensions)
             }
             self._reload_changed_content(effective_changed)
+            for changed_path in effective_changed:
+                self._invalidate_folder_index(changed_path)
             if self.folder and (effective_changed or emitted_location_change):
                 self.session.workspace_links.invalidate(self.folder)
             if self.folder and (
@@ -1497,6 +1842,9 @@ class Studio(QObject):
                     tab.update(path="",name=draft["name"],conflict=False)
                 self._remove_tab(tab["id"])
             self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
+        self._invalidate_folder_index(old)
+        if new:
+            self._invalidate_folder_index(new)
         self.session.workspace_links.invalidate()
         self._preferences();self._recover();self._emit()
 
@@ -1543,7 +1891,10 @@ class Studio(QObject):
 
     def _schedule_theme(self,*args): studio_chrome.schedule_theme(self, *args)
 
-    def _watch_palette(self): studio_chrome.watch_palette(self, palette_paths_fn=system_palette_paths)
+    def _watch_palette(self):
+        if getattr(self, "retired", False) or not _watcher_alive(getattr(self, "palette_watcher", None)):
+            return
+        studio_chrome.watch_palette(self, palette_paths_fn=system_palette_paths)
 
     def _palette_changed(self,*args): studio_chrome.palette_changed(self, *args)
 
@@ -2180,7 +2531,10 @@ class Studio(QObject):
 
     def _clear_theme_background_overrides(self): studio_chrome.clear_theme_background_overrides(self)
 
-    def _watch_custom_theme(self): studio_chrome.watch_custom_theme(self)
+    def _watch_custom_theme(self):
+        if getattr(self, "retired", False) or not _watcher_alive(getattr(self, "custom_theme_watcher", None)):
+            return
+        studio_chrome.watch_custom_theme(self)
 
     def _custom_theme_event(self): studio_chrome.custom_theme_event(self)
 
@@ -2227,7 +2581,11 @@ class Studio(QObject):
     def setNoteLocation(self, value):
         directory = local_path(value)
         if directory.is_dir():
-            self.settings["newNoteLocation"] = str(directory)
+            old_location = self.settings.get("newNoteLocation")
+            self.settings["newNoteLocation"] = folder_ops.canonical_path_str(directory)
+            if old_location:
+                self._invalidate_folder_index(old_location)
+            self._invalidate_folder_index(directory)
             self._preferences(); self._emit(False)
 
     @Slot(str)
@@ -3587,6 +3945,10 @@ class Studio(QObject):
                 )
                 if not automatic:
                     self._clear_agent_staging(target)
+                if not automatic or str(path) != original_path:
+                    self._invalidate_folder_index(path)
+                    if original_path and str(path) != original_path:
+                        self._invalidate_folder_index(original_path)
                 try:
                     self._agent_open_paths.add(str(Path(path).resolve()))
                 except OSError:
@@ -3708,6 +4070,8 @@ class Studio(QObject):
             if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
                 win._start_folder_search()
             win._emit()
+        self._invalidate_folder_index(old_path)
+        self._invalidate_folder_index(new_path)
 
     @Slot(str)
     def notifyMessage(self, text):
@@ -3746,11 +4110,14 @@ class Studio(QObject):
                 write_portable(target, "", {})
             else:
                 atomic_write(target, b"")
-            return folder_ops.canonical_path_str(target.resolve(strict=True))
+            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+            self.session.folder_note_index.invalidate(created_str)
+            return created_str
 
         def finished(created_path, error):
             if error or not created_path:
                 return
+            self._invalidate_folder_index(created_path)
             self.session.workspace_links.invalidate(self.folder)
             created = Path(created_path)
             for win in list(self.session.windows.values()):
@@ -3805,11 +4172,14 @@ class Studio(QObject):
             if target.exists() or folder_ops._is_link_or_junction(target):
                 raise ValueError("An item with that name already exists.")
             target.mkdir(parents=False, exist_ok=False)
-            return folder_ops.canonical_path_str(target.resolve(strict=True))
+            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+            self.session.folder_note_index.invalidate(created_str)
+            return created_str
 
         def finished(created_dir, error):
             if error or not created_dir:
                 return
+            self._invalidate_folder_index(created_dir)
             self.session.workspace_links.invalidate(self.folder)
             created = Path(created_dir)
             for win in list(self.session.windows.values()):
@@ -4036,7 +4406,7 @@ class Studio(QObject):
             return
         for win in list(self.session.windows.values()):
             for tab in win.tabs:
-                if (tab["id"] in win.saving or tab["id"] in getattr(win, "_staging_tabs", ())) and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
+                if (tab["id"] in win.saving or tab["id"] in win._staging_tabs) and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
                     self.message = "Wait for the current save to finish."
                     self._emit(False)
                     return
@@ -5122,9 +5492,6 @@ class Studio(QObject):
         saving = getattr(self, "saving", None)
         if saving is not None and tab_id in saving:
             raise ValueError("A save is already in progress for this tab; retry after it finishes")
-        staging = getattr(self, "_staging_tabs", None)
-        if staging is not None and tab_id in staging:
-            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
         content_snapshot = tab["content"]
         revision = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
         if args.get("expectedRevision") != revision:
@@ -5238,6 +5605,9 @@ class Studio(QObject):
             self._recover()
             self._emit()
             if path_changed:
+                Studio._invalidate_folder_index(self, resolved_path)
+                if old_canonical_path or old_path:
+                    Studio._invalidate_folder_index(self, old_canonical_path or old_path)
                 Studio._refresh_open_folder_trees(self, resolved_path, old_canonical_path or old_path)
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
                     "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
@@ -5760,10 +6130,19 @@ class Studio(QObject):
             if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._last_reader_agent_seq.clear(); self._emit(); self.replied.emit(id,"true",""); return
             if command == "agent_banner_shown":
                 target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
-                if target and not target.get("agent_unreviewed"):
-                    target["agent_unreviewed"] = True
-                    self.recovery_timer.start(800)
-                    self._emit(False)
+                if target:
+                    before_text = args.get("before")
+                    after_text = args.get("after")
+                    recorded = False
+                    if isinstance(before_text, str) and isinstance(after_text, str) and before_text != after_text:
+                        self._append_agent_edit(target, before_text, after_text)
+                        if target.get("agent_edits"):
+                            self._last_reader_agent_seq[target["id"]] = target["agent_edits"][-1]["seq"]
+                        recorded = True
+                    if not target.get("agent_unreviewed") or recorded:
+                        target["agent_unreviewed"] = True
+                        self.recovery_timer.start(800)
+                        self._emit(False)
                 self.replied.emit(id, "true", "")
                 return
             if command == "agent_banner_dismissed":
@@ -6189,8 +6568,9 @@ class Studio(QObject):
                 elif command == "export_fmd_native" and save_as:
                     save_target = next((t for t in self.tabs if t["id"] == (save_as_tab or captured["id"])), target)
                     if save_target:
+                        old_save_path = save_target.get("path", "")
                         old_assets = save_target.get("assets", {})
-                        path_changed = save_target.get("path") != save_as
+                        path_changed = not old_save_path or not folder_ops.same_path(old_save_path, save_as)
                         if old_assets != args["assets"] or path_changed:
                             self.session.reader_assets.revoke_tab(self.window_id, save_target["id"])
                         merged_assets = args["assets"] if path_changed else _preserve_unchanged_assets(old_assets, args["assets"])
@@ -6207,6 +6587,9 @@ class Studio(QObject):
                             conflict=False,
                         )
                         self._clear_agent_staging(save_target)
+                        self._invalidate_folder_index(save_as)
+                        if old_save_path and path_changed:
+                            self._invalidate_folder_index(old_save_path)
                         try:
                             self._agent_open_paths.add(str(Path(save_as).resolve()))
                         except OSError:
@@ -6218,13 +6601,14 @@ class Studio(QObject):
                         self.message = "Saved"
                         self._recover()
                         self._emit()
-                        if path_changed:
-                            self._refresh_open_folder_trees(save_as)
+                        self._refresh_open_folder_trees(save_as, old_save_path)
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
                     self.pending_save_as_tab = ""
                 elif command.startswith("export_"):
                     studio_exports.finalize_standalone_export(self, result["path"])
+                    if is_searchable_note_name(Path(result["path"]).name):
+                        self._invalidate_folder_index(result["path"])
                 if agent_export_info:
                     studio_exports.complete_agent_export(self, id, agent_export_info, result)
                 if not agent_export_info:

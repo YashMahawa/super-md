@@ -81,6 +81,7 @@ def init_studio_window(
     studio_obj._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
     studio_obj._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
     studio_obj.workspaceSearchBatch.connect(studio_obj._on_workspace_search_batch)
+    studio_obj.quickSwitcherIndexed.connect(studio_obj._on_quick_switcher_indexed)
     if session is None:
         if session_cls is None:
             raise TypeError("init_studio_window requires session or session_cls")
@@ -160,6 +161,9 @@ def init_studio_window(
     studio_obj._folder_search_matches: list[dict] = []
     studio_obj._folder_search_scanning, studio_obj._folder_search_pending, studio_obj._folder_search_scanned_files, studio_obj._folder_search_truncated = False, False, 0, False
     studio_obj._folder_search_generation, studio_obj._folder_search_cancel, studio_obj._folder_search_tabs_sig = 0, None, None
+    studio_obj._quick_switcher_open, studio_obj._quick_switcher_query = False, ""
+    studio_obj._quick_switcher_items, studio_obj._quick_switcher_candidates = [], []
+    studio_obj._quick_switcher_loading, studio_obj._quick_switcher_generation, studio_obj._quick_switcher_cancel = False, 0, None
     studio_obj._pending_seeded_find: dict | None = None
     studio_obj.mode = studio_obj.settings.get("readingMode", "live")
     studio_obj.fullscreen, studio_obj.reader_overlay, studio_obj.image_overlay, studio_obj.busy = False, False, False, 0
@@ -387,6 +391,7 @@ def stop_window(
     if getattr(studio_obj, "_storage_cancel_event", None) is not None:
         studio_obj._storage_cancel_event.set()
     _call_optional(studio_obj, "_cancel_subfolder_search")
+    _call_optional(studio_obj, "_cancel_quick_switcher", True)
     if getattr(studio_obj, "_folder_search_cancel", None) is not None:
         studio_obj._folder_search_cancel.set()
     studio_obj._folder_search_pending = False
@@ -488,7 +493,9 @@ def stop_window(
     sys_prefs = getattr(studio_obj, "system_preferences", None)
     if sys_prefs is not None and sys_prefs.state() != process_cls.ProcessState.NotRunning:
         sys_prefs.terminate()
-        sys_prefs.waitForFinished(300)
+        if not sys_prefs.waitForFinished(300):
+            sys_prefs.kill()
+            sys_prefs.waitForFinished(100)
 
 def folder_slice_key(studio_obj, files):
     return (studio_obj.folder, studio_obj.folder_filter, bool(studio_obj._folder_searching), getattr(studio_obj, "_files_revision", 0), id(files), len(files))

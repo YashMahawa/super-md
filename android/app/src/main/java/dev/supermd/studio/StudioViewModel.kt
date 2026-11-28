@@ -1511,9 +1511,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val note = mutable.value.tabs.firstOrNull { it.id == targetId } ?: return
         if (note.dirty && note.uri != null) scheduleAutosave(targetId)
     }
-    fun markAgentBannerShown(id: String) {
-        if (mutable.value.tabs.any { it.id == id && !it.agentUnreviewed }) {
-            change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(agentUnreviewed = true) else it }) }
+    fun markAgentBannerShown(id: String, before: String? = null, after: String? = null) {
+        val hasEdit = before != null && after != null && before != after
+        if (mutable.value.tabs.any { it.id == id && (!it.agentUnreviewed || hasEdit) }) {
+            change { s ->
+                s.copy(
+                    tabs = s.tabs.map {
+                        if (it.id == id) {
+                            val updatedEdits = if (hasEdit) {
+                                val nextSeq = maxOf(agentEditSeq, it.agentEdits.maxOfOrNull { step -> step.seq } ?: 0L) + 1L
+                                agentEditSeq = nextSeq
+                                appendAgentEditSteps(it.agentEdits, nextSeq, before!!, after!!)
+                            } else it.agentEdits
+                            it.copy(agentUnreviewed = true, agentEdits = updatedEdits)
+                        } else it
+                    },
+                )
+            }
         }
     }
     fun dismissAgentBanner(id: String) {
