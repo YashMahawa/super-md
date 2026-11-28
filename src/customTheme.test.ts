@@ -2,6 +2,7 @@
 import {expect,it} from 'vitest';
 import {applyCustomStyle} from './customTheme';
 import {componentContrast,componentRoles,componentMetrics} from './themeComponents';
+import {hasReadableThemeInk,minThemeContrast,readableThemeColor,themeContrast} from './themeContrast';
 const base={surface:'#efe0db','surface-low':'#e8d8d0',text:'#30221b',primary:'#824322'};
 it('applies bounded values and removes every override when reset',()=>{
   const root=document.documentElement;
@@ -50,4 +51,19 @@ it('renders safe paw tiles with independently adjustable size, opacity and spaci
   const second=applyCustomStyle(root,{background:{pattern:'paws',color:'#97674b',opacity:0,spacing:144,size:40}},base);
   expect(first).toBe(second);expect(decodeURIComponent(root.style.getPropertyValue('--custom-pattern'))).toContain('opacity="0"');
   applyCustomStyle(root,undefined,base);expect(root.style.getPropertyValue('--custom-pattern')).toBe('');
+});
+it('clamps unreadable foregrounds to #111111 or #f9f9f9 and detects conflicting surfaces',()=>{
+  expect(themeContrast('#000000','#ffffff')).toBeCloseTo(21,5);
+  expect(themeContrast('#ffffff','#ffffff')).toBeCloseTo(1,5);
+  expect(componentContrast).toBe(themeContrast);
+  expect(readableThemeColor('#1a6b52','#f5fbf6')).toBe('#1a6b52');
+  expect(readableThemeColor('#cccccc','#ffffff')).toBe('#111111');
+  expect(readableThemeColor('#333333','#16181d')).toBe('#f9f9f9');
+  expect(readableThemeColor('#666666',['#ffffff','#ececec'])).toBe('#666666');
+  expect(readableThemeColor('#888888',['#ffffff','#ececec'])).toBe('#111111');
+  expect(readableThemeColor('#555555',['#121212','#202020'])).toBe('#f9f9f9');
+  expect(minThemeContrast('#111111',['#ffffff','#e8e8e8'])).toBeGreaterThanOrEqual(4.5);
+  expect(hasReadableThemeInk(['#ffffff','#f0f0f0'])).toBe(true);
+  expect(hasReadableThemeInk(['#161616','#222222'])).toBe(true);
+  expect(hasReadableThemeInk(['#ffffff','#111111'])).toBe(false);
 });

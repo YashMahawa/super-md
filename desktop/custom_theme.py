@@ -94,18 +94,32 @@ def stamp(path):
 def variant(theme, mode, dark):
     return (theme or {}).get("variants",{}).get("black" if mode=="black" else "dark" if dark else "light",{})
 
+_INKS = ("#111111", "#f9f9f9")
+
+def _min_contrast(color, backgrounds):
+    return min(get_contrast_ratio(color, bg) for bg in backgrounds)
+
+def _best_ink(backgrounds):
+    return max(_INKS, key=lambda c: _min_contrast(c, backgrounds))
+
+def _has_readable_ink(backgrounds, min_ratio=4.5):
+    return max(_min_contrast(c, backgrounds) for c in _INKS) >= min_ratio
+
+def _readable_ink(color, backgrounds, min_ratio=4.5):
+    return color if _min_contrast(color, backgrounds) >= min_ratio else _best_ink(backgrounds)
+
 def palette(base, custom):
     overrides={key:value for key,value in custom.items() if key in base}
     if not overrides:return dict(base)
     result={**base,**overrides}
     surfaces=("surface","surface-low","surface-high")
-    if max(min(get_contrast_ratio(c,result[b]) for b in surfaces) for c in ("#111111","#f9f9f9"))<4.5:
+    if not _has_readable_ink([result[b] for b in surfaces]):
         result["surface-low"]=result["surface-high"]=result["surface"]
-    if get_contrast_ratio(result["primary"],result["surface"])<4.5 or any(get_contrast_ratio(result["primary"],result[b])<3 for b in surfaces):
-        result["primary"]=max(("#111111","#f9f9f9"),key=lambda c:min(get_contrast_ratio(c,result[b]) for b in surfaces))
-    for foreground,backgrounds in [("text",["surface","surface-low","surface-high"]),("muted",["surface","surface-low","surface-high"]),("on-primary",["primary"]),("on-primary-container",["primary-container"])]:
-        if any(get_contrast_ratio(result[foreground],result[background])<4.5 for background in backgrounds):
-            result[foreground]=max(("#111111","#f9f9f9"),key=lambda c:min(get_contrast_ratio(c,result[b]) for b in backgrounds))
+    surface_colors=[result[b] for b in surfaces]
+    if get_contrast_ratio(result["primary"],result["surface"])<4.5 or _min_contrast(result["primary"],surface_colors)<3:
+        result["primary"]=_best_ink(surface_colors)
+    for foreground,backgrounds in [("text",surfaces),("muted",surfaces),("on-primary",("primary",)),("on-primary-container",("primary-container",))]:
+        result[foreground]=_readable_ink(result[foreground],[result[b] for b in backgrounds])
     result["on-surface"]=result["text"]
     return result
 
