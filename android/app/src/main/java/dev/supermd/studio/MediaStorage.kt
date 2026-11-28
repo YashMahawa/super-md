@@ -26,6 +26,8 @@ private const val MAX_CACHED_LOCAL_CHARS = 48_000_000L
 class MediaStorage(private val context: Context) {
     companion object {
         const val UNSUPPORTED_DROP_IMAGE_MESSAGE = "Only supported images (PNG, JPEG, GIF, WebP, AVIF, or SVG) can be dropped into a note."
+        const val UNGRANTED_DROP_IMAGE_MESSAGE = "Dropped image read access was not granted; choose the image with Insert image instead."
+        const val SWITCHED_NOTE_IMPORT_MESSAGE = "Image import cancelled because you switched notes before it finished."
         private val SUPPORTED_IMAGE_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
 
         internal fun resolveDroppedImageMime(name: String?, providerMime: String?): String? {
@@ -49,7 +51,12 @@ class MediaStorage(private val context: Context) {
             return extMime
         }
     }
-    data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int)
+    data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int, val missingGrantCount: Int = 0)
+    internal data class AdmittedDroppedImageCandidate(
+        val admitted: AdmittedExternalDrop,
+        val name: String?,
+        val resolvedMime: String,
+    )
     private val publisher = AgentDownloadPublisher(context)
     private val attachments = File(context.filesDir, "attachments").apply { mkdirs() }
     private val bundles = File(context.filesDir, "portable-assets").apply { mkdirs() }
@@ -332,55 +339,166 @@ class MediaStorage(private val context: Context) {
         return result
     }
     private fun resolveUriDisplayName(uri: Uri): String? =
-        androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name
-            ?.takeIf { it.isNotBlank() }
-            ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            uri.path?.let { File(it).name }?.takeIf { it.isNotBlank() }
+                ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+        } else {
+            runCatching { androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+        }
 
-    private fun isSafeExternalUri(uri: Uri): Boolean {
-        return when (uri.scheme?.lowercase()) {
-            "content" -> {
-                val authority = uri.authority?.lowercase().orEmpty()
-                authority.isNotEmpty() && authority != "${context.packageName.lowercase()}.share"
+    fun importUris(uris: List<Uri>): JSONArray {
+        require(uris.size in 1..32)
+        var total = 0L
+        val result = JSONArray()
+        try {
+            for (uri in uris) {
+                val (name, type, bytes) = when (uri.scheme?.lowercase()) {
+                    "content" -> {
+                        ExternalDocumentEntryGuard.validatePickedMediaUri(context, uri)
+                        val resolvedName = resolveUriDisplayName(uri) ?: "Image"
+                        val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                        val resolvedType = imageMime(resolvedName, providerMime)
+                        val readBytes = ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
+                            context = context,
+                            resolver = context.contentResolver,
+                            uri = uri,
+                        ).use { input -> readLimited(input, 25_000_000) }
+                        Triple(resolvedName, resolvedType, readBytes)
+                    }
+                    "file" -> {
+                        ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
+                            context = context,
+                            resolver = context.contentResolver,
+                            uri = uri,
+                        ).use { input ->
+                            val resolvedName = resolveUriDisplayName(uri) ?: "Image"
+                            val resolvedType = imageMime(resolvedName, null)
+                            val readBytes = readLimited(input, 25_000_000)
+                            Triple(resolvedName, resolvedType, readBytes)
+                        }
+                    }
+                    else -> throw IllegalArgumentException("Unsupported image URI")
+                }
+                requireMediaSignature(type, bytes)
+                total += bytes.size
+                require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+                result.put(store(name, type, bytes))
             }
-            "file" -> {
-                val rawPath = uri.path ?: return false
-                val canonical = runCatching { File(rawPath).canonicalPath }.getOrNull() ?: return false
-                val privateRoot = runCatching { context.filesDir.parentFile?.canonicalPath }.getOrNull()
-                privateRoot == null || (canonical != privateRoot && !canonical.startsWith(privateRoot + File.separator))
-            }
-            else -> false
+            return result
+        } catch (error: Throwable) {
+            discardImportedImages(result)
+            throw error
         }
     }
 
-    fun importDroppedUris(uris: List<Uri>): DroppedImageBatch {
-        if (uris.isEmpty()) return DroppedImageBatch(JSONArray(), 0)
+    fun importDroppedUris(
+        uris: List<Uri>,
+        dragReadPermissionGranted: Boolean = true,
+    ): DroppedImageBatch {
+        if (uris.isEmpty()) return DroppedImageBatch(JSONArray(), 0, 0)
+        var skipped = 0
+        var missingGrants = 0
+        val candidates = mutableListOf<AdmittedDroppedImageCandidate>()
+        try {
+            for (uri in uris) {
+                when (val decision = ExternalDocumentEntryGuard.admitDroppedUri(context, uri, dragReadPermissionGranted)) {
+                    is ExternalDropUriDecision.MissingGrant -> {
+                        missingGrants++
+                    }
+                    is ExternalDropUriDecision.Rejected -> {
+                        skipped++
+                    }
+                    is ExternalDropUriDecision.Allowed -> {
+                        val name = resolveUriDisplayName(uri)
+                        val providerMime = if (uri.scheme.equals("content", ignoreCase = true)) {
+                            runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                        } else {
+                            null
+                        }
+                        val resolvedMime = resolveDroppedImageMime(name, providerMime)
+                        if (resolvedMime == null) {
+                            decision.close()
+                            skipped++
+                        } else {
+                            candidates += AdmittedDroppedImageCandidate(
+                                admitted = decision.admitted,
+                                name = name,
+                                resolvedMime = resolvedMime,
+                            )
+                        }
+                    }
+                }
+            }
+            val imported = importAdmittedDroppedImages(candidates)
+            val totalMissing = missingGrants + imported.missingGrantCount
+            val nonGrantSkipped = skipped + (imported.skippedCount - imported.missingGrantCount)
+            return DroppedImageBatch(
+                images = imported.images,
+                skippedCount = nonGrantSkipped + totalMissing,
+                missingGrantCount = totalMissing,
+            )
+        } finally {
+            candidates.forEach { runCatching { it.admitted.close() } }
+        }
+    }
+
+    internal fun importAdmittedDroppedImages(
+        candidates: List<AdmittedDroppedImageCandidate>,
+    ): DroppedImageBatch {
+        if (candidates.isEmpty()) return DroppedImageBatch(JSONArray(), 0, 0)
         var total = 0L
         var skipped = 0
+        var missingGrants = 0
         val result = JSONArray()
-        for (uri in uris) {
-            if (!isSafeExternalUri(uri)) {
-                skipped++
-                continue
+        try {
+            for (candidate in candidates) {
+                require(result.length() < 32) { "Insert at most 32 images at a time" }
+                val bytes = try {
+                    candidate.admitted.openInputStream(context, context.contentResolver).use { input ->
+                        readLimited(input, 25_000_000)
+                    }
+                } catch (_: SecurityException) {
+                    missingGrants++
+                    continue
+                } catch (error: Exception) {
+                    if (error.message?.contains("exceeds", ignoreCase = true) == true) throw error
+                    skipped++
+                    continue
+                }
+                val validSignature = runCatching { requireMediaSignature(candidate.resolvedMime, bytes) }.isSuccess
+                if (!validSignature) {
+                    skipped++
+                    continue
+                }
+                total += bytes.size
+                require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+                result.put(store(candidate.name ?: "Image", candidate.resolvedMime, bytes))
             }
-            val name = resolveUriDisplayName(uri)
-            val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
-            val resolvedMime = resolveDroppedImageMime(name, providerMime)
-            if (resolvedMime == null) {
-                skipped++
-                continue
-            }
-            require(result.length() < 32) { "Insert at most 32 images at a time" }
-            val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
-            val validSignature = runCatching { requireMediaSignature(resolvedMime, bytes) }.isSuccess
-            if (!validSignature) {
-                skipped++
-                continue
-            }
-            total += bytes.size
-            require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-            result.put(store(name ?: "Image", resolvedMime, bytes))
+            return DroppedImageBatch(
+                images = result,
+                skippedCount = skipped + missingGrants,
+                missingGrantCount = missingGrants,
+            )
+        } catch (error: Throwable) {
+            discardImportedImages(result)
+            throw error
+        } finally {
+            candidates.forEach { runCatching { it.admitted.close() } }
         }
-        return DroppedImageBatch(result, skipped)
+    }
+
+    internal fun discardImportedImages(images: JSONArray) {
+        for (i in 0 until images.length()) {
+            val source = images.optJSONObject(i)?.optString("source").orEmpty()
+            if (!source.startsWith("assets/import-") || !validKey(source)) continue
+            containedFile(attachments, File(attachments, source.substringAfter('/')))?.let { file ->
+                invalidateLocalAsset(file)
+                file.delete()
+            }
+        }
     }
 
     /** Save a requested browser image/diagram into Downloads or the user's configured note folder. */

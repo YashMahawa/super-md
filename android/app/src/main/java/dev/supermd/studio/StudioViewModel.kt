@@ -1184,9 +1184,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal val lastOutlineNoteId: String get() = readerProtocolAndOutline.lastOutlineNoteId
     fun outline(id: String, entries: JSONArray) = readerProtocolAndOutline.outline(id, entries)
     private fun resolveDisplayName(target: Uri): String? =
-        DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank)
-            ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
-            ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.lastPathSegment?.takeIf(String::isNotBlank)
+        if (target.scheme.equals("file", ignoreCase = true)) {
+            target.path?.let { File(it).name }?.takeIf(String::isNotBlank)
+                ?: target.lastPathSegment?.substringAfterLast('/')?.takeIf(String::isNotBlank)
+        } else {
+            runCatching { DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank) }.getOrNull()
+                ?: target.lastPathSegment?.substringAfterLast('/')?.takeIf(String::isNotBlank)
+        }
 
     private var autosaveJob: Job? = null
     private val autosavePending = mutableSetOf<String>()
@@ -2178,11 +2182,21 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         relative: String?,
         externalIntentFlags: Int?,
         externalCaller: ExternalIntentCaller,
+        admittedDrop: AdmittedExternalDrop? = null,
+        strictDroppedNote: Boolean = false,
     ): Note {
-        if (externalIntentFlags == null) return loadNoteForOpen(uri, relative)
-        // External Intents must prove their own live caller grant; never manufacture
-        // access from persisted SAF folder trees or untrusted app-private paths.
-        return loadResolvedNoteForOpen(uri, uri, relative, externalIntentFlags, externalCaller)
+        if (externalIntentFlags == null && admittedDrop == null) return loadNoteForOpen(uri, relative)
+        // External Intents and drops must prove their own live caller grant or admitted file handle;
+        // never manufacture access from persisted SAF folder trees or untrusted app-private paths.
+        return loadResolvedNoteForOpen(
+            target = uri,
+            originalUri = uri,
+            relative = relative,
+            externalIntentFlags = externalIntentFlags ?: admittedDrop?.intentFlags,
+            externalCaller = externalCaller,
+            admittedDrop = admittedDrop,
+            strictDroppedNote = strictDroppedNote,
+        )
     }
     private fun loadResolvedNoteForOpen(
         target: Uri,
@@ -2190,30 +2204,35 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         relative: String?,
         externalIntentFlags: Int?,
         externalCaller: ExternalIntentCaller,
+        admittedDrop: AdmittedExternalDrop? = null,
+        strictDroppedNote: Boolean = false,
     ): Note {
         val app = getApplication<Application>()
         val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, originalUri.toString()) } == true }
-        // Reopening an existing draft must still validate its grant,
+        // Reopening an existing draft must still validate its grant or admitted descriptor,
         // but must never reload older disk bytes over its edits.
         if (existing != null) {
-            val verifyStream = if (externalIntentFlags != null) {
-                ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
-            } else {
-                resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+            val verifyStream = when {
+                admittedDrop != null -> admittedDrop.openInputStream(app, resolver)
+                externalIntentFlags != null -> ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
+                else -> resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
             }
             verifyStream.use { }
-            val keepExistingUri = existing.uri != null &&
+            val keepPendingTreeUri = existing.uri != null &&
                 DocumentsContract.isTreeUri(target) &&
                 documentAccess.resolveReadAccess(target) is SafReadAccess.PendingTreeMembership
+            val keepStrongerExistingUri = externalIntentFlags != null &&
+                (externalIntentFlags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) == 0 &&
+                existing.uri != null
             return existing.copy(
-                uri = if (keepExistingUri) existing.uri else target.toString(),
+                uri = if (keepPendingTreeUri || keepStrongerExistingUri) existing.uri else target.toString(),
                 relative = relative ?: existing.relative,
             )
         }
-        val inputStream = if (externalIntentFlags != null) {
-            ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
-        } else {
-            resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+        val inputStream = when {
+            admittedDrop != null -> admittedDrop.openInputStream(app, resolver)
+            externalIntentFlags != null -> ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
+            else -> resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
         }
         return inputStream.use { stream ->
             val name = resolveDisplayName(target)
@@ -2229,7 +2248,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
                     .also { recordPortableBaseline(it.id, opened.directory) }
             } else {
-                val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                if (strictDroppedNote) {
+                    val lowerExt = name.substringAfterLast('.', "").lowercase()
+                    require(lowerExt != "smd" && lowerExt != "fmd") { "Unsupported portable note file" }
+                }
+                val rawBytes = readLimited(buffered, 20_000_000)
+                if (strictDroppedNote) {
+                    require(rawBytes.none { it == 0.toByte() }) { "Binary files cannot be opened as Markdown notes" }
+                }
+                val content = rawBytes.toString(Charsets.UTF_8).removePrefix("\uFEFF")
                 Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
             }
         }
@@ -3976,40 +4003,75 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } }
         closeTargetId?.let { close(it) }
     }
-    fun importDropped(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
+    internal fun discardDroppedImages(images: JSONArray) {
+        viewModelScope.launch(Dispatchers.IO) { media.discardImportedImages(images) }
+    }
+    fun importPickedImages(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
+        if (uris.isEmpty()) {
+            result(null)
+            return@launch
+        }
+        try {
+            val images = withContext(Dispatchers.IO) { media.importUris(uris) }
+            if (mutable.value.active.id != id) {
+                withContext(Dispatchers.IO) { media.discardImportedImages(images) }
+                mutable.value = mutable.value.copy(message = MediaStorage.SWITCHED_NOTE_IMPORT_MESSAGE)
+                result(null)
+                return@launch
+            }
+            markAssetsDirty(id)
+            result(images)
+        } catch (error: Exception) {
+            fail("Could not insert image: ${error.message}")
+            result(null)
+        }
+    }
+    fun importDropped(
+        uris: List<Uri>,
+        id: String,
+        dragReadPermissionGranted: Boolean = true,
+        result: (JSONArray?) -> Unit,
+    ) = viewModelScope.launch {
         if (uris.isEmpty()) {
             mutable.value = mutable.value.copy(message = MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE)
             result(null)
             return@launch
         }
         try {
-            val batch = withContext(Dispatchers.IO) { media.importDroppedUris(uris) }
+            val batch = withContext(Dispatchers.IO) { media.importDroppedUris(uris, dragReadPermissionGranted) }
             val images = batch.images
             if (images.length() == 0) {
-                mutable.value = mutable.value.copy(message = MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE)
+                val failureMessage = if (batch.missingGrantCount > 0 && batch.skippedCount == batch.missingGrantCount) {
+                    MediaStorage.UNGRANTED_DROP_IMAGE_MESSAGE
+                } else {
+                    MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE
+                }
+                mutable.value = mutable.value.copy(message = failureMessage)
+                result(null)
+                return@launch
+            }
+            if (mutable.value.active.id != id) {
+                withContext(Dispatchers.IO) { media.discardImportedImages(images) }
+                mutable.value = mutable.value.copy(message = MediaStorage.SWITCHED_NOTE_IMPORT_MESSAGE)
                 result(null)
                 return@launch
             }
             markAssetsDirty(id)
             if (batch.skippedCount > 0) {
-                val skippedMessage = if (batch.skippedCount == 1) {
+                val skippedMessage = if (batch.missingGrantCount > 0 && batch.skippedCount == batch.missingGrantCount) {
+                    if (batch.missingGrantCount == 1) {
+                        "Skipped 1 image without read permission."
+                    } else {
+                        "Skipped ${batch.missingGrantCount} images without read permission."
+                    }
+                } else if (batch.skippedCount == 1) {
                     "Skipped 1 unsupported file; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
                 } else {
                     "Skipped ${batch.skippedCount} unsupported files; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
                 }
                 mutable.value = mutable.value.copy(message = skippedMessage)
             }
-            if (mutable.value.active.id == id) {
-                result(images)
-            } else {
-                val insertion = (0 until images.length()).joinToString("\n\n") { i ->
-                    val image = images.getJSONObject(i)
-                    "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)"
-                }
-                val note = mutable.value.tabs.find { it.id == id }
-                if (note != null) edit(id, note.content + "\n\n" + insertion + "\n")
-                result(null)
-            }
+            result(images)
         } catch (error: Exception) {
             fail("Could not insert image: ${error.message}")
             result(null)
@@ -4046,4 +4108,312 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             throw error
         } finally { staging.deleteRecursively() }
     }
+
+    private data class AdmittedDroppedNoteCandidate(
+        val admitted: AdmittedExternalDrop,
+        val name: String?,
+        val providerMime: String?,
+    )
+
+    private suspend fun openDroppedNoteBatch(
+        candidates: List<AdmittedDroppedNoteCandidate>,
+        batchNotice: String?,
+    ) {
+        val request = openRequests.begin()
+        val dropCaller = ExternalIntentCaller(allowGrantedShareFile = false)
+        val loadedNotes = mutableListOf<Note>()
+        val createdPortableDirectories = LinkedHashSet<String>()
+        val openErrors = mutableListOf<String>()
+        try {
+            withContext(Dispatchers.IO) {
+                for (candidate in candidates) {
+                    val label = candidate.name ?: candidate.admitted.uri.lastPathSegment ?: "note"
+                    runCatching {
+                        candidate.admitted.use { admitted ->
+                            loadNoteForOpen(
+                                uri = admitted.uri,
+                                relative = null,
+                                externalIntentFlags = admitted.intentFlags,
+                                externalCaller = dropCaller,
+                                admittedDrop = admitted,
+                                strictDroppedNote = true,
+                            )
+                        }
+                    }.onSuccess { note ->
+                        loadedNotes += note
+                        note.assetDirectory?.let { dir ->
+                            if (mutable.value.tabs.none { it.assetDirectory == dir }) {
+                                createdPortableDirectories += dir
+                            }
+                        }
+                    }.onFailure { error ->
+                        openErrors += "$label: ${error.message ?: "Could not read note"}"
+                    }
+                }
+            }
+            if (loadedNotes.isEmpty()) {
+                val parts = mutableListOf<String>()
+                if (openErrors.isNotEmpty()) parts += "Could not open ${openErrors.joinToString("; ")}"
+                if (!batchNotice.isNullOrBlank()) parts += batchNotice
+                fail(parts.joinToString(" ").ifBlank { "Could not open dropped note" })
+                return
+            }
+            if (!openRequests.isCurrent(request)) {
+                loadedNotes.forEach { retainOpenedNote(it, activate = false) }
+            } else {
+                val expectedActiveId = mutable.value.active.id
+                var retainedCount = 0
+                val accepted = performReaderBarrier(expectedActiveId) {
+                    val activateLast = openRequests.isCurrent(request)
+                    loadedNotes.forEachIndexed { index, note ->
+                        retainOpenedNote(
+                            note,
+                            activate = activateLast && index == loadedNotes.lastIndex,
+                        )
+                        retainedCount++
+                    }
+                }
+                if (!accepted || retainedCount == 0) {
+                    if (!openRequests.isCurrent(request)) {
+                        loadedNotes.forEach { retainOpenedNote(it, activate = false) }
+                    } else {
+                        cleanupPortableDirectories(createdPortableDirectories)
+                        readerBarrierFailed()
+                        return
+                    }
+                }
+            }
+            val notices = mutableListOf<String>()
+            if (openErrors.isNotEmpty()) notices += "Could not open ${openErrors.joinToString("; ")}"
+            if (!batchNotice.isNullOrBlank()) notices += batchNotice
+            if (notices.isNotEmpty()) {
+                mutable.value = mutable.value.copy(message = notices.joinToString(" "))
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            cleanupPortableDirectories(createdPortableDirectories)
+            throw cancelled
+        } finally {
+            candidates.forEach { runCatching { it.admitted.close() } }
+        }
+    }
+
+    internal fun handleExternalDrop(
+        uris: List<Uri>,
+        activeNoteId: String,
+        dragReadPermissionGranted: Boolean,
+        onComplete: () -> Unit = {},
+        result: (JSONArray?) -> Unit = {},
+    ): Job = viewModelScope.launch {
+        val admittedHandles = mutableListOf<AdmittedExternalDrop>()
+        try {
+            val seen = LinkedHashSet<String>()
+            val orderedUris = uris.filter { seen.add(it.toString()) }
+            if (orderedUris.isEmpty()) {
+                mutable.value = mutable.value.copy(message = DROP_UNSUPPORTED_ITEM_MESSAGE)
+                result(null)
+                return@launch
+            }
+            val app = getApplication<Application>()
+            val imageCandidates = mutableListOf<MediaStorage.AdmittedDroppedImageCandidate>()
+            val noteCandidates = mutableListOf<AdmittedDroppedNoteCandidate>()
+            var folderRejectedCount = 0
+            var missingGrantCount = 0
+            var unsupportedFileCount = 0
+            val securityRejectedReasons = mutableListOf<String>()
+
+            withContext(Dispatchers.IO) {
+                for (uri in orderedUris) {
+                    when (val decision = ExternalDocumentEntryGuard.admitDroppedUri(app, uri, dragReadPermissionGranted)) {
+                        is ExternalDropUriDecision.MissingGrant -> missingGrantCount++
+                        is ExternalDropUriDecision.Rejected -> {
+                            if (decision.isFolder) folderRejectedCount++
+                            else securityRejectedReasons += decision.reason
+                        }
+                        is ExternalDropUriDecision.Allowed -> {
+                            admittedHandles += decision.admitted
+                            val name = resolveDisplayName(uri)
+                            val providerMime = if (uri.scheme.equals("content", ignoreCase = true)) {
+                                runCatching { resolver.getType(uri) }.getOrNull()
+                            } else {
+                                null
+                            }
+                            if (providerMime?.substringBefore(';')?.trim()?.equals(DocumentsContract.Document.MIME_TYPE_DIR, ignoreCase = true) == true) {
+                                decision.close()
+                                folderRejectedCount++
+                                continue
+                            }
+                            val imageMime = MediaStorage.resolveDroppedImageMime(name, providerMime)
+                            when {
+                                imageMime != null -> imageCandidates += MediaStorage.AdmittedDroppedImageCandidate(
+                                    admitted = decision.admitted,
+                                    name = name,
+                                    resolvedMime = imageMime,
+                                )
+                                isSupportedDroppedNote(name, providerMime) -> noteCandidates += AdmittedDroppedNoteCandidate(
+                                    admitted = decision.admitted,
+                                    name = name,
+                                    providerMime = providerMime,
+                                )
+                                else -> {
+                                    decision.close()
+                                    unsupportedFileCount++
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            when {
+                noteCandidates.isNotEmpty() -> {
+                    imageCandidates.forEach { runCatching { it.admitted.close() } }
+                    val skippedParts = mutableListOf<String>()
+                    if (folderRejectedCount > 0) {
+                        skippedParts += if (folderRejectedCount == 1) {
+                            "Skipped 1 folder (use Open folder instead)."
+                        } else {
+                            "Skipped $folderRejectedCount folders (use Open folder instead)."
+                        }
+                    }
+                    if (imageCandidates.isNotEmpty()) {
+                        skippedParts += "Drop images inside an open note after opening it."
+                    }
+                    val skippedOther = unsupportedFileCount + missingGrantCount + securityRejectedReasons.size
+                    if (skippedOther > 0) {
+                        skippedParts += if (skippedOther == 1) {
+                            "Skipped 1 unsupported item."
+                        } else {
+                            "Skipped $skippedOther unsupported items."
+                        }
+                    }
+                    openDroppedNoteBatch(
+                        candidates = noteCandidates,
+                        batchNotice = skippedParts.joinToString(" ").takeIf { it.isNotBlank() },
+                    )
+                    result(null)
+                }
+                imageCandidates.isNotEmpty() -> {
+                    try {
+                        val batch = withContext(Dispatchers.IO) { media.importAdmittedDroppedImages(imageCandidates) }
+                        val images = batch.images
+                        if (images.length() == 0) {
+                            val totalMissing = missingGrantCount + batch.missingGrantCount
+                            val totalOtherSkipped = folderRejectedCount + unsupportedFileCount + securityRejectedReasons.size +
+                                (batch.skippedCount - batch.missingGrantCount)
+                            val failureMessage = if (totalMissing > 0 && totalOtherSkipped == 0) {
+                                MediaStorage.UNGRANTED_DROP_IMAGE_MESSAGE
+                            } else {
+                                MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE
+                            }
+                            mutable.value = mutable.value.copy(message = failureMessage)
+                            result(null)
+                            return@launch
+                        }
+                        if (mutable.value.active.id != activeNoteId) {
+                            withContext(Dispatchers.IO) { media.discardImportedImages(images) }
+                            mutable.value = mutable.value.copy(message = MediaStorage.SWITCHED_NOTE_IMPORT_MESSAGE)
+                            result(null)
+                            return@launch
+                        }
+                        markAssetsDirty(activeNoteId)
+                        val totalMissing = missingGrantCount + batch.missingGrantCount
+                        val totalSkipped = batch.skippedCount + folderRejectedCount + unsupportedFileCount + missingGrantCount + securityRejectedReasons.size
+                        if (totalSkipped > 0) {
+                            val skippedMessage = if (totalMissing > 0 && totalSkipped == totalMissing) {
+                                if (totalMissing == 1) {
+                                    "Skipped 1 image without read permission."
+                                } else {
+                                    "Skipped $totalMissing images without read permission."
+                                }
+                            } else if (totalSkipped == 1) {
+                                "Skipped 1 unsupported file; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
+                            } else {
+                                "Skipped $totalSkipped unsupported files; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
+                            }
+                            mutable.value = mutable.value.copy(message = skippedMessage)
+                        }
+                        result(images)
+                    } catch (error: Exception) {
+                        fail("Could not insert image: ${error.message}")
+                        result(null)
+                    }
+                }
+                else -> {
+                    when {
+                        folderRejectedCount > 0 && unsupportedFileCount == 0 && missingGrantCount == 0 && securityRejectedReasons.isEmpty() ->
+                            mutable.value = mutable.value.copy(message = DROP_FOLDER_UNSUPPORTED_MESSAGE)
+                        missingGrantCount > 0 && folderRejectedCount == 0 && unsupportedFileCount == 0 && securityRejectedReasons.isEmpty() ->
+                            mutable.value = mutable.value.copy(message = DROP_UNGRANTED_ITEM_MESSAGE)
+                        securityRejectedReasons.isNotEmpty() && unsupportedFileCount == 0 && folderRejectedCount == 0 && missingGrantCount == 0 ->
+                            fail("Could not open dropped file: ${securityRejectedReasons.first()}")
+                        else ->
+                            mutable.value = mutable.value.copy(message = DROP_UNSUPPORTED_ITEM_MESSAGE)
+                    }
+                    result(null)
+                }
+            }
+        } finally {
+            admittedHandles.forEach { runCatching { it.close() } }
+            onComplete()
+        }
+    }
+}
+
+internal const val DROP_UNSUPPORTED_ITEM_MESSAGE =
+    "Only supported Markdown notes (.md, .smd, .fmd, .markdown, .txt) or images can be dropped."
+internal const val DROP_FOLDER_UNSUPPORTED_MESSAGE =
+    "Folder drops are not supported; use Open folder instead."
+internal const val DROP_UNGRANTED_ITEM_MESSAGE =
+    "Dropped file read access was not granted; use Open or Insert image instead."
+
+private val UNAMBIGUOUS_DROPPED_NOTE_MIMES = setOf(
+    "text/markdown",
+    "text/x-markdown",
+    "text/x-supermarkdown",
+    "application/vnd.supermd.smd",
+    "application/vnd.supermd.fmd",
+    "application/x-smd",
+    "application/x-fmd",
+)
+
+private val PORTABLE_COMPATIBLE_NOTE_MIMES = UNAMBIGUOUS_DROPPED_NOTE_MIMES + setOf(
+    "application/gzip",
+    "application/x-gzip",
+    "application/json",
+    "application/octet-stream",
+    "text/plain",
+)
+
+private val PLAIN_COMPATIBLE_NOTE_MIMES = UNAMBIGUOUS_DROPPED_NOTE_MIMES + setOf(
+    "text/plain",
+    "application/octet-stream",
+)
+
+internal fun isSupportedDroppedNote(name: String?, providerMime: String?): Boolean {
+    val normalizedMime = providerMime?.substringBefore(';')?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+    if (normalizedMime == DocumentsContract.Document.MIME_TYPE_DIR.lowercase()) return false
+    if (
+        normalizedMime != null && (
+            normalizedMime.startsWith("image/") ||
+                normalizedMime.startsWith("video/") ||
+                normalizedMime.startsWith("audio/") ||
+                normalizedMime == "application/pdf" ||
+                normalizedMime == "application/zip"
+        )
+    ) {
+        return false
+    }
+    val leaf = name?.substringAfterLast('/')?.substringAfterLast('\\')?.trim().orEmpty()
+    val dot = leaf.lastIndexOf('.')
+    val ext = if (dot > 0 && dot < leaf.lastIndex) leaf.substring(dot + 1).lowercase() else ""
+    if (ext.isNotEmpty()) {
+        if (ext !in FOLDER_NOTE_EXTENSIONS) return false
+        if (normalizedMime == null) return true
+        return if (ext == "smd" || ext == "fmd") {
+            normalizedMime in PORTABLE_COMPATIBLE_NOTE_MIMES
+        } else {
+            normalizedMime in PLAIN_COMPATIBLE_NOTE_MIMES
+        }
+    }
+    return normalizedMime != null && normalizedMime in UNAMBIGUOUS_DROPPED_NOTE_MIMES
 }
