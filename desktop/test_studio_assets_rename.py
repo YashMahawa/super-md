@@ -318,9 +318,12 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             )
         self.assertEqual(invalidations, [self.studio.folder, self.studio.folder, None])
         self.assertIn((self.open_root / "Patched Note.md").resolve(), [p.resolve() for p in atomic_calls])
+        search_restarts: list[str] = []
         seeded_win = SimpleNamespace(
             retired=False, tabs=[], folder=str(self.open_root), expanded=set(), _pinned_visible_dirs=set(),
-            _agent_open_paths=set(), _agent_owned_files=set(), _folder_search_open=False, _folder_search_query="",
+            _agent_open_paths=set(), _agent_owned_files=set(),
+            _folder_search_open=True, _folder_search_query="topic", _folder_search_pending=True,
+            _start_folder_search=lambda: search_restarts.append("started"),
             _pending_seeded_find={"path": str(self.open_root / "a.md"), "sourceStart": 10, "sourceEnd": 15, "matchText": "topic"},
             _watch_notes=lambda force=False: None, _recover=lambda: None, _load_tree=lambda: None, _emit=lambda *a: None,
         )
@@ -333,11 +336,13 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             _note=lambda *a: {"id": "n1"}, _submit=lambda work, done, executor=None: done(work(), None),
         )
         studio_assets_rename.sync_path_change(lightweight, str(self.open_root / "a.md"), str(self.open_root / "b.md"), is_dir=False, message="Moved")
+        self.assertEqual(search_restarts, [])
         canon_b = folder_ops.canonical_path_str(self.open_root / "b.md")
         self.assertEqual(
             seeded_win._pending_seeded_find,
             {"path": canon_b, "sourceStart": 10, "sourceEnd": 15, "matchText": "topic"},
         )
+        seeded_win._folder_search_pending = False
         short_root = self.temp_dir / "RUNNER~1" / "workspace"
         short_prefix, canon_prefix = str(short_root), str(self.open_root)
         seeded_win._pending_seeded_find = {"path": str(short_root / "a.md"), "sourceStart": 2, "sourceEnd": 7, "matchText": "alias"}
@@ -348,6 +353,7 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             side_effect=lambda p: orig_realpath(canon_prefix + str(p)[len(short_prefix):]) if str(p).startswith(short_prefix) else orig_realpath(p),
         ):
             studio_assets_rename.sync_path_change(lightweight, str(short_root / "a.md"), str(short_root / "b.md"), is_dir=False, message="Moved")
+        self.assertEqual(search_restarts, ["started"])
         self.assertEqual(
             seeded_win._pending_seeded_find,
             {"path": canon_b, "sourceStart": 2, "sourceEnd": 7, "matchText": "alias"},
