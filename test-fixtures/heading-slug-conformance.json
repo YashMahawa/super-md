@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "cases": [
+    { "id": "ascii_punctuation", "input": "Hello, World!", "documentSlug": "hello-world", "agentSlug": "hello-world" },
+    { "id": "empty_string", "input": "", "documentSlug": "section", "agentSlug": "" },
+    { "id": "whitespace_only", "input": "   \t\n  ", "documentSlug": "section", "agentSlug": "" },
+    { "id": "punctuation_only", "input": "???", "documentSlug": "section", "agentSlug": "" },
+    { "id": "hyphens_only", "input": "---", "documentSlug": "---", "agentSlug": "" },
+    { "id": "underscores_only", "input": "___", "documentSlug": "___", "agentSlug": "" },
+    { "id": "underscores_and_double_space", "input": "snake_case  heading", "documentSlug": "snake_case--heading", "agentSlug": "snake-case-heading" },
+    { "id": "leading_trailing_hyphens_underscores", "input": "  --_Intro_--  ", "documentSlug": "--_intro_--", "agentSlug": "intro" },
+    { "id": "precomposed_latin_accents", "input": "Café naïve résumé", "documentSlug": "café-naïve-résumé", "agentSlug": "cafe-nai-ve-re-sume" },
+    { "id": "decomposed_latin_accents", "input": "Cafe\u0301 nai\u0308ve", "documentSlug": "café-naïve", "agentSlug": "cafe-nai-ve" },
+    { "id": "combining_latin_letter_mark", "input": "a\u0363b", "documentSlug": "ab", "agentSlug": "a-b" },
+    { "id": "hebrew_niqqud_points", "input": "ש\u05b8\u05c1לו\u05b9ם", "documentSlug": "שלום", "agentSlug": "ש-לו-ם" },
+    { "id": "double_struck_sub_super", "input": "ℍ₂O & ℝ² Space", "documentSlug": "h2o--r2-space", "agentSlug": "h2o-r2-space" },
+    { "id": "trademark_and_hertz", "input": "Trade™ 100㎐", "documentSlug": "tradetm-100hz", "agentSlug": "tradetm-100hz" },
+    { "id": "ligature_and_circled_digit", "input": "ﬁle ① Section", "documentSlug": "file-1-section", "agentSlug": "file-1-section" },
+    { "id": "ohm_and_angstrom", "input": "Ω Ohm & Å Angstrom", "documentSlug": "ω-ohm--å-angstrom", "agentSlug": "ω-ohm-a-angstrom" },
+    { "id": "inline_kbd_tag", "input": "Press <kbd>Ctrl</kbd> + C", "documentSlug": "press-ctrl--c", "agentSlug": "press-kbd-ctrl-kbd-c" },
+    { "id": "fullwidth_angle_kbd_tag", "input": "Press ＜kbd＞Ctrl＜/kbd＞ + C", "documentSlug": "press-ctrl--c", "agentSlug": "press-kbd-ctrl-kbd-c" },
+    { "id": "unclosed_less_than", "input": "Relation a < b", "documentSlug": "relation-a--b", "agentSlug": "relation-a-b" },
+    { "id": "paired_comparison_angles", "input": "Bounds a < b > c", "documentSlug": "bounds-a--c", "agentSlug": "bounds-a-b-c" },
+    { "id": "empty_angle_brackets", "input": "Empty <> tag", "documentSlug": "empty--tag", "agentSlug": "empty-tag" },
+    { "id": "nbsp_and_ideographic_space", "input": "Alpha\u00a0Beta\u3000Gamma", "documentSlug": "alpha-beta-gamma", "agentSlug": "alpha-beta-gamma" },
+    { "id": "bom_trim_and_internal", "input": "\ufeffHello\ufeffWorld\ufeff", "documentSlug": "hello-world", "agentSlug": "hello-world" },
+    { "id": "nel_not_js_whitespace", "input": "Line\u0085Break", "documentSlug": "linebreak", "agentSlug": "line-break" },
+    { "id": "greek_final_sigma", "input": "Σύνοψη ΟΔΥΣΣΕΥΣ Σ", "documentSlug": "σύνοψη-οδυσσευς-σ", "agentSlug": "συ-νοψη-οδυσσευς-σ" },
+    { "id": "german_sharp_s", "input": "Straße & Übung", "documentSlug": "straße--übung", "agentSlug": "straße-u-bung" },
+    { "id": "cyrillic_heading", "input": "Глава 2: Введение", "documentSlug": "глава-2-введение", "agentSlug": "глава-2-введение" },
+    { "id": "cjk_heading", "input": "第1章 概要", "documentSlug": "第1章-概要", "agentSlug": "第1章-概要" }
+  ]
+}

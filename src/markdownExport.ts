@@ -52,7 +52,9 @@ function refs(markdown: string): ImageRef[] {
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
   visit(tree, "definition", (node: any) => {
-    if (node.position && node.position.start.offset >= frontmatterEnd) definitions.set(node.identifier, node);
+    if (node.position && node.position.start.offset >= frontmatterEnd && !definitions.has(node.identifier)) {
+      definitions.set(node.identifier, node);
+    }
   });
   visit(tree, (node: any) => {
     if (!node.position || node.position.start.offset < frontmatterEnd) return;
