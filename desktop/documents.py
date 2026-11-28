@@ -6,10 +6,15 @@ import json
 import os
 import re
 import stat
-import tempfile
 import threading
 import zlib
 from pathlib import Path
+if __package__:
+    from . import atomic_io as _atomic_io
+    from .atomic_io import _ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, atomic_output_file, set_trusted_ascii_predicate
+else:
+    import atomic_io as _atomic_io
+    from atomic_io import _ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, atomic_output_file, set_trusted_ascii_predicate
 
 MIMES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "svg": "image/svg+xml", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 MAX_FILE = 120_000_000
@@ -226,6 +231,7 @@ def _validated_image_meta(data: str) -> tuple[str, int]:
 
 def _is_cached_validated_asset(data: str) -> bool:
     return _lookup_validated_asset(data) is not None
+set_trusted_ascii_predicate(_is_cached_validated_asset)
 
 
 def image_data(data: str) -> tuple[str, bytes]:
@@ -377,12 +383,7 @@ def _write_gzip_json(target, value: dict, *, _trusted_ascii_assets: bool = False
     json.dump(value, BoundedTextWriter(), ensure_ascii=False, separators=(",", ":"))
     emit(compressor.flush())
 
-def compressed_bundle(
-    markdown: str,
-    assets: dict[str, str],
-    *,
-    validated_assets: dict[str, str] | None = None,
-) -> bytes:
+def compressed_bundle(markdown: str, assets: dict[str, str], *, validated_assets: dict[str, str] | None = None) -> bytes:
     value = bundle(markdown, assets, validated_assets=validated_assets)
     import io
     output = io.BytesIO()
@@ -392,79 +393,23 @@ def compressed_bundle(
         raise ValueError("Compressed SMD exceeds 120 MB")
     return data
 
-def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
-    """Preserve atomic replacement despite brief Windows AV/indexer file locks.
-
-    Only transient sharing/access-denied errors are retried, for at most one
-    second. Other errors fail immediately and the caller cleans up its temp.
-    """
-    if os.name != "nt":
-        os.replace(source, target)
-        return
-    import time
-    deadline = time.monotonic() + 1.0
-    delay = 0.005
-    while True:
-        try:
-            os.replace(source, target)
-            return
-        except PermissionError as error:
-            remaining = deadline - time.monotonic()
-            if getattr(error, "winerror", None) not in (5, 32) or remaining <= 0:
-                raise
-            time.sleep(min(delay, remaining))
-            delay = min(0.04, delay * 2)
-
-def write_portable(
-    path: Path,
-    markdown: str,
-    assets: dict[str, str],
-    *,
-    validated_assets: dict[str, str] | None = None,
-) -> None:
+def write_portable(path: Path, markdown: str, assets: dict[str, str], *, validated_assets: dict[str, str] | None = None) -> None:
     """Atomically save the unchanged v1 JSON envelope in deterministic gzip."""
-    value = bundle(markdown, assets, validated_assets=validated_assets)
-    hasher = hashlib.sha256()
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    value, hasher = bundle(markdown, assets, validated_assets=validated_assets), hashlib.sha256()
+    with atomic_output_file(path, buffering=_B64_DECODE_CHUNK, replace_fn=_replace_with_windows_sharing_retry) as raw:
+        class _HashingWriter:
+            def write(self, data: bytes) -> int:
+                hasher.update(data)
+                return raw.write(data)
+            def flush(self) -> None: raw.flush()
+        _write_gzip_json(_HashingWriter(), value, _trusted_ascii_assets=True)
+        if raw.tell() > MAX_FILE:
+            raise ValueError("Compressed SMD exceeds 120 MB")
     try:
-        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as raw:
-            if os.name != "nt" and hasattr(os, "fchmod"):
-                try:
-                    st_mode = path.stat().st_mode
-                except FileNotFoundError:
-                    pass
-                else:
-                    os.fchmod(raw.fileno(), stat.S_IMODE(st_mode))
-
-            class _HashingWriter:
-                def write(self, data: bytes) -> int:
-                    hasher.update(data)
-                    return raw.write(data)
-
-                def flush(self) -> None:
-                    raw.flush()
-
-            _write_gzip_json(_HashingWriter(), value, _trusted_ascii_assets=True)
-            if raw.tell() > MAX_FILE:
-                raise ValueError("Compressed SMD exceeds 120 MB")
-            raw.flush()
-            os.fsync(raw.fileno())
-        _replace_with_windows_sharing_retry(temporary, path)
-        try:
-            st = path.stat()
-            _cache_portable_file(
-                (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns),
-                hasher.hexdigest(),
-                markdown,
-                assets,
-                assets_decoded=True,
-            )
-        except OSError:
-            pass
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
+        st = path.stat()
+        _cache_portable_file((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns), hasher.hexdigest(), markdown, assets, assets_decoded=True)
+    except OSError:
+        pass
 
 def open_note(path: Path, *, decode_assets: bool = True) -> tuple[str, dict[str, str], bool]:
     before = path.stat()
@@ -560,190 +505,10 @@ def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int =
         path, max_text_bytes, max_file_bytes=MAX_FILE, cache_lookup=_lookup_cached_portable_markdown
     )
 
-def atomic_write(path: Path, data: bytes) -> None:
-    # Same-filesystem replace is atomic; a cancelled/failed write leaves the old note intact.
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(handle, "wb") as file:
-            if path.exists() and hasattr(os,"fchmod"):
-                os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
-            file.write(data)
-            file.flush()
-            os.fsync(file.fileno())
-        _replace_with_windows_sharing_retry(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-def _write_json_str(raw, text: str) -> None:
-    if type(text) is str and _is_cached_validated_asset(text):
-        raw.write(b'"')
-        for offset in range(0, len(text), _B64_DECODE_CHUNK):
-            raw.write(text[offset:offset + _B64_DECODE_CHUNK].encode("ascii"))
-        raw.write(b'"')
-        return
-    if len(text) <= _B64_DECODE_CHUNK:
-        raw.write(json.dumps(text, ensure_ascii=False).encode("utf-8", errors="backslashreplace"))
-        return
-    plain = text if type(text) is str else str(text)
-    raw.write(b'"')
-    for offset in range(0, len(plain), _B64_DECODE_CHUNK):
-        chunk = json.dumps(plain[offset:offset + _B64_DECODE_CHUNK], ensure_ascii=False)[1:-1]
-        raw.write(chunk.encode("utf-8", errors="backslashreplace"))
-    raw.write(b'"')
-
-
-def _write_json_value(raw, value, seen: set[int]) -> None:
-    if isinstance(value, str):
-        _write_json_str(raw, value)
-    elif value is None:
-        raw.write(b"null")
-    elif value is True:
-        raw.write(b"true")
-    elif value is False:
-        raw.write(b"false")
-    elif isinstance(value, (int, float)):
-        raw.write(json.dumps(value).encode("ascii"))
-    elif isinstance(value, (list, tuple)):
-        marker = id(value)
-        if marker in seen:
-            raise ValueError("Circular reference detected")
-        seen.add(marker)
-        try:
-            raw.write(b"[")
-            for idx, item in enumerate(value):
-                if idx:
-                    raw.write(b", ")
-                _write_json_value(raw, item, seen)
-            raw.write(b"]")
-        finally:
-            seen.remove(marker)
-    elif isinstance(value, dict):
-        marker = id(value)
-        if marker in seen:
-            raise ValueError("Circular reference detected")
-        seen.add(marker)
-        try:
-            raw.write(b"{")
-            first = True
-            for key, item in value.items():
-                if not first:
-                    raw.write(b", ")
-                first = False
-                if isinstance(key, str):
-                    _write_json_str(raw, key)
-                elif key is None:
-                    raw.write(b'"null"')
-                elif key is True:
-                    raw.write(b'"true"')
-                elif key is False:
-                    raw.write(b'"false"')
-                elif isinstance(key, (int, float)):
-                    raw.write(b'"' + json.dumps(key).encode("ascii") + b'"')
-                else:
-                    raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
-                raw.write(b": ")
-                _write_json_value(raw, item, seen)
-            raw.write(b"}")
-        finally:
-            seen.remove(marker)
-    else:
-        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-_ATOMIC_JSON_STAGE_TLS = threading.local()
-
-
-def _stage_target_key(path: Path | str) -> str:
-    try:
-        resolved = os.path.realpath(os.path.abspath(os.fspath(path)))
-    except OSError:
-        resolved = os.path.abspath(os.fspath(path))
-    if os.name == "nt":
-        if resolved.startswith("\\\\?\\UNC\\"):
-            resolved = "\\\\" + resolved[8:]
-        elif resolved.startswith("\\\\?\\"):
-            resolved = resolved[4:]
-    return os.path.normcase(os.path.normpath(resolved))
-
-
-class _StagedAtomicJsonScope:
-    """Defer the final atomic rename of ``target_path`` until the caller commits."""
-
-    def __init__(self, target_path: Path, abort_check=None):
-        self.target = Path(os.path.abspath(os.fspath(target_path)))
-        self.target_key = _stage_target_key(target_path)
-        self.abort_check = abort_check
-        self.intercepted = False
-        self.temporary: str | None = None
-        self._previous = None
-
-    def __enter__(self):
-        self._previous = getattr(_ATOMIC_JSON_STAGE_TLS, "active", None)
-        _ATOMIC_JSON_STAGE_TLS.active = self
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        _ATOMIC_JSON_STAGE_TLS.active = self._previous
-        if exc_type is not None:
-            self.discard()
-        return False
-
-    def publish(self, destination: Path | None = None) -> None:
-        temp = self.temporary
-        if temp is None:
-            return
-        self.temporary = None
-        try:
-            _replace_with_windows_sharing_retry(temp, destination or self.target)
-        finally:
-            if os.path.exists(temp):
-                os.unlink(temp)
-
-    def discard(self) -> None:
-        temp = self.temporary
-        self.temporary = None
-        if temp is not None and os.path.exists(temp):
-            try:
-                os.unlink(temp)
-            except OSError:
-                pass
-
-
-def stage_atomic_json(target_path: Path, *, abort_check=None) -> _StagedAtomicJsonScope:
-    return _StagedAtomicJsonScope(target_path, abort_check=abort_check)
-
-
-def atomic_json(path: Path, value) -> None:
-    """Write ordered recovery without full-workspace JSON + UTF-8 copies or long GIL holds."""
-    path_obj = Path(path)
-    stage_scope = getattr(_ATOMIC_JSON_STAGE_TLS, "active", None)
-    capture_stage = (
-        stage_scope is not None
-        and not stage_scope.intercepted
-        and _stage_target_key(path_obj) == stage_scope.target_key
-    )
-    if capture_stage:
-        stage_scope.intercepted = True
-        if callable(stage_scope.abort_check) and stage_scope.abort_check():
-            return
-    handle, temporary = tempfile.mkstemp(prefix=f".{path_obj.name}.", suffix=".tmp", dir=path_obj.parent)
-    handed_off = False
-    try:
-        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as file:
-            if path_obj.exists() and hasattr(os, "fchmod"):
-                os.fchmod(file.fileno(), stat.S_IMODE(path_obj.stat().st_mode))
-            _write_json_value(file, value, set())
-            file.flush()
-            os.fsync(file.fileno())
-        if capture_stage:
-            stage_scope.temporary = temporary
-            handed_off = True
-            return
-        _replace_with_windows_sharing_retry(temporary, path_obj)
-    finally:
-        if not handed_off and os.path.exists(temporary):
-            os.unlink(temporary)
+def atomic_write(path: Path, data: bytes) -> None: _atomic_io.atomic_write(path, data, replace_fn=_replace_with_windows_sharing_retry)
+def _write_json_value(raw, value, seen: set[int]) -> None: _atomic_io._write_json_value(raw, value, seen, write_str=_write_json_str, write_value=_write_json_value)
+def stage_atomic_json(target_path: Path, *, abort_check=None) -> _StagedAtomicJsonScope: return _atomic_io.stage_atomic_json(target_path, abort_check=abort_check, replace_fn=_replace_with_windows_sharing_retry)
+def atomic_json(path: Path, value) -> None: _atomic_io.atomic_json(path, value, write_value=_write_json_value, replace_fn=_replace_with_windows_sharing_retry)
 
 def materialize_assets(root: Path, assets: dict[str,str]) -> None:
     """Save a portable note as Markdown without dropping its pictures or overwriting others."""
