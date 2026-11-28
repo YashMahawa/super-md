@@ -723,3 +723,4 @@ test("preserves clicked rendered text caret on double-click below inline emphasi
   await expect(codeArea).toHaveValue("```ts\n- keep literal newline in code\n\n```");
 });
 
+

@@ -11,7 +11,7 @@ const { invokeMock, toJsxRuntimeSpy } = vi.hoisted(() => ({
   }),
   toJsxRuntimeSpy: vi.fn(),
 }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("../nativeBridge", () => ({ invoke: invokeMock }));
 vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("hast-util-to-jsx-runtime")>();
   return {
@@ -2032,7 +2032,7 @@ it("preserves the clicked rendered text caret on double-click across inline emph
     ]);
     act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
 
-    // 5. Custom-titled callout and default-titled callout map lower body lines accurately:
+    // 5. Custom-titled callout, default-titled callout, and GFM table cell after a wikilink column map accurately:
     area = dblClickAt(2, "target line", 0);
     expect(area.value).toBe(calloutBlock);
     expect([area.selectionStart, area.selectionEnd]).toEqual([
@@ -2049,7 +2049,6 @@ it("preserves the clicked rendered text caret on double-click across inline emph
     ]);
     act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
 
-    // 5b. GFM table cell after a wikilink column maps accurately:
     area = dblClickAt(4, "target entry", 0);
     expect(area.value).toBe(tableBlock);
     expect([area.selectionStart, area.selectionEnd]).toEqual([
@@ -2097,7 +2096,7 @@ it("preserves the clicked rendered text caret on double-click across inline emph
   }
 });
 
-it("formats rendered Live selections across nested lists, existing formatting, inline code/math unwraps, upstream draft shifts, backward directional selections, and single-step undo while guarding protected code and multi-paragraph selections", async () => {
+it("formats guarded rendered Live selections across nested lists, partial/existing formatting, inline code/math unwraps, upstream draft shifts, directional selections, and single-step undo while protecting code and multi-paragraph selections", async () => {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
@@ -2114,6 +2113,7 @@ it("formats rendered Live selections across nested lists, existing formatting, i
     "",
     "- Parent list target",
     "  - Nested child item target",
+    "    1. Deep ordered target",
     "",
     "Trailing paragraph stays separate.",
     "",
@@ -2160,6 +2160,14 @@ it("formats rendered Live selections across nested lists, existing formatting, i
       r.setEnd(t.node, endIdx - t.start);
       sel.addRange(r);
     }
+  };
+
+  const runFormat = (action: string): boolean => {
+    let applied = false;
+    act(() => {
+      applied = formatActiveLiveBlock(action);
+    });
+    return applied;
   };
 
   // 0. Unselected Ctrl+B in rendered Live mode is NOT intercepted (leaves sidebar shortcut untouched)
@@ -2250,18 +2258,15 @@ it("formats rendered Live selections across nested lists, existing formatting, i
     area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
   });
 
-  // 4. Existing formatted text (`**Fourier**`) unwraps cleanly on `bold` and unwraps/restores via document-level undo after Escape
+  // 4. Partial selection inside existing **Fourier** ("rier") unwraps **Fourier** -> Fourier without splitting, keeps "rier" selected, and restores via document-level undo after Escape
   blocks = host.querySelectorAll<HTMLElement>(".live-block");
-  selectRenderedSubstring(blocks[1]!.querySelector("p")!, "Fourier");
-  let didFormat = false;
-  act(() => {
-    didFormat = formatActiveLiveBlock("bold");
-  });
-  expect(didFormat).toBe(true);
+  selectRenderedSubstring(blocks[1]!.querySelector("p")!, "rier");
+  expect(runFormat("bold")).toBe(true);
   area = host.querySelector<HTMLTextAreaElement>("textarea")!;
   expect(area.value).toBe(
     "Study Fourier [docs](https://example.com), `cmd_flag`, $x + 1$, and selected rendered range with backward target.",
   );
+  expect(area.value.slice(area.selectionStart, area.selectionEnd)).toBe("rier");
   act(() => {
     area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
   });
@@ -2270,19 +2275,22 @@ it("formats rendered Live selections across nested lists, existing formatting, i
   });
   expect(doc).toContain("Study **Fourier** [docs]");
 
-  // 5. Inline code & inline math: cross-actions (`bold`) are blocked without opening textarea, while matching actions (`inline_code` / `inline_math`) unwrap cleanly
+  // Boundary-straddling rendered selection ("rier docs") is rejected without opening textarea
   const snapshotBeforeGuards = doc;
   blocks = host.querySelectorAll<HTMLElement>(".live-block");
-  const codeEl = blocks[1]!.querySelector("code")!;
-  selectRenderedSubstring(codeEl, "cmd_flag");
-  expect(formatActiveLiveBlock("bold")).toBe(false);
+  selectRenderedSubstring(blocks[1]!.querySelector("p")!, "rier docs");
+  expect(runFormat("bold")).toBe(false);
   expect(host.querySelector("textarea")).toBeNull();
   expect(doc).toBe(snapshotBeforeGuards);
 
-  act(() => {
-    didFormat = formatActiveLiveBlock("inline_code");
-  });
-  expect(didFormat).toBe(true);
+  // 5. Inline code & inline math (including range.selectNode(katexEl)): cross-actions are blocked, matching actions unwrap cleanly
+  const codeEl = blocks[1]!.querySelector("code")!;
+  selectRenderedSubstring(codeEl, "cmd_flag");
+  expect(runFormat("bold")).toBe(false);
+  expect(host.querySelector("textarea")).toBeNull();
+  expect(doc).toBe(snapshotBeforeGuards);
+
+  expect(runFormat("inline_code")).toBe(true);
   area = host.querySelector<HTMLTextAreaElement>("textarea")!;
   expect(area.value).toContain(", cmd_flag, $x + 1$,");
   act(() => {
@@ -2293,16 +2301,13 @@ it("formats rendered Live selections across nested lists, existing formatting, i
   blocks = host.querySelectorAll<HTMLElement>(".live-block");
   const katexEl = blocks[1]!.querySelector(".katex")!;
   const mathRange = document.createRange();
-  mathRange.selectNodeContents(katexEl);
+  mathRange.selectNode(katexEl);
   const sel = window.getSelection()!;
   sel.removeAllRanges();
   sel.addRange(mathRange);
-  expect(formatActiveLiveBlock("bold")).toBe(false);
+  expect(runFormat("bold")).toBe(false);
   expect(host.querySelector("textarea")).toBeNull();
-  act(() => {
-    didFormat = formatActiveLiveBlock("inline_math");
-  });
-  expect(didFormat).toBe(true);
+  expect(runFormat("inline_math")).toBe(true);
   area = host.querySelector<HTMLTextAreaElement>("textarea")!;
   expect(area.value).toContain("`cmd_flag`, x + 1, and");
   act(() => {
@@ -2310,28 +2315,21 @@ it("formats rendered Live selections across nested lists, existing formatting, i
     area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
   });
 
-  // 6. Nested list items: formats parent li (excluding nested ul) and nested child li independently while rejecting cross-li selection
+  // 6. Nested list items: formats parent li, nested child li, and deep ordered li independently while rejecting cross-li selection
   blocks = host.querySelectorAll<HTMLElement>(".live-block");
   selectRenderedSubstring(blocks[2]!.querySelectorAll("li")[0]!, "Parent list");
-  act(() => {
-    didFormat = formatActiveLiveBlock("italic");
-  });
-  expect(didFormat).toBe(true);
+  expect(runFormat("italic")).toBe(true);
   area = host.querySelector<HTMLTextAreaElement>("textarea")!;
-  expect(area.value).toBe("- *Parent list* target\n  - Nested child item target");
+  expect(area.value).toBe("- *Parent list* target\n  - Nested child item target\n    1. Deep ordered target");
   act(() => {
     area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
   });
 
   blocks = host.querySelectorAll<HTMLElement>(".live-block");
-  const listItems = blocks[2]!.querySelectorAll("li");
-  selectRenderedSubstring(listItems[1]!, "child item");
-  act(() => {
-    didFormat = formatActiveLiveBlock("bold");
-  });
-  expect(didFormat).toBe(true);
+  selectRenderedSubstring(blocks[2]!.querySelectorAll("li")[2]!, "ordered target");
+  expect(runFormat("bold")).toBe(true);
   area = host.querySelector<HTMLTextAreaElement>("textarea")!;
-  expect(area.value).toBe("- *Parent list* target\n  - Nested **child item** target");
+  expect(area.value).toBe("- *Parent list* target\n  - Nested child item target\n    1. Deep **ordered target**");
   act(() => {
     area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
   });
@@ -2344,16 +2342,28 @@ it("formats rendered Live selections across nested lists, existing formatting, i
   sel.removeAllRanges();
   sel.addRange(crossLi);
   const afterNestedEdit = doc;
-  expect(formatActiveLiveBlock("bold")).toBe(false);
+  expect(runFormat("bold")).toBe(false);
   expect(host.querySelector("textarea")).toBeNull();
   expect(doc).toBe(afterNestedEdit);
 
-  // 7. Protected fenced code block (<pre>) and multi-paragraph rendered selections are rejected without opening textarea
+  // 7. Protected fenced code block (rendered <pre> AND open protected <textarea>) and multi-paragraph rendered selections are rejected
   const preEl = blocks[4]!.querySelector("pre")!;
   selectRenderedSubstring(preEl, "protectedCode");
-  expect(formatActiveLiveBlock("bold")).toBe(false);
+  expect(runFormat("bold")).toBe(false);
   expect(host.querySelector("textarea")).toBeNull();
   expect(doc).toBe(afterNestedEdit);
+
+  act(() => {
+    blocks[4]!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  act(() => {
+    area.setSelectionRange(6, 19);
+  });
+  expect(runFormat("bold")).toBe(false);
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
 
   const paras = host.querySelectorAll(".live-document p");
   const multiPara = document.createRange();
@@ -2361,7 +2371,7 @@ it("formats rendered Live selections across nested lists, existing formatting, i
   multiPara.setEnd(paras[2]!.firstChild!, 8);
   sel.removeAllRanges();
   sel.addRange(multiPara);
-  expect(formatActiveLiveBlock("bold")).toBe(false);
+  expect(runFormat("bold")).toBe(false);
   expect(host.querySelector("textarea")).toBeNull();
   expect(doc).toBe(afterNestedEdit);
 
@@ -2369,3 +2379,4 @@ it("formats rendered Live selections across nested lists, existing formatting, i
   act(() => root.unmount());
   host.remove();
 });
+

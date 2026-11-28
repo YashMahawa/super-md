@@ -28,9 +28,9 @@ import {
   type PendingBlockFocus,
   type SelectionDirection,
 } from '../liveBlockHistory';
-import {formatActionFromKeyEvent,notifyHistoryBoundary,type FormatAction} from '../markdownFormatting';
+import {formatActionFromKeyEvent,notifyHistoryBoundary,toggleMarkdownFormat,type FormatAction} from '../markdownFormatting';
 import {useLiveInsertionPoint,type SavedLiveSelection} from '../liveInsertionPoint';
-import {mapLiveRenderedSelectionToSourceRange,planGuardedLiveFormat,resolveLiveCaretOffset} from '../liveSelectionRange';
+import {mapLiveRenderedSelectionToSourceRange,resolveLiveCaretOffset,resolveLiveRenderedFormatEdit} from '../liveSelectionRange';
 import {useLiveViewportHold} from '../useLiveViewportHold';
 
 const noTrustedHosts:string[]=[];
@@ -313,7 +313,7 @@ export default function LiveEditor({noteId,markdown,onChange,onHistory,historyRe
     lastSelection.current={start:selection?.start??0,end:selection?.end??0,direction:selection?.direction??'none'};
     pendingSelection.current=selection??null;
     const text=resolvedDoc.slice(start,end);
-    const protectedBlock=protectedHint??(resolvedDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(resolvedDoc)).tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
+    const protectedBlock=Boolean(protectedHint)||(resolvedDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(resolvedDoc)).tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
     const nextSession:EditingSession={session,prefix:resolvedDoc.slice(0,start),suffix:resolvedDoc.slice(end),baseMarkdown:resolvedDoc,baseSplitEnd:end,protectedBlock};
     syncedMarkdownRef.current=resolvedDoc;
     latestRef.current.editing=nextSession;
@@ -431,8 +431,6 @@ export default function LiveEditor({noteId,markdown,onChange,onHistory,historyRe
       if(!outsidePressRef.current.active)return;
       window.clearTimeout(outsidePressRef.current.timer);
       outsidePressRef.current.clientY=event.clientY;
-      // Touch browsers synthesize mousedown -> blur -> mouseup -> click after
-      // pointerup; keep deferral alive until that click dispatches.
       outsidePressRef.current.timer=window.setTimeout(finish,event.pointerType==='touch'?80:0);
     };
     const onMouseUp=(event:MouseEvent)=>{
@@ -595,13 +593,14 @@ export default function LiveEditor({noteId,markdown,onChange,onHistory,historyRe
     const {editing:current,draftText:currentDraft,markdown:latestMarkdown,renderedSource:currentRenderedSource,sourceAnalysis:currentSourceAnalysis}=latestRef.current;
     const activeDoc=current?syncedMarkdownRef.current:latestMarkdown,area=editor.current;
     const selection=typeof window!=='undefined'?window.getSelection():null;
-    const selectionInTextarea=Boolean(area&&selection?.anchorNode&&(selection.anchorNode===area||area.contains(selection.anchorNode)));
-    if(!selectionInTextarea&&selection&&!selection.isCollapsed){
+    const anchorEl=selection?.anchorNode?(selection.anchorNode instanceof Element?selection.anchorNode:selection.anchorNode.parentElement):null;
+    const selectionInActiveEditor=Boolean(area&&selection?.anchorNode&&(selection.anchorNode===area||area.contains(selection.anchorNode)||anchorEl?.closest('.live-active-block')));
+    if(!selectionInActiveEditor&&selection&&!selection.isCollapsed){
       const mapped=mapLiveRenderedSelectionToSourceRange(selection,rootRef.current,currentRenderedSource,currentSourceAnalysis,current,activeDoc);
       if(!mapped){
         if((selection.anchorNode&&rootRef.current?.contains(selection.anchorNode))||!current)return false;
       }else{
-        const planned=planGuardedLiveFormat(activeDoc,mapped.from,mapped.to,mapped.reversed,mapped.blockStart,mapped.blockEnd,action,activeDoc===currentSourceAnalysis.source?currentSourceAnalysis:undefined);
+        const planned=resolveLiveRenderedFormatEdit(activeDoc,mapped,action);
         if(!planned)return false;
         const origBlockText=activeDoc.slice(mapped.blockStart,mapped.blockEnd);
         const origStart=mapped.from-mapped.blockStart,origEnd=mapped.to-mapped.blockStart;
@@ -624,10 +623,13 @@ export default function LiveEditor({noteId,markdown,onChange,onHistory,historyRe
       }
     }
     if(!current||!area||current.protectedBlock||!commitDiscreteRef.current)return false;
-    const prefixLen=current.prefix.length,fullDoc=current.prefix+currentDraft+current.suffix,blockEndInDoc=fullDoc.length-current.suffix.length;
     const start=area.selectionStart,end=area.selectionEnd,reversed=area.selectionDirection==='backward';
-    const planned=planGuardedLiveFormat(fullDoc,prefixLen+start,prefixLen+end,reversed,prefixLen,blockEndInDoc,action);
-    return !!planned&&commitDiscreteRef.current(planned.nextBlockText,planned.nextStart,planned.nextEnd,planned.nextDirection);
+    const range=reversed?{anchor:end,head:start}:{anchor:start,head:end};
+    const result=toggleMarkdownFormat(currentDraft,[range],action,0);
+    if(result.changes.length===0&&result.doc===currentDraft&&result.ranges[0].anchor===range.anchor&&result.ranges[0].head===range.head)return false;
+    const nextRange=result.ranges[0],nextStart=Math.min(nextRange.anchor,nextRange.head),nextEnd=Math.max(nextRange.anchor,nextRange.head);
+    const nextDirection:SelectionDirection=nextRange.anchor>nextRange.head?'backward':nextStart<nextEnd?'forward':'none';
+    return commitDiscreteRef.current(result.doc,nextStart,nextEnd,nextDirection);
   },[emitEditorChange,openDocBlock,syncActiveCaretCenter]);
 
   const {commitDiscreteBlockEdit,handleBeforeInput,handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown}=useLiveBlockEditing({

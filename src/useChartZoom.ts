@@ -15,6 +15,10 @@ export function useChartZoom(source: string) {
   // state over an already queued pan and silently discard the user's movement.
   const centerRef = useRef(center);
   const pointer = useRef<Point>({x:.5,y:.5});
+  const panFrameRef = useRef(0);
+  const cancelPanFrame = () => {
+    if (panFrameRef.current) { cancelAnimationFrame(panFrameRef.current); panFrameRef.current = 0; }
+  };
   const locate = (point: Point) => {
     const svg = host.current?.querySelector("svg"), rect=svg?.getBoundingClientRect();
     if (!rect || !rect.width || !rect.height) return {x:.5,y:.5};
@@ -24,6 +28,7 @@ export function useChartZoom(source: string) {
     return {x:Math.max(0,Math.min(1,(x-left/width)/((width-left-20)/width))),y:Math.max(0,Math.min(1,(y-24/height)/((height-70)/height)))};
   };
   const change = (requested: number, focus:Point={x:.5,y:.5}) => {
+    cancelPanFrame();
     const next = Math.max(.05, Math.min(64, Number.isFinite(requested) ? requested : 1));
     const position=zoomPlotCenter(centerRef.current,value.current,next,focus);
     centerRef.current=position;setCenter(position);remember(chartCenters,source,position);
@@ -34,15 +39,19 @@ export function useChartZoom(source: string) {
     change(chartZooms.get(source) ?? 1);
     const element = host.current?.querySelector("svg"); if (!element) return;
     let distance = 0, frame = 0, pending = value.current, focus={x:.5,y:.5}, held=false;
-    let midpoint:Point|null=null, drag:Point|null=null, dragOrigin:Point|null=null, dragging=false, panFrame=0;
-    const pan = (dx:number,dy:number)=>{
+    let midpoint:Point|null=null, drag:Point|null=null, dragOrigin:Point|null=null, dragging=false;
+    const stepPan = (dx:number,dy:number):Point=>{
       const rect=element.getBoundingClientRect();
       const width=element.viewBox.baseVal.width||760,height=element.viewBox.baseVal.height||360;
       const w=rect.width*(width-Number(element.getAttribute("data-plot-left")||70)-20)/width;
       const h=rect.height*(height-70)/height;
       const next={x:centerRef.current.x-dx/(w*value.current),y:centerRef.current.y+dy/(h*value.current)};
       centerRef.current=next;remember(chartCenters,source,next);
-      if(!panFrame)panFrame=requestAnimationFrame(()=>{panFrame=0;setCenter(centerRef.current);});
+      return next;
+    };
+    const pan = (dx:number,dy:number)=>{
+      stepPan(dx,dy);
+      if(!panFrameRef.current)panFrameRef.current=requestAnimationFrame(()=>{panFrameRef.current=0;setCenter(centerRef.current);});
     };
     const press = (event:PointerEvent)=>{if(event.pointerType==="mouse" && event.button===0){held=true;drag={x:event.clientX,y:event.clientY};dragOrigin=drag;dragging=false;element.setPointerCapture(event.pointerId);event.preventDefault();}};
     const release = ()=>{held=false;drag=null;dragOrigin=null;dragging=false;};
@@ -62,14 +71,27 @@ export function useChartZoom(source: string) {
       if (!distance || event.touches.length !== 2) return;
       event.preventDefault(); event.stopPropagation();
       const next=span(event.touches),point={x:(event.touches[0].clientX+event.touches[1].clientX)/2,y:(event.touches[0].clientY+event.touches[1].clientY)/2};
-      change(value.current*next/distance,locate(midpoint||point));
-      if(midpoint)pan(point.x-midpoint.x,point.y-midpoint.y);
+      if (!(next > 0)) return;
+      const nextZoom=Math.max(.05,Math.min(64,value.current*next/distance));
+      if(nextZoom!==value.current){
+        cancelPanFrame();
+        const zoomed=zoomPlotCenter(centerRef.current,value.current,nextZoom,locate(midpoint||point));
+        centerRef.current=zoomed;
+        value.current=nextZoom;
+        const position=midpoint&&(point.x!==midpoint.x||point.y!==midpoint.y)?stepPan(point.x-midpoint.x,point.y-midpoint.y):zoomed;
+        remember(chartCenters,source,position);
+        setCenter(position);
+        setZoom(nextZoom);remember(chartZooms,source,nextZoom);
+      }else if(midpoint&&(point.x!==midpoint.x||point.y!==midpoint.y)){
+        pan(point.x-midpoint.x,point.y-midpoint.y);
+      }
       midpoint=point;
       distance=next;
     };
     const end = (event: TouchEvent) => {
       if (event.touches.length >= 2) return;
       if (frame) { cancelAnimationFrame(frame); frame = 0; change(pending,focus); }
+      if (panFrameRef.current) { cancelAnimationFrame(panFrameRef.current); panFrameRef.current = 0; setCenter(centerRef.current); }
       distance = 0; midpoint=null; delete element.dataset.chartPinching;
     };
     const wheel = (event: WheelEvent) => {
@@ -106,7 +128,7 @@ export function useChartZoom(source: string) {
     element.addEventListener("wheel", wheel, {passive: false});
     window.addEventListener("supermd-chart-native-zoom", native);
     return () => {
-      cancelAnimationFrame(frame);cancelAnimationFrame(panFrame); delete element.dataset.chartPinching;
+      cancelAnimationFrame(frame); cancelPanFrame(); delete element.dataset.chartPinching;
       element.removeEventListener("pointermove",track);
       element.removeEventListener("supermd-canvas-pan",nativePan);
       element.removeEventListener("pointerdown",press);
@@ -118,6 +140,7 @@ export function useChartZoom(source: string) {
     };
   }, [source]);
   const reset = () => {
+    cancelPanFrame();
     const origin={x:0,y:0};centerRef.current=origin;setCenter(origin);remember(chartCenters,source,origin);
     value.current=1;setZoom(1);remember(chartZooms,source,1);
   };

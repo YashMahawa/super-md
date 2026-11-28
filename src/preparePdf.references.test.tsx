@@ -84,3 +84,23 @@ it("preserves intentional escapes alongside unescaped study syntax, including si
   expect(prepared.content).toContain("\\==Fenced literal==");
   expect(prepared.content).not.toContain("hidden comment");
 });
+
+it("preserves repeated, forward, early, case-mismatched, multi-paragraph, and undefined footnotes for PDF numbering",async()=>{
+  const source=[
+    "[^early]: Early note defined before body.",
+    "",
+    "Lead[^second], then[^First], repeat[^SECOND], early[^early], and literal[^missing].",
+    "",
+    "[^first]: First definition in file, cited second.",
+    "",
+    "    Continuation paragraph inside first footnote.",
+    "",
+    "[^second]: Second definition in file, cited first.",
+  ].join("\n");
+  const prepared=await preparePdf(source,"/notes/footnotes.md");
+  expect(prepared.content).toContain("Lead[^second], then[^First], repeat[^SECOND], early[^early], and literal\\[\\^missing].");
+  expect(prepared.content).toContain("[^early]: Early note defined before body.");
+  expect(prepared.content).toContain("[^first]: First definition in file, cited second.\n\n    Continuation paragraph inside first footnote.");
+  expect(prepared.content).toContain("[^second]: Second definition in file, cited first.");
+  expect(prepared.content).not.toContain("[^missing]:");
+});
