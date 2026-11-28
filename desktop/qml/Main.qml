@@ -220,6 +220,7 @@ ApplicationWindow {
         case "replace": window.openFind(true); break
         case "find_next": window.focusReader(); studio.command("find_next"); break
         case "find_previous": window.focusReader(); studio.command("find_previous"); break
+        case "quick_switcher": studio.openQuickSwitcher(); break
         case "search_folder": studio.openFolderSearch(); break
         case "close_tab": studio.closeTabSafely(window.activeTabId || viewState.active); break
         case "next_tab": studio.cycleTab(1); break
@@ -337,6 +338,7 @@ ApplicationWindow {
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
         function onAgentRequest(payload) { window.routeAgentRequest(payload) }
         function onWorkspaceSearchChanged() { if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open(); else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close() }
+        function onQuickSwitcherChanged() { if (studio.quickSwitcherState.open && !quickSwitcherDialog.visible) quickSwitcherDialog.openWithFocusCapture(); else if (!studio.quickSwitcherState.open && quickSwitcherDialog.visible) quickSwitcherDialog.close() }
         function onWorkspaceFolderDropped() { window.sidebar = true; window.sidebarSection = "folder" }
     }
     onViewStateChanged: {
@@ -461,6 +463,7 @@ ApplicationWindow {
                         implicitWidth: 250
                         NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.reopen_tab || "") : ""; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
                         NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.save_as || "") : ""; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
+                        NoteMenuItem { objectName: "quickSwitcherAction"; text: "Quick switcher"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.quick_switcher || "") : ""; icon.source: "../icons/File.svg"; onTriggered: studio.openQuickSwitcher() }
                         NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; actionVisible: window.width < 1060; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
@@ -877,4 +880,5 @@ ApplicationWindow {
         onOpenNoteRequested: openDialog.open()
     }
     FolderSearchDialog { id: folderSearchDialog }
+    QuickSwitcherDialog { id: quickSwitcherDialog }
 }

@@ -29,7 +29,7 @@ import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,dete
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
 import { parseFrontmatter } from "./frontmatter";
-import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
+import LiveEditor, { formatActiveLiveBlock } from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
 import {ReaderEdits,type SourceChange} from './readerEdits';
@@ -49,10 +49,10 @@ import {rememberWindowedScrollSource} from './windowedSearch';
 import ReadingSearch, { isValidSeedOccurrence, type ReadingSearchSeed } from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
-import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
+import { documentOutline, navigateToHeading, cancelHeadingNavigation, readingKeyboardScrollDelta, resolveHeadingOffset } from "./documentNavigation";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
-import {recordHistory,replayHistory,transferHistory,trimHistoryCache,validHistory,type NoteHistory} from './noteHistory';
+import {applyHistoryEdit,replayHistory,transferHistory,trimHistoryCache,tryLiveTextareaHistory,validHistory,type LiveHistoryEditMeta,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
 import {mediaFilter,mediaTone,type MediaAppearance} from './mediaAppearance';
@@ -209,6 +209,7 @@ export function Reader() {
   const [themeGuide,setThemeGuide]=useState(false);
   const [agentBannerNotes,setAgentBannerNotes]=useState<Record<string,boolean>>({});
   const appliedAgentSeq=useRef(new Map<string,number>());
+  const localAgentEdits=useRef(new Map<string,Array<{before:string;after:string}>>());
   const showAgentBanner=useCallback((noteId:string)=>{
     setAgentBannerNotes(prev=>prev[noteId]?prev:{...prev,[noteId]:true});
   },[]);
@@ -223,6 +224,7 @@ export function Reader() {
   const histories=useRef(new Map<string,NoteHistory>());
   const trimHistories=(active:string)=>trimHistoryCache(histories.current,active);
   const replaying=useRef(false);
+  const [historyReplayToken,setHistoryReplayToken]=useState(0);
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
   const zoomFrame=useRef(0),zoomTimer=useRef(0),zoomFocus=useRef<Point|undefined>(undefined),zoomTarget=useRef<number|null>(null),zoomAnchors=useRef<{focus?:Point;points:Map<HTMLElement,Point|null>}>({points:new Map()});
@@ -291,33 +293,42 @@ export function Reader() {
           requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:false}})));
         }
       };
-      let replayedPendingAgentEdits = false;
-      if (Array.isArray(pendingAgentEdits) && pendingAgentEdits.length > 0 && typeof rest.id === "string") {
-        let lastSeq = appliedAgentSeq.current.get(rest.id) ?? 0;
+      const applyPendingAgentEdits = (targetId: string) => {
+        if (!Array.isArray(pendingAgentEdits) || pendingAgentEdits.length === 0 || !targetId) return;
+        let lastSeq = appliedAgentSeq.current.get(targetId) ?? 0;
         const unseen = pendingAgentEdits
           .filter((item): item is PendingAgentEdit => !!item && typeof item.seq === "number" && item.seq > lastSeq && typeof item.before === "string" && typeof item.after === "string")
           .sort((a, b) => a.seq - b.seq);
-        if (unseen.length > 0) {
-          replayedPendingAgentEdits = true;
-          const importedBase = rest.viewState && old?.id !== rest.id
-            ? (validHistory(rest.viewState.history) ? transferHistory(rest.viewState.history) : null)
-            : histories.current.get(rest.id);
-          const history = importedBase || { undo: [], redo: [], last: -1000 };
-          for (const step of unseen) {
+        if (unseen.length === 0) return;
+        const localQueue = localAgentEdits.current.get(targetId);
+        let history = histories.current.get(targetId);
+        let recordedAny = false;
+        for (const step of unseen) {
+          const localIdx = localQueue ? localQueue.findIndex(item => item.before === step.before && item.after === step.after) : -1;
+          if (localIdx >= 0 && localQueue) {
+            localQueue.splice(0, localIdx + 1);
+            if (localQueue.length === 0) localAgentEdits.current.delete(targetId);
+          } else {
+            if (!history) history = { undo: [], redo: [], last: -1000 };
             history.last = -1000;
-            recordHistory(history, step.before, step.after, 0);
+            applyHistoryEdit(history, step.before, step.after, 0, { isolateHistory: true });
             history.last = -1000;
-            window.dispatchEvent(new CustomEvent("supermd-sync-cached-editor", { detail: { id: rest.id, before: step.before, after: step.after } }));
-            lastSeq = step.seq;
+            window.dispatchEvent(new CustomEvent("supermd-sync-cached-editor", { detail: { id: targetId, before: step.before, after: step.after } }));
+            recordedAny = true;
           }
-          appliedAgentSeq.current.set(rest.id, lastSeq);
-          histories.current.delete(rest.id);
-          histories.current.set(rest.id, history);
-          trimHistories(rest.id);
+          lastSeq = step.seq;
         }
-      }
+        appliedAgentSeq.current.set(targetId, lastSeq);
+        if (recordedAny && history) {
+          histories.current.delete(targetId);
+          histories.current.set(targetId, history);
+          trimHistories(targetId);
+        }
+      };
       if (agentUnreviewed === true && typeof rest.id === "string") {
         setAgentBannerNotes(prev => prev[rest.id] ? prev : { ...prev, [rest.id]: true });
+      } else if (agentUnreviewed === false && typeof rest.id === "string") {
+        setAgentBannerNotes(prev => { if (!prev[rest.id]) return prev; const nextBanner = { ...prev }; delete nextBanner[rest.id]; return nextBanner; });
       }
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
       const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
@@ -357,7 +368,7 @@ export function Reader() {
         refs: { consumedHeadingToken, suppressedRestoreToken, savePosition, modeAnchor, splitPane },
         onHistoryBoundary: () => { const history = histories.current.get(next.id); if (history) history.last = 0; },
       });
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind(next.content);return;}
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyPendingAgentEdits(next.id);applyIncomingFind(next.content);return;}
       snapshotOutgoingTabOrPathAnchor({
         old,
         next,
@@ -369,17 +380,16 @@ export function Reader() {
       if (next.viewState && old?.id !== next.id) {
         importEditorSession(next.id, next.viewState.editor);
         importRenderedViews(next.content, next.viewState.rendered);
-        if (!replayedPendingAgentEdits) {
-          const history=next.viewState.history;
-          histories.current.delete(next.id);
-          if(validHistory(history)){const imported=transferHistory(history);if(imported)histories.current.set(next.id,imported);}
-        }
+        const history=next.viewState.history;
+        histories.current.delete(next.id);
+        if(validHistory(history)){const imported=transferHistory(history);if(imported)histories.current.set(next.id,imported);}
         trimHistories(next.id);
         const importedAnchor=parseImportedAnchor(next.viewState.anchor);
         noteViews.current.set(next.id, {top:next.viewState.top, ...(importedAnchor?{anchor:importedAnchor}:{})});
       } else if (old && old.id !== next.id) {
         trimHistories(next.id);
       }
+      applyPendingAgentEdits(next.id);
       // Native snapshots may have been queued before the latest pinch frame.
       // Within one workspace mode the reader owns its gesture scale; explicit
       // native zoom controls use supermdSetZoom instead of echoing a snapshot.
@@ -426,28 +436,24 @@ export function Reader() {
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
-      const active=document.activeElement;
-      if(active instanceof HTMLTextAreaElement && active.closest('.live-active-block')){
-        const current=reference.current;
-        const previousContent=current?.content;
-        replaying.current=true;
-        const applied=replayActiveLiveBlockHistory(direction);
-        if(applied&&current&&previousContent!==undefined){
-          const history=histories.current.get(current.id);
-          if(history){replayHistory(history,previousContent,direction);histories.current.delete(current.id);histories.current.set(current.id,history);trimHistories(current.id);}
+      const activeEl=document.activeElement;
+      if(isTextEntryField(activeEl)){
+        const inLiveBlock=activeEl instanceof HTMLTextAreaElement&&Boolean(activeEl.closest('.live-active-block'));
+        if(!inLiveBlock){document.execCommand(direction);return;}
+        if(tryLiveTextareaHistory(direction)){
+          if(direction==="undo"&&reference.current)dismissAgentBanner(reference.current.id);
+          return;
         }
-        replaying.current=false;
-        if(applied)return;
       }
-      if(isTextEntryField(active)){document.execCommand(direction);return;}
       const current=reference.current;if(!current)return;
       replaying.current=true;
       let applied=false;
-      const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
-      if(next!==undefined){update(next);applied=true;}
-      else if(current.mode==="editor"||current.mode==="split")applied=editorHistory(current.id,direction);
-      else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined){update(cached);applied=true;}}
-      replaying.current=false;
+      try{
+        const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
+        if(next!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(next);applied=true;}
+        else if(current.mode==="editor"||current.mode==="split")applied=editorHistory(current.id,direction);
+        else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(cached);applied=true;}}
+      }finally{replaying.current=false;}
       if(applied&&direction==="undo")dismissAgentBanner(current.id);
     };
     window.supermdFormat=action=>{
@@ -751,11 +757,11 @@ export function Reader() {
     const history=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt')return;
       if(!(event.ctrlKey||event.metaKey)||event.altKey)return;
-      const key=event.key.toLowerCase();if(key!=="z"&&key!=="y")return;
+      const key=event.key.toLowerCase();if(key!=="z"&&(key!=="y"||event.shiftKey))return;
       if(document.querySelector(".image-viewer,.math-repair-panel,.reading-search,.media-dialog"))return;
-      // Leave a Live textarea's native editing history intact; Source and Read
-      // route through the same bounded note history on hardware keyboards.
-      if(isTextEntryField(event.target))return;
+      // Preserve non-document inputs while routing Live block textareas through
+      // supermdHistory so native undo/redo reconciles and crosses block boundaries.
+      if(isTextEntryField(event.target)&&!(event.target instanceof HTMLTextAreaElement&&event.target.closest('.live-active-block')))return;
       event.preventDefault();event.stopImmediatePropagation();window.supermdHistory?.(key==="y"||event.shiftKey?"redo":"undo");
     };
     const historyBoundary=()=>{
@@ -858,25 +864,25 @@ export function Reader() {
       else if(root instanceof HTMLElement&&!event.ctrlKey&&!event.metaKey&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom]')){rememberWindowedScrollSource(root,event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?root.clientHeight:1));if(Math.abs(event.deltaY)>2)requestChrome('hide');}
     };
     const scrollKey=(event:KeyboardEvent)=>{
-      const target=event.target as Element;
-      if(event.defaultPrevented||event.ctrlKey||event.metaKey||event.altKey||target.closest('input,textarea,button,summary,[contenteditable="true"],.image-viewer,.media-dialog,.reading-search'))return;
-      const root=target.closest<HTMLElement>('.android-reading')||(target===document.body?document.querySelector<HTMLElement>('.android-reading'):null);
+      const target=event.target instanceof Element?event.target:null;
+      const root=target?.closest<HTMLElement>('.android-reading')||(!target||target===document.body||target===document.documentElement?document.querySelector<HTMLElement>('.android-reading'):null);
       if(!root)return;
-      const page=root.clientHeight*.875;
-      const delta=event.key==='ArrowUp'?-40:event.key==='ArrowDown'?40:event.key==='PageUp'?-page:event.key==='PageDown'?page:event.key===' '?(event.shiftKey?-page:page):0;
-      if(delta)rememberWindowedScrollSource(root,delta);
+      const delta=readingKeyboardScrollDelta(event,root);
+      if(delta===null)return;
+      cancelHeadingNavigation(root);
+      rememberWindowedScrollSource(root,delta);
     };
     document.addEventListener("wheel",wheel,{passive:false});
     document.addEventListener('keydown',scrollKey);
     return () => {gaps.end();gapSelection.current=null;document.removeEventListener('scroll',selectionScroll,true);document.removeEventListener('keydown',scrollKey);document.removeEventListener("pointermove",pan);document.removeEventListener("pointercancel",up);document.removeEventListener("pointermove",track);document.removeEventListener("pointerdown",down);document.removeEventListener("pointerup",up);window.removeEventListener("blur",up);cancelAnimationFrame(frame); document.removeEventListener("wheel",wheel); document.removeEventListener("touchstart", start); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); document.removeEventListener("touchcancel", end); };
   }, []);
-  const update = useCallback((content: string,changes?:SourceChange[]) => {
+  const update = useCallback((content: string,changes?:SourceChange[],historyMeta?:LiveHistoryEditMeta) => {
     const previous=reference.current!;
     if(content===previous.content)return;
     window.dispatchEvent(new CustomEvent("supermd-sync-cached-editor",{detail:{id:previous.id,before:previous.content,after:content}}));
     if(!replaying.current){
       const history=histories.current.get(previous.id)||{undo:[],redo:[],last:0},now=Date.now();
-      recordHistory(history,previous.content,content,now);
+      applyHistoryEdit(history,previous.content,content,now,historyMeta);
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
       trimHistories(previous.id);
     } else {
@@ -890,6 +896,8 @@ export function Reader() {
     const delivery=next.editProtocol===1?edits.current!.change(next.id,content,changes):invoke("document_changed",{id:next.id,content});
     void delivery.then(()=>setEditError(''),error=>setEditError(String(error)));
   }, []);
+  const handleLiveChange = useCallback((content: string, meta?: LiveHistoryEditMeta) => update(content, undefined, meta), [update]);
+  const handleLiveHistory = useCallback((direction: "undo" | "redo") => { window.supermdHistory?.(direction); return true; }, []);
   useEffect(()=>{
     const MAX_AGENT_QUEUE=16;
     let active=false,disposed=false;
@@ -1242,10 +1250,18 @@ export function Reader() {
           content=applyMathRepairs(note.content,indices.map(index=>repairs[index]));applied=indices.length;
         }else {const patch=applyAgentPatchesDetailed(note.content,request.operations);content=patch.text;applied=patch.applied;patchOperations=patch.operations;}
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: typing changed the note before the edit');
-        const changed=content!==note.content;
+        const beforeContent=note.content;
+        const changed=content!==beforeContent;
         const history=histories.current.get(note.id);if(history)history.last=-1000;
-        update(content);const nextHistory=histories.current.get(note.id);if(nextHistory)nextHistory.last=-1000;
-        if(changed){showAgentBanner(note.id);void invoke('agent_banner_shown',{id:note.id}).catch(()=>{});}
+        update(content,undefined,{isolateHistory:true});const nextHistory=histories.current.get(note.id);if(nextHistory)nextHistory.last=-1000;
+        if(changed){
+          const queue=localAgentEdits.current.get(note.id)??[];
+          queue.push({before:beforeContent,after:content});
+          if(queue.length>60)queue.splice(0,queue.length-60);
+          localAgentEdits.current.set(note.id,queue);
+          showAgentBanner(note.id);
+          void invoke('agent_banner_shown',{id:note.id,before:beforeContent,after:content}).catch(()=>{});
+        }
         if(note.editProtocol===1)await edits.current!.flush(note.id);
         const response:{tabId:string;revision:string;changed:boolean;applied:number;operations?:unknown[]}={tabId:note.id,revision:await agentRevision(content),changed,applied};
         if(patchOperations)response.operations=patchOperations;
@@ -1328,9 +1344,9 @@ export function Reader() {
     {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed} initialReplace={searchReplace}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
-    <MediaTools documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const current = reference.current; if (!current || current.id !== state.id) return; const content = current.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
+    <MediaTools documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const current = reference.current; if (!current || current.id !== state.id) return; const content = current.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to), undefined, { isolateHistory: true }); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} documentPath={state.path === state.id ? null : state.path} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} onTypewriterChange={changeTypewriter} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} noteId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} noteId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={handleLiveChange} onHistory={handleLiveHistory} historyReplayToken={historyReplayToken} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview noteId={state.id} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }

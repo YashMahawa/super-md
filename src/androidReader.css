@@ -67,23 +67,26 @@
 /* Desktop-only reserved scroll lanes; leave Android's touch indicators alone. */
 :root[data-host="qt"] :is(.android-reading, .cm-scroller) {
   scrollbar-gutter: stable;
+}
+:root[data-host="qt"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre)) {
   scrollbar-width: auto;
   scrollbar-color: auto;
 }
-:root[data-host="qt"] :is(.android-reading, .cm-scroller)::-webkit-scrollbar { width: 16px; height: 16px; }
-:root[data-host="qt"] :is(.android-reading, .cm-scroller)::-webkit-scrollbar-track { background: transparent; }
-:root[data-host="qt"] :is(.android-reading, .cm-scroller)::-webkit-scrollbar-thumb {
+:root[data-host="qt"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre))::-webkit-scrollbar { width: 16px; height: 16px; }
+:root[data-host="qt"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre))::-webkit-scrollbar-track { background: transparent; }
+:root[data-host="qt"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre))::-webkit-scrollbar-thumb {
   border: 4px solid transparent;
   border-radius: 12px;
   background: transparent;
   background-clip: padding-box;
   min-height: 40px;
+  min-width: 40px;
   transition: background-color .18s ease;
 }
-:root[data-host="qt"] :is(.scroll-indicator-active, .scroll-indicator-hover)::-webkit-scrollbar-thumb { background-color: color-mix(in srgb, var(--muted) 45%, transparent); }
-:root[data-motion="off"] :is(.android-reading, .cm-scroller)::-webkit-scrollbar-thumb { transition: none; }
-:root[data-host="qt"] :is(.android-reading, .cm-scroller)::-webkit-scrollbar-thumb:hover { background-color: var(--primary); }
-:root[data-host="qt"] :is(.android-reading, .cm-scroller)::-webkit-scrollbar-corner { background: transparent; }
+:root[data-host="qt"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre)):is(.scroll-indicator-active, .scroll-indicator-hover)::-webkit-scrollbar-thumb { background-color: color-mix(in srgb, var(--muted) 45%, transparent); }
+:root[data-motion="off"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre))::-webkit-scrollbar-thumb { transition: none; }
+:root[data-host="qt"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre))::-webkit-scrollbar-thumb:hover { background-color: var(--primary); }
+:root[data-host="qt"] :is(.android-reading, .cm-scroller, .markdown-body :where(table, pre))::-webkit-scrollbar-corner { background: transparent; }
 .reader-edit-error {
   position: fixed;
   z-index: 1000;
