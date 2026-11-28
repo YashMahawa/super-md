@@ -597,3 +597,130 @@ test("keeps #64 workspace link navigation and Live/document undo-redo semantics 
   });
 });
 
+test("preserves clicked rendered text caret on double-click below inline emphasis and links while keeping keyboard entry and protected blocks intact", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 860 });
+  const proseBlock = [
+    "Review *emphasized context*, `npm test`, $x^2 + 1$, %%draft note%% and [the architecture guide](https://example.com/architecture/overview?tab=live) above,",
+    "then refine **bold intro** before editing the milestone phrase on this lower line.",
+  ].join("\n");
+  const calloutBlock = [
+    "> [!tip] Quick *check*",
+    "> Callout body target.",
+  ].join("\n");
+  const codeBlock = [
+    "```ts",
+    "- keep literal newline in code",
+    "```",
+  ].join("\n");
+  const note = ["# Release Notes", "", proseBlock, "", calloutBlock, "", codeBlock].join("\n");
+
+  await loadLiveNote(page, note, "live");
+
+  const getCharPoint = async (blockIndex: number, needle: string, charIndex = 0) =>
+    page.locator(".live-block").nth(blockIndex).evaluate(
+      (blockEl, { needle, charIndex }) => {
+        const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          if ((node as Text).parentElement?.closest(".katex-mathml")) continue;
+          const textNode = node as Text;
+          const start = textNode.data.indexOf(needle);
+          if (start < 0) continue;
+          const pos = start + charIndex;
+          const charRange = document.createRange();
+          charRange.setStart(textNode, pos);
+          charRange.setEnd(textNode, Math.min(textNode.data.length, pos + 1));
+          const rect = charRange.getBoundingClientRect();
+          return { x: rect.left + Math.min(1.5, rect.width * 0.2), y: rect.top + rect.height / 2 };
+        }
+        throw new Error(`Could not locate "${needle}" in block ${blockIndex}`);
+      },
+      { needle, charIndex },
+    );
+
+  // 1. Double-click right at the start of "milestone" on line 2 (below heading, inline *emphasis*, `code`, $math$, %%comment%%, [link](...), newline, and **bold intro**).
+  const milestonePoint = await getCharPoint(1, "milestone", 0);
+  await page.mouse.dblclick(milestonePoint.x, milestonePoint.y);
+
+  const area = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(area).toBeFocused();
+  await expect(area).toHaveValue(proseBlock);
+
+  const expectedMilestoneOffset = proseBlock.indexOf("milestone");
+  const selection = await area.evaluate((el: HTMLTextAreaElement) => ({
+    start: el.selectionStart,
+    end: el.selectionEnd,
+  }));
+  expect(selection).toEqual({ start: expectedMilestoneOffset, end: expectedMilestoneOffset });
+
+  // Type immediately without repositioning cursor: text inserts cleanly at the clicked rendered word!
+  await page.keyboard.type("verified ");
+  const updatedProseBlock = proseBlock.replace("milestone phrase", "verified milestone phrase");
+  await expect(area).toHaveValue(updatedProseBlock);
+  await page.screenshot({ path: "/tmp/live-double-click-caret.png" });
+
+  // 2. Close with Escape -> .live-block retains focus, and Enter / F2 keyboard edit entry remain intact.
+  await page.keyboard.press("Escape");
+  await expect(page.locator("textarea")).toHaveCount(0);
+  const proseLocator = page.locator(".live-block").nth(1);
+  await expect(proseLocator).toBeFocused();
+
+  await page.keyboard.press("Enter");
+  await expect(area).toBeFocused();
+  await expect(area).toHaveValue(updatedProseBlock);
+  expect(
+    await area.evaluate((el: HTMLTextAreaElement) => el.selectionStart === el.selectionEnd),
+  ).toBe(true);
+
+  await page.keyboard.press("Escape");
+  await expect(proseLocator).toBeFocused();
+  await page.keyboard.press("F2");
+  await expect(area).toBeFocused();
+  await expect(area).toHaveValue(updatedProseBlock);
+  await page.keyboard.press("Escape");
+
+  // 3. Double-clicking inside rendered inline emphasis and inline code places collapsed carets at exact source offsets.
+  const emphasisPoint = await getCharPoint(1, "context", 0);
+  await page.mouse.dblclick(emphasisPoint.x, emphasisPoint.y);
+  await expect(area).toBeFocused();
+  const expectedContextOffset = updatedProseBlock.indexOf("context");
+  expect(
+    await area.evaluate((el: HTMLTextAreaElement) => ({ start: el.selectionStart, end: el.selectionEnd })),
+  ).toEqual({ start: expectedContextOffset, end: expectedContextOffset });
+  await page.keyboard.press("Escape");
+
+  const codeSpanPoint = await getCharPoint(1, "test", 0);
+  await page.mouse.dblclick(codeSpanPoint.x, codeSpanPoint.y);
+  await expect(area).toBeFocused();
+  const expectedCodeOffset = updatedProseBlock.indexOf("test");
+  expect(
+    await area.evaluate((el: HTMLTextAreaElement) => ({ start: el.selectionStart, end: el.selectionEnd })),
+  ).toEqual({ start: expectedCodeOffset, end: expectedCodeOffset });
+  await page.keyboard.press("Escape");
+
+  // 4. Double-clicking inside a rendered callout body maps past `[!tip] Quick *check*` to the exact body offset.
+  const calloutTargetPoint = await getCharPoint(2, "target", 0);
+  await page.mouse.dblclick(calloutTargetPoint.x, calloutTargetPoint.y);
+  await expect(area).toBeFocused();
+  await expect(area).toHaveValue(calloutBlock);
+  const expectedCalloutOffset = calloutBlock.indexOf("target");
+  expect(
+    await area.evaluate((el: HTMLTextAreaElement) => ({ start: el.selectionStart, end: el.selectionEnd })),
+  ).toEqual({ start: expectedCalloutOffset, end: expectedCalloutOffset });
+  await page.keyboard.press("Escape");
+
+  // 5. Protected fenced code block double-click preserves protectedBlock behavior (literal Enter, no list marker continuation).
+  await page.locator(".live-block").nth(3).dblclick();
+  const codeArea = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(codeArea).toBeFocused();
+  await expect(codeArea).toHaveValue(codeBlock);
+  await codeArea.evaluate((el: HTMLTextAreaElement) => {
+    const endOfCodeLine = el.value.indexOf("in code") + "in code".length;
+    el.setSelectionRange(endOfCodeLine, endOfCodeLine);
+  });
+  await codeArea.press("Enter");
+  await expect(codeArea).toHaveValue("```ts\n- keep literal newline in code\n\n```");
+});
+
+

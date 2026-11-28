@@ -1,5 +1,6 @@
 import {useEffect,useLayoutEffect,useRef,useState,type ReactNode} from 'react';
 import {PencilSimpleIcon} from '@phosphor-icons/react';
+import {resolveDoubleClickCaretRange} from '../liveSelectionRange';
 import WindowedBlock,{type WindowHeading} from './WindowedBlock';
 
 export const fullscreenInteractiveSelector='a,button,input,select,textarea,summary,details,img,.note-image,.interactive-chart,.inline-diagram,.svg-figure,.mermaid,.step-cards,.remote-image-card,.image-error,.code-container';
@@ -7,7 +8,7 @@ export const fullscreenInteractiveSelector='a,button,input,select,textarea,summa
 export interface LiveBlockShellProps {
   windowed:boolean;estimate:number;text:string;headings:WindowHeading[];
   start:number;end:number;blockIndex:number;active:boolean;protectedHint:boolean;
-  onOpen:(element:HTMLElement,start:number,end:number,protectedHint:boolean)=>void;
+  onOpen:(element:HTMLElement,start:number,end:number,protectedHint:boolean,caretRange?:Range|null)=>void;
   editor:ReactNode;
   children:ReactNode;
 }
@@ -68,7 +69,10 @@ export function LiveBlockShell({windowed,estimate,text,headings,start,end,blockI
     onBlur={event=>{if(!event.currentTarget.contains(event.relatedTarget as Node|null))setFocused(false);}}
     onDoubleClick={event=>{
       if(active||(event.target as Element).closest('a,button,input,select,textarea'))return;
-      window.getSelection()?.removeAllRanges();onOpen(event.currentTarget,start,end,protectedHint);
+      const caretRange=!protectedHint&&(event.detail>0||event.clientX!==0||event.clientY!==0)
+        ?resolveDoubleClickCaretRange(event.currentTarget,event.target,event.clientX,event.clientY)
+        :null;
+      window.getSelection()?.removeAllRanges();onOpen(event.currentTarget,start,end,protectedHint,caretRange);
     }}
     onKeyDown={event=>{if(!active&&event.target===event.currentTarget&&(event.key==='Enter'||event.key==='F2')){event.preventDefault();onOpen(event.currentTarget,start,end,protectedHint);}}}>
     {revealed?<button type="button" className="live-block-edit" data-independent-zoom aria-label="Edit block" title="Edit block" onClick={event=>{
