@@ -374,93 +374,6 @@ private object NoMotionScheme : MotionScheme {
     override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
 }
 
-internal fun shouldAcceptExternalDrag(localState: Any?, description: android.content.ClipDescription?): Boolean {
-    if (localState != null || description == null) return false
-    val count = description.mimeTypeCount
-    if (count <= 0) return false
-    var hasExternalPayload = false
-    for (index in 0 until count) {
-        val mime = description.getMimeType(index)?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-        if (mime.startsWith("chromium/")) return false
-        if (mime.isNotEmpty() && mime != "text/plain" && mime != "text/html") {
-            hasExternalPayload = true
-        }
-    }
-    return hasExternalPayload
-}
-
-internal class ExternalDropDragController(
-    private val onExternalDrop: (android.view.DragEvent) -> Unit,
-) : android.view.View.OnDragListener {
-    private var acceptingExternalDrag = false
-
-    override fun onDrag(view: android.view.View?, event: android.view.DragEvent): Boolean =
-        onDragAction(
-            action = event.action,
-            localState = event.localState,
-            description = event.clipDescription,
-            event = event,
-        )
-
-    internal fun onDragAction(
-        action: Int,
-        localState: Any?,
-        description: android.content.ClipDescription?,
-        event: android.view.DragEvent? = null,
-    ): Boolean {
-        return when (action) {
-            android.view.DragEvent.ACTION_DRAG_STARTED -> {
-                acceptingExternalDrag = shouldAcceptExternalDrag(localState, description)
-                acceptingExternalDrag
-            }
-            android.view.DragEvent.ACTION_DROP -> {
-                if (!acceptingExternalDrag) return false
-                if (event != null) onExternalDrop(event)
-                true
-            }
-            android.view.DragEvent.ACTION_DRAG_ENDED -> {
-                val handled = acceptingExternalDrag
-                acceptingExternalDrag = false
-                handled
-            }
-            else -> acceptingExternalDrag
-        }
-    }
-}
-
-internal fun shouldBlockNativeDrop(
-    state: StudioState,
-    folderSearchVisible: Boolean = false,
-    accessRequestOpen: Boolean = false,
-    settingsOpen: Boolean = false,
-    exporting: Boolean = false,
-    renaming: Boolean = false,
-    contentsShown: Boolean = false,
-    drawerOpen: Boolean = false,
-): Boolean =
-    !state.welcomed ||
-        state.busy ||
-        state.readerOverlay ||
-        folderSearchVisible ||
-        accessRequestOpen ||
-        state.folderAccessPrompt != null ||
-        state.pendingCloseNoteId != null ||
-        state.pendingSaveConflictNoteId != null ||
-        settingsOpen ||
-        exporting ||
-        renaming ||
-        contentsShown ||
-        drawerOpen
-
-internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<android.net.Uri> {
-    if (clip == null) return emptyList()
-    return (0 until clip.itemCount).mapNotNull { index ->
-        clip.getItemAt(index)?.uri?.takeIf { uri ->
-            uri.scheme?.lowercase() in setOf("content", "file")
-        }
-    }
-}
-
 internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")
 
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
@@ -488,8 +401,6 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     var findRequest by remember { mutableIntStateOf(0) }
     var findReplace by remember { mutableStateOf(false) }
     var renaming by rememberSaveable {mutableStateOf(false)}
-    var pendingRenameKey by rememberSaveable { mutableStateOf<String?>(null) }
-    var pendingRenameInput by rememberSaveable { mutableStateOf<String?>(null) }
     var contentsShown by remember {mutableStateOf(false)}
     var readingChromeVisible by remember {mutableStateOf(true)}
     LaunchedEffect(state.busy) { if (!state.busy) readerPdfOwnsProgress = false }
@@ -1174,38 +1085,10 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
-                val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
-                    if (shouldBlockNativeDrop(
-                            model.state.value,
-                            folderSearchVisible = model.folderSearch.value.visible,
-                            accessRequestOpen = model.documentAccessRequests.value != null,
-                            settingsOpen = settings,
-                            exporting = exporting,
-                            renaming = renaming,
-                            contentsShown = contentsShown,
-                            drawerOpen = drawer.isOpen,
-                        )) {
-                        return@rememberUpdatedState
-                    }
-                    val permissions = activity.requestDragAndDropPermissions(event)
-                    val uris = extractDroppedFileUris(event.clipData)
-                    if (uris.isNotEmpty()) {
-                        val id = model.state.value.active.id
-                        val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
-                        val x = event.x / currentDensity
-                        val y = event.y / currentDensity
-                        reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                        model.importDropped(uris, id) { images ->
-                            permissions?.release()
-                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
-                        }
-                    } else {
-                        permissions?.release()
-                        if ((event.clipData?.itemCount ?: 0) > 0) {
-                            model.importDropped(emptyList(), model.state.value.active.id) {}
-                        }
-                    }
-                }
+                val handleExternalDrop = rememberExternalDropHandler(
+                    model = model, activity = activity, settingsOpen = settings, exporting = exporting,
+                    renaming = renaming, contentsShown = contentsShown, drawerOpen = drawer.isOpen,
+                )
                 Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
                     key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -1322,134 +1205,16 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         renameTarget = renameFolderTarget,
         onDismissRename = { renameFolderTarget = null },
     )
-    // Long forms must not strand their primary action below a half-open sheet.
-    if (renaming) {
-        val activeRenameKey = "${state.active.id}\n${state.active.name}"
-        val initialStem = remember(state.active.id, state.active.name, pendingRenameKey, pendingRenameInput) {
-            if (pendingRenameKey == activeRenameKey && pendingRenameInput != null) {
-                pendingRenameInput!!
-            } else if (noteExtension(state.active.name).isNotEmpty()) {
-                noteStem(state.active.name)
-            } else {
-                state.active.name
-            }
-        }
-        var name by rememberSaveable(state.active.id, state.active.name, pendingRenameInput) { mutableStateOf(initialStem) }
-        var renameError by remember(state.active.id, state.active.name) { mutableStateOf<String?>(null) }
-        var renameBusy by remember(state.active.id, state.active.name) { mutableStateOf(false) }
-        AlertDialog(
-            onDismissRequest = {
-                if (!renameBusy) {
-                    if (pendingRenameKey == activeRenameKey) {
-                        pendingRenameKey = null
-                        pendingRenameInput = null
-                    }
-                    renaming = false
-                }
-            },
-            title = { Text("Rename note") },
-            text = {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it; renameError = null },
-                    enabled = !renameBusy,
-                    singleLine = true,
-                    isError = renameError != null,
-                    label = { Text("Note name") },
-                    supportingText = renameError?.let { err -> { Text(err, color = MaterialTheme.colorScheme.error) } },
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        val targetId = state.active.id
-                        val submittedName = name
-                        renameBusy = true
-                        renameError = null
-                        model.rename(targetId, submittedName, showGlobalError = false) { ok, err ->
-                            renameBusy = false
-                            if (ok) {
-                                if (pendingRenameKey == activeRenameKey) {
-                                    pendingRenameKey = null
-                                    pendingRenameInput = null
-                                }
-                                renaming = false
-                            } else if (err == DOCUMENT_ACCESS_MESSAGE || model.documentAccessRequests.value?.noteId == targetId) {
-                                pendingRenameKey = activeRenameKey
-                                pendingRenameInput = submittedName
-                                renaming = false
-                            } else {
-                                renameError = err
-                            }
-                        }
-                    },
-                    enabled = !renameBusy && name.isNotBlank(),
-                ) { Text("Rename") }
-            },
-            dismissButton = {
-                TextButton(
-                    enabled = !renameBusy,
-                    onClick = {
-                        if (pendingRenameKey == activeRenameKey) {
-                            pendingRenameKey = null
-                            pendingRenameInput = null
-                        }
-                        renaming = false
-                    },
-                ) { Text("Cancel") }
-            },
-        )
-    }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
-        exporting = false
-        if (format in listOf("md", "mdzip")) {
-            val archive = format == "mdzip"
-            if (model.prepareMarkdownExport(sharing, archive)) web?.evaluateJavascript("window.supermdExportMarkdown?.($archive)", null) ?: model.fail("The reader is not ready")
-        } else if (sharing) {
-            if (model.prepareShare(format)) {
-                if (format == "pdf") readerPdfOwnsProgress = true
-                when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
-            }
-        } else {
-            val stem = noteStem(state.active.name).ifBlank { "Untitled" }
-            if (format == "smd") portable.launch("$stem.smd") else pdf.launch("$stem.pdf")
-        }
-    } }
-    if (!accessPickerShowing) accessRequest?.let { request ->
-        AlertDialog(onDismissRequest = model::dismissDocumentAccess,
-            title = { Text(if (request.assetSource == null) "Restore file access" else "Allow linked file access") },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(request.name, style = MaterialTheme.typography.titleSmall)
-                Text(request.detail ?: if(request.assetSource == null) DOCUMENT_ACCESS_MESSAGE else LINKED_ASSET_ACCESS_MESSAGE)
-                if (request.assetSource == null && request.noteId == state.active.id) TextButton(onClick = {
-                    model.dismissDocumentAccess()
-                    model.beginSaveAs()
-                }) { Text("Save a copy instead") }
-            } },
-            confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
-            dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
-    }
-    if (!workspaceFolderPickerShowing) state.folderAccessPrompt?.let { prompt ->
-        AlertDialog(
-            onDismissRequest = model::dismissWorkspaceFolderPrompt,
-            title = { Text("Allow folder access for note links") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(prompt.noteName, style = MaterialTheme.typography.titleSmall)
-                    Text("Super MD needs permission for the folder containing this note to open linked notes like \"${prompt.target}\". Your current note and edits remain untouched.")
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    workspaceFolderPickerShowing = true
-                    workspaceFolderPicker.launch(prompt.initialUri)
-                }) { Text("Choose folder") }
-            },
-            dismissButton = {
-                TextButton(onClick = model::dismissWorkspaceFolderPrompt) { Text("Not now") }
-            },
-        )
-    }
+    StudioPrimaryDialogs(
+        state = state, model = model, renaming = renaming, onDismissRename = { renaming = false },
+        exporting = exporting, sharing = sharing, noteLocation = noteLocation, web = web,
+        onDismissExport = { exporting = false }, onReaderPdfOwnsProgress = { readerPdfOwnsProgress = true },
+        onLaunchPortableExport = portable::launch, onLaunchPdfExport = pdf::launch,
+        accessPickerShowing = accessPickerShowing, accessRequest = accessRequest,
+        onLaunchAccessPicker = { accessPickerShowing = true; accessPicker.launch(it) },
+        workspaceFolderPickerShowing = workspaceFolderPickerShowing,
+        onLaunchWorkspaceFolderPicker = { workspaceFolderPickerShowing = true; workspaceFolderPicker.launch(it) },
+    )
     if (folderSearch.visible) {
         BackHandler { model.cancelWorkspaceSearch() }
         FolderSearchModal(
@@ -1460,40 +1225,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             onDismiss = model::cancelWorkspaceSearch,
         )
     }
-    state.pendingCloseNote?.let { note ->
-        AlertDialog(
-            onDismissRequest = model::dismissCloseConfirmation,
-            title = { Text("Save changes to ${note.name}?") },
-            text = { Text("Save your changes before closing, or discard them.") },
-            confirmButton = {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = { model.resolveCloseConfirmation("discard") }) { Text("Discard") }
-                    Button(onClick = { model.resolveCloseConfirmation("save") }) { Text("Save") }
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { model.resolveCloseConfirmation("cancel") }) { Text("Cancel") }
-            },
-        )
-    }
-    state.pendingSaveConflictNote?.let { note ->
-        AlertDialog(
-            onDismissRequest = model::dismissSaveConflict,
-            icon = { Icon(painterResource(R.drawable.symbol_warning), null, tint = MaterialTheme.colorScheme.error) },
-            title = { Text("${note.name} changed on disk") },
-            text = { Text("This note was modified outside Super MD since you opened or last saved it. Save a copy to keep both versions, or overwrite the file on disk.") },
-            confirmButton = {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = { model.resolveSaveConflict("overwrite") }) { Text("Overwrite") }
-                    Button(onClick = { model.resolveSaveConflict("save_as") }) { Text("Save as") }
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { model.resolveSaveConflict("cancel") }) { Text("Cancel") }
-            },
-        )
-    }
-    state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
+    StudioConfirmationDialogs(state = state, model = model)
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(noteOpenMimeTypes()) }
 }
 
@@ -1671,53 +1403,6 @@ internal fun buildHighlightedSnippet(
                         }
                     }
                 }
-            }
-        }
-    }
-}
-
-@Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {
-    var step by rememberSaveable { mutableIntStateOf(0) }
-    AlertDialog(onDismissRequest = {}, icon = { Icon(Icons.AutoMirrored.Rounded.MenuBook, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary) },
-        title = { Text(listOf("Welcome to Super MD", "Make it comfortable", "Your next clear thought")[step]) },
-        text = { Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
-            Text("${step + 1} of 3", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.height(16.dp))
-            when (step) {
-                0 -> { Text("A calm place for notes, equations and ideas. Ordinary files, no vault, no account."); Spacer(Modifier.height(16.dp)); Text("Write in Live, edit precisely in Source, or settle into Read. Tablets also have Split.") }
-                1 -> { Choice("Appearance", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Black")) { model.appearance(theme = it) }; Choice("Reading font", state.font, listOf("sans" to "Sans", "serif" to "Serif", "mono" to "Mono")) { model.appearance(font = it) }; Row(verticalAlignment = Alignment.CenterVertically) { Text("Expressive motion", Modifier.weight(1f)); Switch(state.motion, { model.appearance(motion = it) }) } }
-                else -> { Text("Explore equations, sliders and diagrams in the sample. PDFs are typeset locally, including on this device."); Spacer(Modifier.height(16.dp)); Text("Python runs only when you press Run. Only run code you trust.", fontWeight = FontWeight.Medium); Spacer(Modifier.height(16.dp)); Text("For images beside a note, open its containing folder to grant Android permission.") }
-            }
-        } },
-        confirmButton = { Button(onClick = { if (step < 2) step++ else model.welcomeDone() }) { Text(if (step < 2) "Continue" else "Explore the sample") } },
-        dismissButton = { if (step > 0) TextButton(onClick = { if (step == 2) open() else step-- }) { Text(if (step == 2) "Open a note" else "Back") } })
-}
-
-@Composable private fun ConflictBanner(
-    busy: Boolean,
-    onSaveAs: () -> Unit,
-    onReload: () -> Unit,
-    onOverwrite: () -> Unit,
-) {
-    val palette = MaterialTheme.colorScheme
-    Surface(
-        color = palette.errorContainer,
-        contentColor = palette.onErrorContainer,
-        shape = RoundedCornerShape(16.dp),
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
-    ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(painterResource(R.drawable.symbol_warning), null, Modifier.size(20.dp), tint = palette.onErrorContainer)
-                Column(Modifier.weight(1f)) {
-                    Text("Changed on disk", style = MaterialTheme.typography.titleSmall)
-                    Text("This file was modified outside Super MD. Autosave is paused for this tab.", style = MaterialTheme.typography.bodySmall)
-                }
-            }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                FilledTonalButton(onClick = onSaveAs, enabled = !busy) { Text("Save as") }
-                OutlinedButton(onClick = onReload, enabled = !busy) { Text("Reload from disk") }
-                TextButton(onClick = onOverwrite, enabled = !busy) { Text("Overwrite") }
             }
         }
     }
