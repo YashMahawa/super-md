@@ -41,6 +41,8 @@ _SYSTEM_PREFIXES=(
     Path('/var/opt'),
 )
 
+_MAX_METADATA_BYTES=65536
+
 def _current_uid():
     return os.geteuid() if hasattr(os,'geteuid') else None
 
@@ -64,7 +66,7 @@ def _is_system_package(package):
             return True
     return False
 
-def _validate_package(package, expected_version=None, *, require_user_owner=False):
+def _check_package_identity(package, expected_version=None, *, require_user_owner=False):
     if expected_version is not None:
         version(expected_version)
     if package.is_symlink() or not package.is_dir():
@@ -75,10 +77,22 @@ def _validate_package(package, expected_version=None, *, require_user_owner=Fals
     binary=resolved/'super-md'
     if binary.is_symlink() or not binary.is_file() or binary.resolve().parent!=resolved:
         raise ValueError('Extracted package identity mismatch')
+    if require_user_owner:
+        _require_user_owned(binary,'Existing installation is not owned by the current user')
+    for rel in ('_internal','_internal/resources','_internal/resources/desktop'):
+        subdir=resolved/rel
+        if subdir.is_symlink() or not subdir.is_dir():
+            raise ValueError('Extracted package identity mismatch')
+        if require_user_owner:
+            _require_user_owned(subdir,'Existing installation is not owned by the current user')
     metadata_file=resolved/'_internal/resources/desktop/build-info.json'
     if metadata_file.is_symlink() or not metadata_file.is_file() or not metadata_file.resolve().is_relative_to(resolved):
         raise ValueError('Extracted package identity mismatch')
+    if require_user_owner:
+        _require_user_owned(metadata_file,'Existing installation is not owned by the current user')
     try:
+        if metadata_file.stat().st_size>_MAX_METADATA_BYTES:
+            raise ValueError('Extracted package identity mismatch')
         metadata=json.loads(metadata_file.read_text(encoding='utf-8'))
     except (OSError,UnicodeDecodeError,json.JSONDecodeError) as exc:
         raise ValueError('Extracted package identity mismatch') from exc
@@ -88,9 +102,19 @@ def _validate_package(package, expected_version=None, *, require_user_owner=Fals
     version(pkg_version)
     if expected_version is not None and pkg_version!=expected_version:
         raise ValueError('Extracted package identity mismatch')
-    icon=resolved/'_internal/resources/public/brand-mark-fixed.svg'
-    if icon.is_symlink() or not icon.is_file() or not icon.resolve().is_relative_to(resolved):
+    public_dir=resolved/'_internal/resources/public'
+    icon=public_dir/'brand-mark-fixed.svg'
+    if public_dir.is_symlink() or not public_dir.is_dir() or icon.is_symlink() or not icon.is_file() or not icon.resolve().is_relative_to(resolved):
         raise ValueError('Application icon is missing')
+    if require_user_owner:
+        _require_user_owned(public_dir,'Existing installation is not owned by the current user')
+        _require_user_owned(icon,'Existing installation is not owned by the current user')
+    return resolved,pkg_version
+
+def _validate_package(package, expected_version=None, *, require_user_owner=False):
+    resolved,pkg_version=_check_package_identity(
+        package,expected_version=expected_version,require_user_owner=require_user_owner
+    )
     uid=_current_uid() if require_user_owner else None
     for root,dirnames,filenames in os.walk(resolved,followlinks=False):
         root_path=Path(root)
@@ -154,23 +178,33 @@ def _ensure_tree_user_writable(root):
                 try:os.chmod(entry,stat.S_IMODE(entry.lstat().st_mode) | 0o600)
                 except OSError:pass
 
+def _resolve_portable_package(executable=None, home=None, *, frozen=None, platform=None):
+    platform=sys.platform if platform is None else platform
+    frozen=bool(getattr(sys,'frozen',False)) if frozen is None else bool(frozen)
+    if not platform.startswith('linux') or not frozen:
+        raise ValueError('Desktop integration is available for portable Linux builds only')
+    exe=Path(executable or sys.executable).resolve()
+    package=exe.parent
+    home_path=Path(home) if home is not None else Path.home()
+    resolved_home=home_path.resolve()
+    opt=(home_path/'.local/opt').resolve()
+    user_local=_is_user_local_package(package,opt)
+    if not user_local and not package.is_relative_to(resolved_home) and _is_system_package(package):
+        raise ValueError('Desktop integration is available for portable Linux builds only')
+    if exe.name!='super-md' or not exe.is_file():
+        raise ValueError('Extracted package identity mismatch')
+    return package,home_path,opt,user_local
+
 def available(executable=None, home=None, *, frozen=None, platform=None):
     platform=sys.platform if platform is None else platform
     frozen=bool(getattr(sys,'frozen',False)) if frozen is None else bool(frozen)
     if not platform.startswith('linux') or not frozen:
         return False
     try:
-        exe=Path(executable or sys.executable).resolve()
-        if exe.name!='super-md' or not exe.is_file():
-            return False
-        package=exe.parent
-        home_path=Path(home) if home is not None else Path.home()
-        resolved_home=home_path.resolve()
-        opt=(home_path/'.local/opt').resolve()
-        user_local=_is_user_local_package(package,opt)
-        if not user_local and not package.is_relative_to(resolved_home) and _is_system_package(package):
-            return False
-        _validate_package(package,require_user_owner=user_local)
+        package,_home_path,_opt,user_local=_resolve_portable_package(
+            executable,home,frozen=True,platform=platform
+        )
+        _check_package_identity(package,require_user_owner=user_local)
         return True
     except (OSError,RuntimeError,ValueError):
         return False
@@ -229,9 +263,12 @@ def _preflight_registration(home):
             _require_user_owned(target,label+' is not owned by the current user')
     return local,binary,desktop,icon_target,mime_target
 
-def register(package, home=None):
+def register(package, home=None, *, _validated=False):
     home=Path(home) if home is not None else Path.home()
-    package=Path(package).resolve()
+    raw_package=Path(package)
+    if not _validated:
+        _validate_package(raw_package,require_user_owner=True)
+    package=raw_package.resolve()
     local,binary,desktop,target,mime=_preflight_registration(home)
     icon=package/'_internal/resources/public/brand-mark-fixed.svg'
     if icon.is_symlink() or not icon.is_file() or not icon.resolve().is_relative_to(package):
@@ -295,24 +332,13 @@ def install_appimage(image, expected_version, integrate=True, home=None):
 
 def integrate_current(current_version, *, executable=None, home=None, frozen=None, platform=None):
     version(current_version)
-    platform=sys.platform if platform is None else platform
-    frozen=bool(getattr(sys,'frozen',False)) if frozen is None else bool(frozen)
-    if not platform.startswith('linux') or not frozen:
-        raise ValueError('Desktop integration is available for portable Linux builds only')
-    exe=Path(executable or sys.executable).resolve()
-    package=exe.parent
-    home_path=Path(home) if home is not None else Path.home()
-    resolved_home=home_path.resolve()
-    opt=(home_path/'.local/opt').resolve()
-    user_local=_is_user_local_package(package,opt)
-    if not user_local and not package.is_relative_to(resolved_home) and _is_system_package(package):
-        raise ValueError('Desktop integration is available for portable Linux builds only')
-    if exe.name!='super-md' or not exe.is_file():
-        raise ValueError('Extracted package identity mismatch')
+    package,home_path,opt,user_local=_resolve_portable_package(
+        executable,home,frozen=frozen,platform=platform
+    )
     _validate_package(package,expected_version=current_version,require_user_owner=user_local)
     _preflight_registration(home_path)
     if user_local:
-        register(package,home_path)
+        register(package,home_path,_validated=True)
         return str(package)
     opt.mkdir(parents=True,exist_ok=True)
     _require_user_owned(opt,'Installation directory is not owned by the current user')
@@ -332,7 +358,7 @@ def integrate_current(current_version, *, executable=None, home=None, frozen=Non
         _ensure_tree_user_writable(stage_dir)
         shutil.rmtree(stage_dir,ignore_errors=True)
     try:
-        register(destination,home_path)
+        register(destination,home_path,_validated=True)
     except Exception:
         if destination is not None:
             _ensure_tree_user_writable(destination)

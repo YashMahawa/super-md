@@ -354,10 +354,15 @@ class IntegrationTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         integration.integrate_current('1.2.3', home=home, **kwargs)
 
+                missing_icon_bundle = self.package(root / 'missing-icon', '1.2.3', relative_dir='usr/lib/super-md')
+                (missing_icon_bundle / '_internal/resources/public/brand-mark-fixed.svg').unlink()
+                self.assertFalse(integration.available(missing_icon_bundle / 'super-md', home, frozen=True, platform='linux'))
+
                 bad_symlink_bundle = self.package(root / 'bad-link', '1.2.3', relative_dir='usr/lib/super-md')
                 (bad_symlink_bundle / '_internal/escape').symlink_to(root / 'outside-secret')
-                self.assertFalse(integration.available(bad_symlink_bundle / 'super-md', home, frozen=True, platform='linux'))
-                with self.assertRaises(ValueError):
+                with patch.object(integration.os, 'walk', side_effect=AssertionError('available() must not call os.walk')):
+                    self.assertTrue(integration.available(bad_symlink_bundle / 'super-md', home, frozen=True, platform='linux'))
+                with self.assertRaisesRegex(ValueError, 'external symlink'):
                     integration.integrate_current('1.2.3', executable=bad_symlink_bundle / 'super-md', home=home, frozen=True, platform='linux')
 
                 unmanaged_desktop = home / '.local/share/applications/dev.supermd.studio.desktop'
@@ -473,3 +478,105 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(xdg_paths[0].read_bytes(), unmanaged_bytes)
             self.assertEqual(snapshot_modes(current), expected_modes)
             self.assertEqual(spy2.calls, [])
+
+    def test_available_skips_package_walk_while_integration_rejects_bad_symlinks_and_preserves_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / 'home'
+            previous = self.package(home / '.local/opt/super-md-qt-1.2.2', '1.2.2', binary_text='stable-1.2.2', relative_dir='')
+            (previous / '_internal/resources/public/brand-mark-fixed.svg').write_text('<svg id="stable"/>', encoding='utf-8')
+            with patch.object(integration.shutil, 'which', return_value=None):
+                integration.register(previous, home)
+
+            launcher = home / '.local/bin/super-md'
+            xdg_paths = (
+                home / '.local/share/applications/dev.supermd.studio.desktop',
+                home / '.local/share/icons/hicolor/scalable/apps/super-md.svg',
+                home / '.local/share/mime/packages/supermd.xml',
+            )
+            xdg_paths[0].chmod(0o640)
+            prior_xdg = {p: (p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in xdg_paths}
+
+            portable_bad_abs = self.package(root / 'portable-abs', '1.2.3', binary_text='abs-link', relative_dir='usr/lib/super-md')
+            (portable_bad_abs / '_internal/abs-escape').symlink_to(root / 'outside-secret')
+
+            portable_bad_rel = self.package(root / 'portable-rel', '1.2.3', binary_text='rel-link', relative_dir='usr/lib/super-md')
+            (portable_bad_rel / '_internal/rel-escape').symlink_to('../../../../outside-secret')
+
+            local_bad = self.package(home / '.local/opt/super-md-qt-1.2.3', '1.2.3', binary_text='local-bad', relative_dir='')
+            (local_bad / '_internal/local-escape').symlink_to('../../outside-secret')
+
+            broken_meta = self.package(root / 'broken-meta', '1.2.3', relative_dir='usr/lib/super-md')
+            (broken_meta / '_internal/resources/desktop/build-info.json').write_text('{invalid', encoding='utf-8')
+
+            with patch.object(integration.os, 'walk', side_effect=AssertionError('availability probe must not call os.walk')):
+                self.assertTrue(integration.available(previous / 'super-md', home, frozen=True, platform='linux'))
+                self.assertTrue(integration.available(portable_bad_abs / 'super-md', home, frozen=True, platform='linux'))
+                self.assertTrue(integration.available(local_bad / 'super-md', home, frozen=True, platform='linux'))
+                self.assertFalse(integration.available(broken_meta / 'super-md', home, frozen=True, platform='linux'))
+                with patch.object(integration, '_current_uid', return_value=os.geteuid() + 1):
+                    self.assertFalse(integration.available(previous / 'super-md', home, frozen=True, platform='linux'))
+
+            stack, spy = self.spy_subprocesses(which_map={'update-desktop-database': '/usr/bin/update-desktop-database'})
+            with stack:
+                for candidate in (portable_bad_abs, portable_bad_rel, local_bad):
+                    with self.assertRaisesRegex(ValueError, 'external symlink'):
+                        integration.integrate_current('1.2.3', executable=candidate / 'super-md', home=home, frozen=True, platform='linux')
+                    self.assertEqual(launcher.resolve(), (previous / 'super-md').resolve())
+                    self.assertEqual({p: (p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in xdg_paths}, prior_xdg)
+                    self.assertEqual(
+                        sorted(p.name for p in (home / '.local/opt').iterdir()),
+                        ['super-md-qt-1.2.2', 'super-md-qt-1.2.3'],
+                    )
+                with self.assertRaisesRegex(ValueError, 'external symlink'):
+                    integration.register(local_bad, home)
+                self.assertEqual(launcher.resolve(), (previous / 'super-md').resolve())
+                self.assertEqual({p: (p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in xdg_paths}, prior_xdg)
+
+                local_foreign = self.package(home / '.local/opt/super-md-qt-1.2.4', '1.2.4', binary_text='local-foreign', relative_dir='')
+                nested_foreign = (local_foreign / '_internal/libForeign.so').resolve()
+                nested_foreign.write_text('foreign-lib', encoding='utf-8')
+                real_lstat = Path.lstat
+
+                def fake_lstat(path_obj, *args, **kwargs):
+                    st = real_lstat(path_obj, *args, **kwargs)
+                    if path_obj == nested_foreign:
+                        return os.stat_result((
+                            st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                            st.st_uid + 1, st.st_gid, st.st_size,
+                            st.st_atime, st.st_mtime, st.st_ctime,
+                        ))
+                    return st
+
+                with patch.object(Path, 'lstat', fake_lstat):
+                    with patch.object(integration.os, 'walk', side_effect=AssertionError('availability probe must not call os.walk')):
+                        self.assertTrue(integration.available(local_foreign / 'super-md', home, frozen=True, platform='linux'))
+                    with self.assertRaisesRegex(ValueError, 'not owned by the current user'):
+                        integration.integrate_current('1.2.4', executable=local_foreign / 'super-md', home=home, frozen=True, platform='linux')
+                    with self.assertRaisesRegex(ValueError, 'not owned by the current user'):
+                        integration.register(local_foreign, home)
+                shutil_rmtree = integration.shutil.rmtree
+                shutil_rmtree(local_foreign)
+                self.assertEqual(launcher.resolve(), (previous / 'super-md').resolve())
+                self.assertEqual({p: (p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in xdg_paths}, prior_xdg)
+
+                clean_portable = self.package(root / 'clean-portable', '1.2.4', binary_text='clean-1.2.4', relative_dir='usr/lib/super-md')
+                real_copytree = integration.shutil.copytree
+
+                def inject_staged_bad_symlink(src, dst, *args, **kwargs):
+                    result = real_copytree(src, dst, *args, **kwargs)
+                    if Path(src) == clean_portable:
+                        (Path(dst) / '_internal/staged-escape').symlink_to(root / 'outside-secret')
+                    return result
+
+                with patch.object(integration.shutil, 'copytree', side_effect=inject_staged_bad_symlink):
+                    with self.assertRaisesRegex(ValueError, 'external symlink'):
+                        integration.integrate_current('1.2.4', executable=clean_portable / 'super-md', home=home, frozen=True, platform='linux')
+                self.assertEqual(launcher.resolve(), (previous / 'super-md').resolve())
+                self.assertEqual({p: (p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in xdg_paths}, prior_xdg)
+                self.assertEqual(
+                    sorted(p.name for p in (home / '.local/opt').iterdir()),
+                    ['super-md-qt-1.2.2', 'super-md-qt-1.2.3'],
+                )
+                self.assertEqual(spy.calls, [])
+                self.assertEqual(spy.popen_calls, [])
