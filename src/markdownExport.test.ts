@@ -83,6 +83,120 @@ describe("plain Markdown export assets", () => {
     expect(result.assets["media/cover.jpeg"]).toMatch(/^data:image\/jpeg;base64,/);
   });
 
+  it("selects the first duplicate reference definition, rewrites the selected asset, and preserves source offsets", async () => {
+    const firstEarlyPng = `data:image/png;base64,${btoa("early-first")}`;
+    const firstHeroSvg = `data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg"><circle cx="8" cy="8" r="6"/></svg>')}`;
+    const firstCoverJpg = `data:image/jpeg;base64,${btoa("cover-first")}`;
+    native.mockImplementation(async (command: string, args: { source: string }) => {
+      if (command === "load_asset" && args.source === "assets/import-early-first.png") return firstEarlyPng;
+      if (command === "load_text_asset" && args.source === "diagrams/first.mmd") return "graph TD\n  First-->Selected\n";
+      if (command === "load_asset" && args.source === "assets/image-first.svg") return firstHeroSvg;
+      if (command === "load_asset" && args.source === "media/first-cover.jpg") return firstCoverJpg;
+      throw new Error(`Unexpected asset load for shadowed definition: ${command} ${args.source}`);
+    });
+
+    const unrewrittenDuplicate = [
+      "---",
+      'title: "😀 Offset Check"',
+      "---",
+      "",
+      "Lead 😀 [[Vault Note]] paragraph.",
+      "",
+      "![Cover][cover]",
+      "",
+      '[cover]: media/first-cover.jpg "First cover"',
+      '[cover]: media/second-cover.jpg "Shadowed cover"',
+      "",
+      "Trailing 😀 [Guide](guide.md) paragraph.",
+      "",
+    ].join("\n");
+    const unrewrittenExport = await prepareMarkdownExport(unrewrittenDuplicate, "/notes/dup.md");
+    expect(unrewrittenExport.content).toBe(unrewrittenDuplicate);
+    expect(unrewrittenExport.assets).toEqual({ "media/first-cover.jpg": firstCoverJpg });
+    expect(unrewrittenExport.content.indexOf("![Cover][cover]")).toBe(unrewrittenDuplicate.indexOf("![Cover][cover]"));
+    expect(unrewrittenExport.content.indexOf("Trailing 😀 [Guide](guide.md)")).toBe(
+      unrewrittenDuplicate.indexOf("Trailing 😀 [Guide](guide.md)"),
+    );
+
+    native.mockClear();
+    const rewriteSource = [
+      "---",
+      'title: "😀 Duplicate References"',
+      "---",
+      "",
+      "[early]: assets/import-early-first.png",
+      "[early]: ../shadowed-outside.png",
+      "",
+      "Lead 😀 [[Vault Note]] before figures.",
+      "",
+      "![Early Hero][early]",
+      "",
+      "[Flow][chart   ref]",
+      "",
+      "![Vector][HERO svg]",
+      "",
+      "![Cover][cover]",
+      "",
+      "[chart ref]: diagrams/first.mmd",
+      "[CHART   REF]: diagrams/shadowed.mmd",
+      '[Hero   SVG]: assets/image-first.svg "Selected vector"',
+      '[hero svg]: assets/image-second.svg "Shadowed vector"',
+      '[cover]: media/first-cover.jpg "Selected cover"',
+      '[cover]: https://untrusted.example/shadowed-cover.jpg "Shadowed remote"',
+      "",
+      "Trailing 😀 [Manual](guide.md) paragraph.",
+      "",
+    ].join("\n");
+
+    const expectedExported = [
+      "---",
+      'title: "😀 Duplicate References"',
+      "---",
+      "",
+      "[early]: ../shadowed-outside.png",
+      "",
+      "Lead 😀 [[Vault Note]] before figures.",
+      "",
+      "![Early Hero](<image1.png>)",
+      "",
+      "",
+      "",
+      "```mermaid",
+      "graph TD",
+      "  First-->Selected",
+      "```",
+      "",
+      "",
+      "",
+      "![Vector](<image2.svg>)",
+      "",
+      "![Cover][cover]",
+      "",
+      "[CHART   REF]: diagrams/shadowed.mmd",
+      '[hero svg]: assets/image-second.svg "Shadowed vector"',
+      '[cover]: media/first-cover.jpg "Selected cover"',
+      '[cover]: https://untrusted.example/shadowed-cover.jpg "Shadowed remote"',
+      "",
+      "Trailing 😀 [Manual](guide.md) paragraph.",
+      "",
+    ].join("\n");
+
+    const plainResult = await prepareMarkdownExport(rewriteSource, "/notes/dup.smd");
+    expect(plainResult.content).toBe(expectedExported);
+    expect(plainResult.assets).toEqual({
+      "image1.png": firstEarlyPng,
+      "image2.svg": firstHeroSvg,
+      "media/first-cover.jpg": firstCoverJpg,
+    });
+    expect(native).toHaveBeenCalledTimes(4);
+
+    native.mockClear();
+    const compatibleResult = await prepareMarkdownExport(rewriteSource, "/notes/dup.smd", { compatible: true });
+    expect(compatibleResult.content).toBe(expectedExported);
+    expect(compatibleResult.assets).toEqual(plainResult.assets);
+    expect(native).toHaveBeenCalledTimes(4);
+  });
+
   it("rewrites reference-style generated SVG to a companion SVG asset and removes the generated definition", async () => {
     native.mockImplementation(async (_command: string, args: any) => {
       if (args.source === "image1.svg") return "data:image/svg+xml;base64,PHN2Zz48Y2lyY2xlLz48L3N2Zz4=";

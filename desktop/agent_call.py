@@ -1,5 +1,5 @@
 """CLI access to the identical named tools exposed by the MCP server."""
-import asyncio,base64,json
+import asyncio,base64
 from pathlib import Path
 
 def call(roots,tool,arguments,*,sessions=None,output=None):
@@ -20,7 +20,6 @@ def call(roots,tool,arguments,*,sessions=None,output=None):
         from agent_documents import DocumentStore
         path=DocumentStore(roots).resolve(path,must_exist=False)
         if path.exists() or path.suffix.lower()!='.png' or image.get('mimeType',image.get('mime_type'))!='image/png':raise ValueError('Choose a new .png output filename')
-        from documents import atomic_write
         with path.open('xb') as handle:handle.write(base64.b64decode(image['data'],validate=True))
         value['content']=[block for block in value['content'] if block.get('type')!='image']
         value['imageOutput']=str(path)

@@ -2,7 +2,6 @@
 
 package dev.supermd.studio
 
-import android.app.Activity
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.pm.ProviderInfo
@@ -76,7 +75,6 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.shadows.ShadowContentResolver
-import org.robolectric.shadows.ShadowWindowManagerGlobal
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], qualifiers = "w360dp-h800dp-xxhdpi")
