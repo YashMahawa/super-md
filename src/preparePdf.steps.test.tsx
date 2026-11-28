@@ -46,6 +46,62 @@ it("keeps step Markdown and LaTeX as formatted export content",async()=>{
   expect(grid.steps[1].markdown).toContain('First item');
 });
 
+it("preserves mixed nested task lists, headings, source text, and footnotes when preparing smd-steps",async()=>{
+  const deck={
+    title:'Release Readiness',
+    steps:[
+      {
+        label:'Checklist',
+        markdown:[
+          '### Step Tasks',
+          '',
+          '- [x] Checked parent',
+          '  - [ ] Unchecked nested task',
+          '  - [X] Checked uppercase nested task',
+          '  - Plain nested bullet',
+          '- [ ] Unchecked sibling with `- [ ] raw` literal',
+        ].join('\n'),
+      },
+      {
+        label:'Notes',
+        markdown:'### Follow-up\n\n1. [x] Ordered checked\n2. [ ] Ordered unchecked',
+      },
+    ],
+  };
+  const source=[
+    '# Document Title',
+    '',
+    'Overview with footnote[^1].',
+    '',
+    '```smd-steps',
+    JSON.stringify(deck),
+    '```',
+    '',
+    '## Closing Section',
+    '',
+    '[^1]: Preserved footnote explanation.',
+    '',
+  ].join('\n');
+  const originalSource=source;
+  const prepared=await preparePdf(source,'/notes/tasks.md');
+  expect(source).toBe(originalSource);
+  expect(source).toContain('```smd-steps');
+  expect(prepared.content).toContain('# Document Title');
+  expect(prepared.content).toContain('Overview with footnote[^1].');
+  expect(prepared.content).toContain('## Closing Section');
+  expect(prepared.content).toContain('[^1]: Preserved footnote explanation.');
+  const grid=JSON.parse(/```smd-step-grid\n([\s\S]*?)\n```/.exec(prepared.content)![1]);
+  expect(grid.steps[0].markdown).toContain('### Step Tasks');
+  expect(grid.steps[0].markdown).toMatch(/^\* \[x\] Checked parent$/m);
+  expect(grid.steps[0].markdown).toMatch(/^  \* \[ \] Unchecked nested task$/m);
+  expect(grid.steps[0].markdown).toMatch(/^  \* \[x\] Checked uppercase nested task$/m);
+  expect(grid.steps[0].markdown).toMatch(/^  \* Plain nested bullet$/m);
+  expect(grid.steps[0].markdown).toContain('`- [ ] raw`');
+  expect(grid.steps[1].markdown).toContain('### Follow-up');
+  expect(grid.steps[1].markdown).toMatch(/^1\. \[x\] Ordered checked$/m);
+  expect(grid.steps[1].markdown).toMatch(/^2\. \[ \] Ordered unchecked$/m);
+});
+
 it("exports smd-chart point arrays and code literals alongside prose wikilinks and callouts without JSON corruption",async()=>{
   const source=[
     ':::callout tip Overview',

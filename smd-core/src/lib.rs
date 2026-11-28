@@ -1181,7 +1181,8 @@ impl<'a> Renderer<'a> {
                             let heading = if matches!(tag, Tag::Heading { .. }) {
                                 let plain = self.events.clone().take_while(|e| !matches!(e, Event::End(TagEnd::Heading(_)))).filter_map(|e| match e { Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => Some(v.to_string()), _ => None }).collect::<String>();
                                 let slug = heading_slug(&plain); let count = self.heading_counts.entry(slug.clone()).or_default();
-                                let id = if *count == 0 { slug } else { format!("{slug}-{count}") }; *count += 1; Some(id)
+                                let id = if *count == 0 { slug } else { format!("{slug}-{count}") }; *count += 1;
+                                Some(if self.headings.is_empty() { format!("fragment-{id}") } else { id })
                             } else { None };
                             if matches!(tag, Tag::Link { .. }) {
                                 self.link_depth += 1;
@@ -1236,7 +1237,7 @@ pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>)
     let body = frontmatter::strip_frontmatter(markdown);
     let stripped = strip_percent_comments(body);
     let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
-    let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
+    let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH);
     let mut equations = HashMap::new();
     for event in &events {
         if let Event::DisplayMath(v) = event {

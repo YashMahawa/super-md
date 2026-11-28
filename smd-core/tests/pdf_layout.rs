@@ -153,6 +153,123 @@ fn headings_and_lists_keep_breathing_room_in_typeset_output() {
 }
 
 #[test]
+fn step_cards_render_mixed_nested_task_checkboxes_in_headless_pdf_while_preserving_headings_source_and_footnotes() {
+    let figure_svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="140"><rect x="4" y="4" width="232" height="132" rx="8" fill="#e8f3ee" stroke="#386a57"/></svg>"##.to_vec();
+    let assets = HashMap::from([("step-fig.svg".to_string(), figure_svg)]);
+    let prep_md = [
+        "### Review Section",
+        "",
+        "- [x] Calibrate sensor",
+        "  - [ ] Verify zero offset",
+        "    - [x] Record baseline reading",
+        "  - [X] Confirm thermal equilibrium",
+        "  - Plain nested observation",
+        "- [ ] Run sweep with `- [ ] raw_flag` and `[x]` literal",
+    ]
+    .join("\n");
+    let summary_md = [
+        "### Review Section",
+        "",
+        "1. [x] Archive dataset",
+        "2. [ ] Publish digest with step token[^local]",
+    ]
+    .join("\n");
+    let deck = serde_json::json!({
+        "title": "Lab Sequence",
+        "steps": [
+            {
+                "label": "Preparation",
+                "image": "step-fig.svg",
+                "markdown": prep_md,
+            },
+            {
+                "label": "Summary",
+                "markdown": summary_md,
+            }
+        ]
+    });
+    let original_source = format!(
+        "# Review Section\n\nJump to [Review Section](#review-section) and [Closing Heading](#closing-heading) with citation[^1].\n\n```smd-steps\n{deck}\n```\n\n## Closing Heading\n\nBody text after steps.\n\n[^1]: Headless footnote body preserved.\n"
+    );
+    let snapshot = original_source.clone();
+
+    let typst_src = source(&original_source, &PdfOptions::default(), &assets).unwrap();
+    assert_eq!(original_source, snapshot, "source() must leave caller Markdown untouched");
+    assert_eq!(typst_src.matches("#text(\"☑ \u{a0}\")").count(), 4, "{typst_src}");
+    assert_eq!(typst_src.matches("#text(\"☐ \u{a0}\")").count(), 3, "{typst_src}");
+    assert!(!typst_src.contains("[x] Calibrate"), "{typst_src}");
+    assert!(!typst_src.contains("[ ] Verify"), "{typst_src}");
+    assert!(!typst_src.contains("[X] Confirm"), "{typst_src}");
+    assert!(typst_src.contains("#raw(\"- [ ] raw_flag\")"), "{typst_src}");
+    assert!(typst_src.contains("#raw(\"[x]\")"), "{typst_src}");
+    assert_eq!(typst_src.matches("#footnote[").count(), 1, "{typst_src}");
+
+    let pdf = export(&original_source, &PdfOptions::default(), &assets).unwrap();
+    assert_eq!(original_source, snapshot, "export() must leave caller Markdown untouched");
+    assert!(pdf.starts_with(b"%PDF-"));
+    assert_eq!(count_pdf_pages(&pdf), 1);
+
+    let dir = std::env::temp_dir().join(format!("supermd-steps-tasks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf_path = dir.join("steps-tasks.pdf");
+    std::fs::write(&pdf_path, &pdf).unwrap();
+    let txt_res = std::process::Command::new("pdftotext").arg(&pdf_path).arg("-").output();
+    let bbox_res = std::process::Command::new("pdftotext").arg("-bbox").arg(&pdf_path).arg("-").output();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if require_poppler() {
+        assert!(txt_res.as_ref().is_ok_and(|o| o.status.success()), "Poppler pdftotext must succeed on Linux CI");
+        assert!(bbox_res.as_ref().is_ok_and(|o| o.status.success()), "Poppler pdftotext -bbox must succeed on Linux CI");
+    }
+    if let Ok(out) = txt_res {
+        if out.status.success() {
+            let extracted = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(extracted.matches('☑').count(), 4, "Expected 4 checked glyphs in PDF text:\n{extracted}");
+            assert_eq!(extracted.matches('☐').count(), 3, "Expected 3 unchecked glyphs in PDF text:\n{extracted}");
+            for expected in [
+                "Review Section",
+                "Lab Sequence",
+                "Preparation",
+                "Calibrate sensor",
+                "Verify zero offset",
+                "Record baseline reading",
+                "Confirm thermal equilibrium",
+                "Plain nested observation",
+                "- [ ] raw_flag",
+                "[x]",
+                "Summary",
+                "Archive dataset",
+                "Publish digest with step token[^local]",
+                "Closing Heading",
+                "Body text after steps.",
+                "Headless footnote body preserved.",
+            ] {
+                assert!(extracted.contains(expected), "Missing {expected:?} in extracted PDF text:\n{extracted}");
+            }
+            for leaked in ["[x] Calibrate", "[ ] Verify", "[x] Record", "[X] Confirm", "[ ] Run sweep", "[x] Archive", "[ ] Publish"] {
+                assert!(!extracted.contains(leaked), "Raw task bracket {leaked:?} leaked into PDF:\n{extracted}");
+            }
+        }
+    }
+    if let Ok(bbox_out) = bbox_res {
+        if bbox_out.status.success() {
+            let xml = String::from_utf8_lossy(&bbox_out.stdout);
+            if xml.contains("<word ") {
+                let x_of = |needle: &str| -> f64 {
+                    let line = xml.lines().find(|l| l.contains("<word ") && l.contains(needle))
+                        .unwrap_or_else(|| panic!("missing word {needle} in bbox:\n{xml}"));
+                    line.split("xMin=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap()
+                };
+                // Nested task levels indent progressively to the right inside the step card.
+                assert!(x_of("Verify") > x_of("Calibrate") + 6.0, "Child task must indent right of parent task");
+                assert!(x_of("Record") > x_of("Verify") + 6.0, "Grandchild task must indent right of child task");
+            }
+        }
+    }
+}
+
+#[test]
 fn staged_pdf_assets_include_only_referenced_images_and_custom_fonts() {
     let temp=std::env::temp_dir().join(format!("supermd-pdf-assets-{}",std::process::id()));
     std::fs::create_dir(&temp).unwrap();
