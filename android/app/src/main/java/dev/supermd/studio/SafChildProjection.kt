@@ -208,7 +208,7 @@ internal fun listSafFolderListing(
     pass: SafProjectionPass = SafProjectionPass(resolver),
 ): SafFolderListing {
     require(!hasInvalidSafFolderRelative(relative)) { "Invalid folder path" }
-    val normalizedRequested = normalizeFolderRelative(relative)
+    val normalizedRequested = normalizeRelativePath(relative)
     val segments = normalizedRequested.split('/').filter { it.isNotEmpty() }
     val (treeUri, rootDocumentId) = documentAccess.resolveReadableTreeRoot(folderUri)
         ?: error("Choose the folder again to restore access")
@@ -245,14 +245,6 @@ internal fun listSafFolderListing(
     }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase(Locale.ROOT) })
     return SafFolderListing(actualRelative, entries)
 }
-
-internal fun listSafFolderEntries(
-    resolver: ContentResolver,
-    documentAccess: DocumentAccess,
-    folderUri: Uri,
-    relative: String,
-    pass: SafProjectionPass = SafProjectionPass(resolver),
-): List<FileEntry> = listSafFolderListing(resolver, documentAccess, folderUri, relative, pass).entries
 
 internal fun refreshSafWorkspaceMetadata(
     resolver: ContentResolver,

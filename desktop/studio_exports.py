@@ -13,9 +13,9 @@ except ImportError:
 
 EXPORT_SUFFIXES = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
 PAYLOAD_FORMATS = {".pdf": "pdf", ".smd": "smd", ".md": "md", ".markdown": "md", ".txt": "md", ".zip": "mdzip"}
-AGENT_EXPORT_EXTENSIONS = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}
-AGENT_EXPORT_COMMANDS = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native"}
-AGENT_EXPORT_MIMES = {"pdf": "application/pdf", "smd": "application/x-supermd", "md": "text/markdown"}
+AGENT_EXPORT_EXTENSIONS = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
+AGENT_EXPORT_COMMANDS = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native", "mdzip": "export_markdown_native"}
+AGENT_EXPORT_MIMES = {"pdf": "application/pdf", "smd": "application/x-supermd", "md": "text/markdown", "mdzip": "application/zip"}
 
 
 def _studio_module():
@@ -101,7 +101,7 @@ def agent_export_native(studio_obj, request_id: str, args: dict) -> None:
         raise ValueError("Export the currently active live tab")
     fmt = args.get("format")
     if fmt not in AGENT_EXPORT_EXTENSIONS:
-        raise ValueError("Export format must be PDF, SMD or Markdown")
+        raise ValueError("export format must be pdf, smd, md, or mdzip")
     expected = args.get("expectedRevision")
     current = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
     if not isinstance(expected, str) or expected != current:
@@ -125,6 +125,11 @@ def agent_export_native(studio_obj, request_id: str, args: dict) -> None:
         options = {**_studio_module().DEFAULT_PDF, **studio_obj.settings.get("pdf", {}), **supplied}
         options["themeAccent"] = supplied.get("themeAccent") or studio_obj._colors().get("primary", "#386a57")
         options = validate_pdf_options(options)
+    elif not isinstance(options, dict):
+        raise ValueError("Export options must be an object")
+    archive = bool(args.get("archive")) or bool(options.get("archive")) or fmt == "mdzip"
+    if archive and fmt == "md":
+        fmt = "mdzip"
     output = studio_obj._agent_export_path(args.get("filename", ""), fmt, target)
     studio_obj.pending_export = str(output)
     job_id = uuid.uuid4().hex
@@ -147,7 +152,7 @@ def agent_export_native(studio_obj, request_id: str, args: dict) -> None:
     command = AGENT_EXPORT_COMMANDS[fmt]
     forwarded = {
         "id": tab_id, "content": content, "assets": assets, "options": options,
-        "expectedRevision": expected, "save": False, "jobId": job_id,
+        "expectedRevision": expected, "save": False, "jobId": job_id, "archive": archive,
     }
     try:
         studio_obj.post(request_id, command, json.dumps(forwarded, ensure_ascii=False, separators=(",", ":")))
