@@ -45,16 +45,82 @@ private data class AgentExportArtifact(
 internal class AgentWindowController(
     private val activity: MainActivity,
     private val onRelayStateChange: (AgentRelayClient.State) -> Unit,
+    private val onRelayRetryingChange: (Boolean) -> Unit,
 ) {
     private val agentExportJobs = ConcurrentHashMap<String, JSONObject>()
     private val agentExportArtifacts = ConcurrentHashMap<String, AgentExportArtifact>()
     private val pendingAgentReplies = ConcurrentHashMap<String, (Any?, String?) -> Unit>()
     private val pendingAgentReplyTimeouts = ConcurrentHashMap<String, Runnable>()
     private val agentMainHandler = Handler(Looper.getMainLooper())
-    private val agentRelayClient: AgentRelayClient by lazy { AgentRelayClient(onRelayStateChange) }
+    private val agentRelayClient: AgentRelayClient by lazy {
+        AgentRelayClient(
+            onState = onRelayStateChange,
+            onRetrying = onRelayRetryingChange,
+            callFactory = activity.agentRelayCallFactoryForTest,
+            webSocketFactory = activity.agentRelayWebSocketFactoryForTest,
+        )
+    }
     private var relayIdentity: String? = null
-    internal fun onStop() { agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies() }
-    internal fun agentConfigForThisWindow(): AgentAccessConfig? = activity.agentAccessState.configForWorkspace(activity.agentWorkspaceKey)
+    private var activityStopped = false
+    private val relayGraceTimerOwner = Any()
+    private var relayGraceTimerActive = false
+    @Volatile private var currentReaderWebView: WebView? = null
+    private val backgroundDisconnectRunnable = Runnable {
+        if (activityStopped) disconnectRelayNow()
+    }
+    internal fun attachCurrentReaderWebView(reader: WebView?) {
+        currentReaderWebView = reader
+    }
+    private fun setRelayGraceTimerLease(active: Boolean) {
+        if (relayGraceTimerActive == active) return
+        relayGraceTimerActive = active
+        val action = if (active) ReaderTimerOwners.process.acquire(relayGraceTimerOwner, true)
+        else ReaderTimerOwners.process.release(relayGraceTimerOwner)
+        val reader = currentReaderWebView ?: return
+        when (action) {
+            ReaderTimerOwners.GlobalAction.PAUSE -> reader.pauseTimers()
+            ReaderTimerOwners.GlobalAction.RESUME -> reader.resumeTimers()
+            ReaderTimerOwners.GlobalAction.NONE -> Unit
+        }
+    }
+    internal fun disconnectRelayNow() {
+        agentMainHandler.removeCallbacks(backgroundDisconnectRunnable)
+        setRelayGraceTimerLease(false)
+        agentRelayClient.disconnect()
+        relayIdentity = null
+        clearPendingAgentReplies()
+    }
+    internal fun onStart() {
+        activityStopped = false
+        agentMainHandler.removeCallbacks(backgroundDisconnectRunnable)
+        setRelayGraceTimerLease(false)
+        activity.syncAgentAccessUiState()
+    }
+    internal fun onResume() {
+        activityStopped = false
+        agentMainHandler.removeCallbacks(backgroundDisconnectRunnable)
+        setRelayGraceTimerLease(false)
+        activity.syncAgentAccessUiState()
+    }
+    internal fun onStop() {
+        activityStopped = true
+        val keepDuringGrace = !activity.isChangingConfigurations && !activity.isFinishing &&
+            activity.agentAccessState.enabled && agentConfigForThisWindow() != null && activity.agentBackgroundGraceMillis > 0L
+        if (keepDuringGrace) {
+            setRelayGraceTimerLease(true)
+            agentMainHandler.removeCallbacks(backgroundDisconnectRunnable)
+            agentMainHandler.postDelayed(backgroundDisconnectRunnable, activity.agentBackgroundGraceMillis)
+        } else {
+            disconnectRelayNow()
+        }
+    }
+    internal fun onDestroy() {
+        activityStopped = true
+        disconnectRelayNow()
+        currentReaderWebView = null
+    }
+    internal fun agentConfigForThisWindow(): AgentAccessConfig? =
+        activity.agentConfigOverrideForTest ?: activity.agentAccessState.configForWorkspace(activity.agentWorkspaceKey)
     internal fun localAgentTabId(value: String): String? {
         if (value.isBlank()) return null
         if (!value.startsWith("tab:")) return value.takeIf { ':' !in it }
@@ -152,16 +218,16 @@ internal class AgentWindowController(
     internal fun revokeAgentAccess(completion: (serverRevoked: Boolean) -> Unit) {
         val configs = activity.agentAccessState.allConfigs()
         activity.agentAccessState.setEnabled(false)
-        agentRelayClient.disconnect()
-        relayIdentity = null
-        clearPendingAgentReplies()
-        if (configs.isEmpty()) { activity.agentAccessState.revoke(); completion(true); return }
+        activity.syncAgentAccessUiState()
+        disconnectRelayNow()
+        if (configs.isEmpty()) { activity.agentAccessState.revoke(); activity.syncAgentAccessUiState(); completion(true); return }
         val remaining = AtomicInteger(configs.size)
         val allRevoked = AtomicBoolean(true)
         configs.forEach { config -> agentRelayClient.revokeDevice(config) { revoked ->
             if (!revoked) allRevoked.set(false)
             if (remaining.decrementAndGet() == 0) {
                 activity.agentAccessState.revoke()
+                activity.syncAgentAccessUiState()
                 clearPendingAgentReplies()
                 completion(allRevoked.get())
             }
@@ -264,16 +330,18 @@ internal class AgentWindowController(
     }
     internal fun refreshAgentRelay(
         currentRelayState: AgentRelayClient.State,
+        currentRelayRetrying: Boolean,
         uiHandlerProvider: () -> ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?,
         bridgeHandlerProvider: () -> ((JSONObject, (Any?, String?) -> Unit) -> Unit)?,
     ) {
+        activity.syncAgentAccessUiState()
         if (!activity.agentAccessState.enabled) {
-            agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return
+            disconnectRelayNow(); return
         }
         val config = agentConfigForThisWindow()
-        if (config == null) { agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return }
+        if (config == null) { disconnectRelayNow(); return }
         val identity = "${config.groupId}:${config.deviceId}"
-        if (identity == relayIdentity && currentRelayState != AgentRelayClient.State.DISCONNECTED) return
+        if (identity == relayIdentity && (currentRelayState != AgentRelayClient.State.DISCONNECTED || currentRelayRetrying)) return
         relayIdentity = identity
         agentRelayClient.connect(config) { request, reply ->
             val ui = uiHandlerProvider()

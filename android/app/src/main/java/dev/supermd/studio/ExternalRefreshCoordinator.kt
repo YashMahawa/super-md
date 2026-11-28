@@ -141,6 +141,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
             current.id !in closingNoteIds &&
             current.id !in conflictedTabIds &&
             !current.dirty &&
+            !current.agentStaged &&
             current.content == snapshotNote(snapshot).content &&
             baselineMatchesRefreshSnapshot(current, snapshot)
 
@@ -148,7 +149,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
         current != null &&
             current.id !in closingNoteIds &&
             current.id !in conflictedTabIds &&
-            current.dirty &&
+            (current.dirty || current.agentStaged) &&
             baselineMatchesRefreshSnapshot(current, snapshot)
 
     private fun completePendingRefresh(snapshotGen: Long) {
@@ -269,7 +270,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                                 newlyBlockedUris[noteUriRaw] = clearSeq
                             }
                         }
-                        if (note.dirty) {
+                        if (note.dirty || note.agentStaged) {
                             val expectedAssets = if (note.portable) {
                                 preIoBaselineAssets(snapshot) ?: baselinePortableAssets(note).also { writeResolvedBaseline(snapshot, it) }
                             } else null
@@ -391,6 +392,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                                 update != null &&
                                 expected != null &&
                                 !tab.dirty &&
+                                !tab.agentStaged &&
                                 tab.id !in s.conflictedTabIds &&
                                 tab.uri == expected.uri &&
                                 tab.content == expected.content &&

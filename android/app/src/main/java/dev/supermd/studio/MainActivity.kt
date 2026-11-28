@@ -46,11 +46,14 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -81,6 +84,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.first
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
@@ -124,10 +128,22 @@ class MainActivity : ComponentActivity() {
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
+    var agentRelayRetrying by mutableStateOf(false)
+        private set
+    var agentAccessEnabled by mutableStateOf(false)
+        private set
+    internal var agentBackgroundGraceMillis: Long = DEFAULT_AGENT_BACKGROUND_GRACE_MILLIS
+    internal var agentConfigOverrideForTest: AgentAccessConfig? = null
+    internal var agentRelayCallFactoryForTest: okhttp3.Call.Factory? = null
+    internal var agentRelayWebSocketFactoryForTest: okhttp3.WebSocket.Factory? = null
     @Volatile private var agentBridgeHandler: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = null
     @Volatile private var agentUiHandler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)? = null
     @Volatile private var agentExportHandler: ((JSONObject) -> Unit)? = null
-    private val agentController = AgentWindowController(this) { agentRelayState = it }
+    private val agentController = AgentWindowController(
+        activity = this,
+        onRelayStateChange = { agentRelayState = it },
+        onRelayRetryingChange = { agentRelayRetrying = it },
+    )
     private var workspaceKey = "main"
     internal val agentWorkspaceKey: String get() = workspaceKey
     @androidx.annotation.VisibleForTesting
@@ -139,6 +155,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         workspaceKey = (savedInstanceState?.getString("workspace") ?: intent.getStringExtra("workspace") ?: "main").takeIf { it == "main" || runCatching { java.util.UUID.fromString(it) }.isSuccess } ?: "main"
+        syncAgentAccessUiState()
         enableEdgeToEdge()
         if (Build.VERSION.SDK_INT >= 28) window.attributes = window.attributes.apply { layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS else WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES }
         // Create this task's workspace before RESUMED/lifecycle consumers can
@@ -206,8 +223,15 @@ class MainActivity : ComponentActivity() {
         model.retainDocumentAccess(uri)
         model.requestOpen(uri, relative)
     }
+    internal fun syncAgentAccessUiState() {
+        agentAccessEnabled = agentAccessState.enabled && agentConfigForThisWindow() != null
+    }
+    internal fun attachCurrentReaderWebView(reader: WebView?) = agentController.attachCurrentReaderWebView(reader)
+    internal fun disconnectRelayNow() = agentController.disconnectRelayNow()
+    override fun onStart() { super.onStart(); agentController.onStart() }
     override fun onStop() { saveReaderPosition?.invoke(); model.flush(); agentController.onStop(); super.onStop() }
-    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal(); model.reloadCustomTheme(); refreshAgentRelay() }
+    override fun onDestroy() { agentController.onDestroy(); super.onDestroy() }
+    override fun onResume() { super.onResume(); agentController.onResume(); model.refreshMetadata(); model.refreshExternal(); model.reloadCustomTheme(); refreshAgentRelay() }
     internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentController.agentConfigForThisWindow()
     internal fun localAgentTabId(value: String): String? = agentController.localAgentTabId(value)
     internal fun setAgentRequestHandlers(bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)?, ui: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?) { agentBridgeHandler = bridge; agentUiHandler = ui }
@@ -226,7 +250,7 @@ class MainActivity : ComponentActivity() {
     internal fun agentRevision(value: String): String = agentController.agentRevision(value)
     internal fun agentSourceLength(value: String): Int = agentController.agentSourceLength(value)
     internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject = agentController.captureAgentViewport(reader, requestedWidth, imageFormat, model)
-    internal fun refreshAgentRelay() = agentController.refreshAgentRelay(agentRelayState, { agentUiHandler }, { agentBridgeHandler })
+    internal fun refreshAgentRelay() = agentController.refreshAgentRelay(agentRelayState, agentRelayRetrying, { agentUiHandler }, { agentBridgeHandler })
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN) {
             if (canFormatEditor?.invoke() == true) {
@@ -296,8 +320,7 @@ class MainActivity : ComponentActivity() {
     }
     companion object {
         private const val OPEN_DISPATCHER_SESSION = "open_dispatcher_session"
-        private const val MAX_AGENT_EXPORT_BYTES = 128L * 1024 * 1024
-        private const val AGENT_EXPORT_LEASE_MILLIS = 10L * 60 * 1000
+        internal const val DEFAULT_AGENT_BACKGROUND_GRACE_MILLIS = 3L * 60L * 1000L
         @Volatile
         @androidx.annotation.VisibleForTesting
         internal var defaultActivityResultRegistryOwnerForTest: androidx.activity.result.ActivityResultRegistryOwner? = null
@@ -305,6 +328,99 @@ class MainActivity : ComponentActivity() {
     fun newWindow() {
         model.flush()
         startActivity(Intent(this, MainActivity::class.java).putExtra("workspace", java.util.UUID.randomUUID().toString()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT))
+    }
+}
+
+internal data class AgentStatusPillUi(val visible: Boolean, val label: String, val stateKey: String)
+
+internal fun sendAgentBridgeReply(
+    activity: MainActivity,
+    model: StudioViewModel,
+    targetId: String,
+    result: Any?,
+    error: String?,
+    reply: (Any?, String?) -> Unit,
+) {
+    val current = model.state.value.tabs.firstOrNull { it.id == targetId }
+    val knownConflict = error?.takeIf { message ->
+        message.contains("revision conflict", ignoreCase = true) ||
+            message.contains("changed since the supplied revision", ignoreCase = true) ||
+            message.contains("changed since the expected revision", ignoreCase = true)
+    }
+    if (knownConflict != null && current != null) {
+        reply(null, JSONObject().put("error", knownConflict).put("currentRevision", activity.agentRevision(current.content))
+            .put("sourceLength", activity.agentSourceLength(current.content)).toString())
+    } else reply(result, error)
+}
+
+internal fun handleInactiveTabSnapshotRequest(
+    activity: MainActivity,
+    model: StudioViewModel,
+    scope: kotlinx.coroutines.CoroutineScope,
+    web: WebView,
+    request: JSONObject,
+    target: String,
+    snapshot: Note,
+    canonicalTabId: (Note) -> String,
+    reply: (Any?, String?) -> Unit,
+) {
+    if (request.optString("action") !in setOf("read_tab", "search_tab", "outline_tab", "list_diagrams", "get_diagram", "patch_tab")) {
+        reply(null, "This Android action requires the requested tab to be active")
+        return
+    }
+    val contentBytes = snapshot.content.toByteArray(Charsets.UTF_8)
+    if (contentBytes.size > MAX_AGENT_SNAPSHOT_BYTES) { reply(null, "This document exceeds Android's 2 MiB inactive-tab snapshot limit; activate it and retry"); return }
+    val compute = JSONObject().put("requestId", request.optString("requestId"))
+        .put("action", request.optString("action")).put("tabId", target).put("content", snapshot.content)
+    listOf("expectedRevision", "operations", "offset", "limit", "query", "context", "heading", "view", "diagramId", "caseSensitive", "wholeWord", "regex", "excludeDiagrams")
+        .forEach { key -> if (request.has(key)) compute.put(key, request.get(key)) }
+    if (request.has("expectedRevision")) compute.put("expectedRevision", request.getString("expectedRevision").lowercase())
+    activity.dispatchAgentCompute(web, compute) { raw, error ->
+        if (error != null) { reply(null, error); return@dispatchAgentCompute }
+        val result = raw as? JSONObject
+        if (result == null) { reply(null, "Android could not read the computed document result"); return@dispatchAgentCompute }
+        val snapshotRevision = activity.agentRevision(snapshot.content)
+        if (result.optString("tabId") != target) {
+            reply(null, "The document result did not match the captured Android note snapshot")
+            return@dispatchAgentCompute
+        }
+        if (request.optString("action") == "patch_tab") {
+            val patchedContent = result.optString("patchedContent", "")
+            if (!result.optString("baseRevision").equals(snapshotRevision, ignoreCase = true) ||
+                result.optInt("baseSourceLength", -1) != activity.agentSourceLength(snapshot.content) ||
+                result.optInt("sourceLength", -1) != activity.agentSourceLength(patchedContent) ||
+                !request.optString("expectedRevision").equals(snapshotRevision, ignoreCase = true)) {
+                sendAgentBridgeReply(activity, model, target, null, "Revision conflict: the note changed; read it again before editing", reply)
+                return@dispatchAgentCompute
+            }
+            scope.launch {
+                runCatching {
+                    model.commitAgentSnapshotPatch(target, snapshotRevision, patchedContent, result.optString("revision"))
+                }.onFailure { sendAgentBridgeReply(activity, model, target, null, it.message ?: "Could not save the inactive-tab patch", reply) }
+                    .onSuccess { result.remove("patchedContent"); result.put("tabId", canonicalTabId(snapshot)); reply(result, null) }
+            }
+        } else {
+            if (!result.optString("revision").equals(snapshotRevision, ignoreCase = true) || result.optInt("sourceLength", -1) != activity.agentSourceLength(snapshot.content)) {
+                reply(null, "The document revision changed while Android was reading it; retry")
+            } else {
+                result.put("tabId", canonicalTabId(snapshot))
+                reply(result, null)
+            }
+        }
+    }
+}
+
+internal fun resolveAgentStatusPillUi(
+    accessEnabled: Boolean,
+    relayState: AgentRelayClient.State,
+    retrying: Boolean,
+): AgentStatusPillUi {
+    val visible = accessEnabled || relayState != AgentRelayClient.State.DISCONNECTED || retrying
+    return when {
+        relayState == AgentRelayClient.State.CONNECTED -> AgentStatusPillUi(visible, "AI connected", "connected")
+        retrying -> AgentStatusPillUi(visible, "AI retrying…", "retrying")
+        relayState == AgentRelayClient.State.CONNECTING -> AgentStatusPillUi(visible, "AI connecting…", "connecting")
+        else -> AgentStatusPillUi(visible, "AI offline", "offline")
     }
 }
 
@@ -548,6 +664,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         }
     }
     DisposableEffect(activity, web) {
+        activity.attachCurrentReaderWebView(web)
         model.assetAccessRestored = { document, source ->
             web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
         }
@@ -565,7 +682,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                 reader.evaluateJavascript("window.supermdFindStep?.(${if (direction < 0) -1 else 1}); true", null)
             }
         }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;activity.stepReaderFind=null;model.assetAccessRestored=null }
+        onDispose { activity.attachCurrentReaderWebView(null); activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;activity.stepReaderFind=null;model.assetAccessRestored=null }
     }
     LaunchedEffect(findRequest, menu, web) {
         if (findRequest == 0 || menu) return@LaunchedEffect
@@ -643,18 +760,8 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             if (rawTabId != null) request.put("tabId", rawTabId)
             request.optString("expectedRevision").takeIf { it.isNotBlank() }?.let { request.put("expectedRevision", it.lowercase()) }
             fun canonicalTabId(note: Note): String = "tab:${activity.agentConfigForThisWindow()?.deviceId ?: "local"}:${activity.agentWorkspaceKey}:${note.id}"
-            fun sendAgentReply(targetId: String, result: Any?, error: String?) {
-                val current = model.state.value.tabs.firstOrNull { it.id == targetId }
-                val knownConflict = error?.takeIf { message ->
-                    message.contains("revision conflict", ignoreCase = true) ||
-                        message.contains("changed since the supplied revision", ignoreCase = true) ||
-                        message.contains("changed since the expected revision", ignoreCase = true)
-                }
-                if (knownConflict != null && current != null) {
-                    reply(null, JSONObject().put("error", knownConflict).put("currentRevision", activity.agentRevision(current.content))
-                        .put("sourceLength", activity.agentSourceLength(current.content)).toString())
-                } else reply(result, error)
-            }
+            fun sendAgentReply(targetId: String, result: Any?, error: String?) =
+                sendAgentBridgeReply(activity, model, targetId, result, error, reply)
             fun withSelectedTab(snapshotSafeWhenInactive: Boolean = false, action: suspend () -> Unit) {
                 val target = request.optString("tabId").takeIf { it.isNotBlank() }
                 if (target == null) { scope.launch { action() }; return }
@@ -666,51 +773,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     return
                 }
                 if (model.state.value.activeId != target && snapshotSafeWhenInactive) {
-                    if (request.optString("action") !in setOf("read_tab", "search_tab", "outline_tab", "list_diagrams", "get_diagram", "patch_tab")) {
-                        reply(null, "This Android action requires the requested tab to be active")
-                        return
-                    }
-                    val contentBytes = snapshot.content.toByteArray(Charsets.UTF_8)
-                    if (contentBytes.size > MAX_AGENT_SNAPSHOT_BYTES) { reply(null, "This document exceeds Android's 2 MiB inactive-tab snapshot limit; activate it and retry"); return }
-                    val compute = JSONObject().put("requestId", request.optString("requestId"))
-                        .put("action", request.optString("action")).put("tabId", target).put("content", snapshot.content)
-                    listOf("expectedRevision", "operations", "offset", "limit", "query", "context", "heading", "view", "diagramId", "caseSensitive", "wholeWord", "regex", "excludeDiagrams")
-                        .forEach { key -> if (request.has(key)) compute.put(key, request.get(key)) }
-                    if (request.has("expectedRevision")) compute.put("expectedRevision", request.getString("expectedRevision").lowercase())
-                    activity.dispatchAgentCompute(web!!, compute) { raw, error ->
-                        if (error != null) { reply(null, error); return@dispatchAgentCompute }
-                        val result = raw as? JSONObject
-                        if (result == null) { reply(null, "Android could not read the computed document result"); return@dispatchAgentCompute }
-                        val snapshotRevision = activity.agentRevision(snapshot.content)
-                        val actionName = request.optString("action")
-                        if (result.optString("tabId") != target) {
-                            reply(null, "The document result did not match the captured Android note snapshot")
-                            return@dispatchAgentCompute
-                        }
-                        if (request.optString("action") == "patch_tab") {
-                            val patchedContent = result.optString("patchedContent", "")
-                            if (!result.optString("baseRevision").equals(snapshotRevision, ignoreCase = true) ||
-                                result.optInt("baseSourceLength", -1) != activity.agentSourceLength(snapshot.content) ||
-                                result.optInt("sourceLength", -1) != activity.agentSourceLength(patchedContent) ||
-                                !request.optString("expectedRevision").equals(snapshotRevision, ignoreCase = true)) {
-                            sendAgentReply(target, null, "Revision conflict: the note changed; read it again before editing")
-                                return@dispatchAgentCompute
-                            }
-                            scope.launch {
-                                runCatching {
-                                    model.commitAgentSnapshotPatch(target, snapshotRevision, patchedContent, result.optString("revision"))
-                                }.onFailure { sendAgentReply(target, null, it.message ?: "Could not save the inactive-tab patch") }
-                                    .onSuccess { result.remove("patchedContent"); result.put("tabId", canonicalTabId(snapshot)); reply(result, null) }
-                            }
-                        } else {
-                            if (!result.optString("revision").equals(snapshotRevision, ignoreCase = true) || result.optInt("sourceLength", -1) != activity.agentSourceLength(snapshot.content)) {
-                                reply(null, "The document revision changed while Android was reading it; retry")
-                            } else {
-                                result.put("tabId", canonicalTabId(snapshot))
-                                reply(result, null)
-                            }
-                        }
-                    }
+                    handleInactiveTabSnapshotRequest(activity, model, scope, web!!, request, target, snapshot, ::canonicalTabId, reply)
                 } else if (model.state.value.activeId != target) {
                     reply(null, "The requested tab is inactive. Activate it in Super MD before using this Android reader action.")
                 } else scope.launch { action() }
@@ -1008,13 +1071,30 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             }
         }
         val readerContent=remember {arrayOfNulls<String>(1)}
+        val sentAgentSeq = remember { mutableStateMapOf<String, Long>() }
         LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
-            if (!readerReady) readerNote[0] = null
+            if (!readerReady) {
+                readerNote[0] = null
+                sentAgentSeq.clear()
+            }
             if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active
                 val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
                 val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("portable", note.portable).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val lastSeq = sentAgentSeq[note.id] ?: 0L
+                val unseenEdits = note.agentEdits.filter { it.seq > lastSeq }
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply {
+                    if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true)
+                    else put("content", note.content)
+                    if (note.agentUnreviewed) put("agentUnreviewed", true)
+                    if (unseenEdits.isNotEmpty()) {
+                        val editsJson = JSONArray()
+                        unseenEdits.forEach { step ->
+                            editsJson.put(JSONObject().put("seq", step.seq).put("before", step.before).put("after", step.after))
+                        }
+                        put("pendingAgentEdits", editsJson)
+                    }
+                }.put("path", note.uri ?: note.id).put("portable", note.portable).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 if (pendingHeading != null) {
                     payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
                 }
@@ -1035,6 +1115,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     payload.put("seededFind", seededJson)
                 }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (unseenEdits.isNotEmpty()) sentAgentSeq[note.id] = unseenEdits.maxOf { it.seq }
                 if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
                 if (matchingSeed != null) {
                     model.consumeSeededFind(matchingSeed.nonce)
@@ -1113,6 +1194,11 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
+                        val pillUi = resolveAgentStatusPillUi(
+                            accessEnabled = activity.agentAccessEnabled,
+                            relayState = activity.agentRelayState,
+                            retrying = activity.agentRelayRetrying,
+                        )
                         val activeNeedsAccess = state.writeNeedsAccess(state.active.id) || model.documentWriteNeedsAccess(state.active.id)
                         StudioTopBar(
                             noteName = state.active.name,
@@ -1148,8 +1234,47 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                             onFixLatex = { web?.evaluateJavascript("window.supermdRepairMath?.()", null) },
                             onRename = { renaming = true },
                             onSettings = { settingsSection = null; settings = true },
+                            agentPillUi = pillUi,
+                            onAgentStatusClick = { settingsSection = "Agent connection"; settings = true },
                         )
                         if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::requestClose, model::reorder, model::newNote)
+                        val jumpNote = state.agentJumpTabId?.takeIf { it != state.active.id }?.let { jumpId -> state.tabs.firstOrNull { it.id == jumpId } }
+                        if (!state.fullscreen && jumpNote != null) {
+                            Surface(
+                                color = palette.secondaryContainer.copy(alpha = 0.85f),
+                                contentColor = palette.onSecondaryContainer,
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 4.dp)
+                                    .testTag("agentJumpBanner"),
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                                ) {
+                                    Text(
+                                        "AI updated ${jumpNote.name} in background",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    TextButton(
+                                        onClick = { model.select(jumpNote.id) },
+                                        modifier = Modifier.testTag("agentJumpButton"),
+                                    ) {
+                                        Text("Jump", fontWeight = FontWeight.SemiBold)
+                                    }
+                                    IconButton(
+                                        onClick = model::dismissAgentJump,
+                                        modifier = Modifier.size(36.dp).testTag("agentJumpDismiss"),
+                                    ) {
+                                        Icon(painterResource(R.drawable.symbol_close), "Dismiss agent notification", Modifier.size(18.dp))
+                                    }
+                                }
+                            }
+                        }
                         if(!state.fullscreen) StudioModeBar(
                             wide = wide,
                             actualMode = actualMode,
@@ -1227,6 +1352,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                     readerPdfOwnsProgress = false
                                     model.editorFocus(false)
                                     readerNote[0] = null
+                                    sentAgentSeq.clear()
                                     readerGeneration++
                                     web = null
                                     scope.launch {
@@ -1270,7 +1396,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                         val x=event.x/density.density;val y=event.y/density.density
                                         chromeTapJob[0]=scope.launch {
                                             if(tap)delay(260)
-                                            evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel')" else "false"}; })()") { interacting ->
+                                            evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel,.reader-agent-banner')" else "false"}; })()") { interacting ->
                                                 if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch) {
                                                     readingChromeAfterGesture(model.state.value.fullscreen, readingChromeVisible, show, tap)?.let { readingChromeVisible=it }
                                                 }
@@ -1750,6 +1876,8 @@ internal fun buildHighlightedSnippet(
     onRename: () -> Unit,
     onSettings: () -> Unit,
     onFolderSearch: () -> Unit = {},
+    agentPillUi: AgentStatusPillUi = AgentStatusPillUi(visible = false, label = "", stateKey = "off"),
+    onAgentStatusClick: () -> Unit = {},
     onRestoreAccess: (() -> Unit)? = null,
 ) {
     val palette = MaterialTheme.colorScheme
@@ -1779,6 +1907,32 @@ internal fun buildHighlightedSnippet(
             }
         },
         actions = {
+            if (agentPillUi.visible) {
+                val agentPillDotColor = when (agentPillUi.stateKey) {
+                    "connected" -> Color(0xff2e7d32)
+                    "retrying", "connecting" -> Color(0xffef6c00)
+                    else -> palette.error
+                }
+                Surface(
+                    onClick = { onMenuExpandedChange(false); onAgentStatusClick() },
+                    shape = RoundedCornerShape(999.dp),
+                    color = if (agentPillUi.stateKey == "connected") palette.primaryContainer else palette.surfaceContainerHigh,
+                    contentColor = if (agentPillUi.stateKey == "connected") palette.onPrimaryContainer else palette.onSurface,
+                    modifier = Modifier
+                        .padding(end = 4.dp)
+                        .semantics { contentDescription = agentPillUi.label }
+                        .testTag("agentStatusPill"),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.padding(horizontal = if (wide) 10.dp else 8.dp, vertical = 6.dp),
+                    ) {
+                        Box(Modifier.size(8.dp).background(agentPillDotColor, RoundedCornerShape(999.dp)))
+                        Text(if (wide) agentPillUi.label else "AI", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                    }
+                }
+            }
             StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
             IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }

@@ -20,10 +20,12 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
@@ -79,7 +81,23 @@ import androidx.compose.ui.unit.dp
                     })
                 }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = { select(note.id) }, contentPadding = PaddingValues(start = 16.dp, end = 4.dp), modifier = Modifier.widthIn(max = 220.dp)) { Text((if (note.dirty) "• " else "") + note.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    val showAgentBadge = note.id != active && (note.agentStaged || note.agentUnreviewed)
+                    if (showAgentBadge) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            shape = RoundedCornerShape(999.dp),
+                            modifier = Modifier.padding(start = 10.dp).testTag("agentTabBadge_${note.id}"),
+                        ) {
+                            Text(
+                                "AI",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
+                    TextButton(onClick = { select(note.id) }, contentPadding = PaddingValues(start = if (showAgentBadge) 6.dp else 16.dp, end = 4.dp), modifier = Modifier.widthIn(max = 220.dp)) { Text((if (note.dirty) "• " else "") + note.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                     IconButton(onClick = { close(note.id) }, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_close), "Close ${note.name}", Modifier.size(20.dp)) }
                 }
             }

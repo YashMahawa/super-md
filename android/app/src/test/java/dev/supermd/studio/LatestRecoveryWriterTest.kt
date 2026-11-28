@@ -174,4 +174,94 @@ class LatestRecoveryWriterTest {
         assertFalse(base == newListButEqualContent)
         assertFalse(base == scalarChanged)
     }
+
+    @Test fun flushAndAwaitExactDistinguishesCommittedSupersededAndFailedRevisions() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val inFlightStarted = CompletableDeferred<Unit>()
+        val releaseInFlight = CompletableDeferred<Unit>()
+        val midWriteStarted = CompletableDeferred<Unit>()
+        val releaseMidWrite = CompletableDeferred<Unit>()
+        val committed = mutableListOf<String>()
+        val writer = LatestRecoveryWriter<String, String>(
+            scope = scope,
+            debounceMillis = 0,
+            signature = { it },
+            write = { value, commit ->
+                when (value) {
+                    "in-flight" -> {
+                        inFlightStarted.complete(Unit)
+                        releaseInFlight.await()
+                    }
+                    "staged-mid-write" -> {
+                        midWriteStarted.complete(Unit)
+                        releaseMidWrite.await()
+                    }
+                    "staged-fail" -> error("disk write error")
+                }
+                commit { committed += value }
+            },
+        )
+        try {
+            // 1. Coalesced in pending while an earlier write is in flight -> SUPERSEDED
+            writer.schedule("in-flight")
+            inFlightStarted.await()
+            val coalescedExact = async { writer.flushAndAwaitExact("staged-coalesced") }
+            while (writer.latestScheduledRevision() < 2L) delay(5)
+            val baselineFlush = writer.flush("baseline-1")
+            releaseInFlight.complete(Unit)
+            baselineFlush?.join()
+
+            val coalescedOutcome = coalescedExact.await()
+            assertEquals(LatestRecoveryWriter.ExactFlushResult.SUPERSEDED, coalescedOutcome.result)
+            assertFalse("Coalesced staged snapshot never committed", committed.contains("staged-coalesced"))
+            assertEquals("baseline-1", committed.last())
+
+            // 2. Superseded mid-write before commitIfLatest -> SUPERSEDED
+            val midWriteExact = async { writer.flushAndAwaitExact("staged-mid-write") }
+            midWriteStarted.await()
+            val baselineFlush2 = writer.flush("baseline-2")
+            releaseMidWrite.complete(Unit)
+            baselineFlush2?.join()
+
+            val midWriteOutcome = midWriteExact.await()
+            assertEquals(LatestRecoveryWriter.ExactFlushResult.SUPERSEDED, midWriteOutcome.result)
+            assertFalse("Mid-write superseded snapshot must not commit", committed.contains("staged-mid-write"))
+            assertEquals("baseline-2", committed.last())
+
+            // 3. Uncontested staged snapshot -> COMMITTED with matching committedRevision
+            val committedOutcome = writer.flushAndAwaitExact("staged-committed")
+            assertEquals(LatestRecoveryWriter.ExactFlushResult.COMMITTED, committedOutcome.result)
+            assertEquals(committedOutcome.revision, writer.committedRevision())
+            assertEquals("staged-committed", committed.last())
+
+            // 4. Failed write reports FAILED
+            val failedOutcome = writer.flushAndAwaitExact("staged-fail")
+            assertEquals(LatestRecoveryWriter.ExactFlushResult.FAILED, failedOutcome.result)
+            assertEquals("staged-committed", committed.last())
+
+            // 5. flushAndAwaitExact bypasses debounceMillis (60s debounce completes immediately)
+            val debouncedCommitted = mutableListOf<String>()
+            val debouncedWriter = LatestRecoveryWriter<String, String>(
+                scope = scope,
+                debounceMillis = 60_000,
+                signature = { it },
+                write = { value, commit -> commit { debouncedCommitted += value } },
+            )
+            try {
+                val startedAt = System.nanoTime()
+                val immediateOutcome = debouncedWriter.flushAndAwaitExact("bypass-debounce")
+                val elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000.0
+                assertEquals(LatestRecoveryWriter.ExactFlushResult.COMMITTED, immediateOutcome.result)
+                assertEquals(listOf("bypass-debounce"), debouncedCommitted)
+                assertTrue("flushAndAwaitExact must bypass 60s debounce (took ${elapsedMillis}ms)", elapsedMillis < 5_000.0)
+            } finally {
+                debouncedWriter.closeAfterLatest("bypass-debounce").join()
+            }
+        } finally {
+            releaseInFlight.complete(Unit)
+            releaseMidWrite.complete(Unit)
+            writer.closeAfterLatest("final").join()
+            scope.cancel()
+        }
+    }
 }

@@ -123,6 +123,8 @@ internal class ReaderBridge(
                     }
                     "apply_bundled_theme" -> model.applyBundledTheme(args.getString("id"))
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
+                    "agent_banner_shown" -> { model.markAgentBannerShown(args.getString("id"), args.opt("before") as? String, args.opt("after") as? String); true }
+                    "agent_banner_dismissed" -> { model.dismissAgentBanner(args.getString("id")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "cache_python_output" -> cachePythonOutput(args)
                     "load_python_output" -> loadPythonOutput(args)

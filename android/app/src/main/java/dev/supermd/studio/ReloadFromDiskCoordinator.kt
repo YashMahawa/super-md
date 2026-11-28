@@ -277,6 +277,7 @@ internal class ReloadFromDiskCoordinator(
                                     } else {
                                         state.closedTabs
                                     },
+                                    agentJumpTabId = state.agentJumpTabId?.takeUnless { it == id },
                                     conflictedTabIds = state.conflictedTabIds - id,
                                     pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
                                     message = "Reloaded from disk",

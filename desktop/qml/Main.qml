@@ -119,6 +119,10 @@ ApplicationWindow {
             if (window.reader === target) target.forceActiveFocus()
         })
     }
+    function openAgentSettings() {
+        settingsPageItem.section = "agents"
+        settingsOpen = true
+    }
     function hintWithShortcut(label, key, fallback) {
         const map = window.shortcutLabels || {}
         const raw = map[key] !== undefined ? map[key] : (fallback || "")
@@ -411,6 +415,42 @@ ApplicationWindow {
                     DragHandler { enabled: studio.fedoraWindowFrame; target: null; onActiveChanged: if (active) window.startSystemMove() }
                     TapHandler { enabled: studio.fedoraWindowFrame; onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized() }
                 }
+                Rectangle {
+                    id: agentStatusPill
+                    objectName: "agentStatusPill"
+                    visible: Boolean(viewState.agentConnection && viewState.agentConnection.visible)
+                    readonly property string connectionState: viewState.agentConnection ? viewState.agentConnection.state : "off"
+                    readonly property string statusText: viewState.agentConnection ? viewState.agentConnection.label : ""
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitHeight: 34
+                    implicitWidth: agentPillRow.implicitWidth + 20
+                    radius: 17
+                    antialiasing: true
+                    color: agentPillHover.hovered ? viewState.colors["primary-container"] : viewState.colors["surface-high"]
+                    border.width: 1
+                    border.color: connectionState === "retrying" ? "#d97706" : connectionState === "connected" || connectionState === "local" ? viewState.colors.primary : viewState.colors.outline
+                    Accessible.role: Accessible.Button
+                    Accessible.name: statusText + (viewState.agentConnection && viewState.agentConnection.detail ? " · " + viewState.agentConnection.detail : "")
+                    RowLayout {
+                        id: agentPillRow
+                        anchors.centerIn: parent
+                        spacing: 7
+                        Rectangle {
+                            width: 8; height: 8; radius: 4
+                            color: agentStatusPill.connectionState === "connected" || agentStatusPill.connectionState === "local" ? "#16a34a" : agentStatusPill.connectionState === "retrying" ? "#d97706" : viewState.colors.primary
+                        }
+                        Label {
+                            visible: window.width >= 900
+                            text: agentStatusPill.statusText
+                            font.pixelSize: 12
+                            font.weight: Font.DemiBold
+                            color: viewState.colors.text
+                        }
+                    }
+                    HoverHandler { id: agentPillHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: window.openAgentSettings() }
+                    Hint { requested: agentPillHover.hovered; text: (viewState.agentConnection && viewState.agentConnection.detail ? viewState.agentConnection.detail + " · " : "") + "Open AI agent settings" }
+                }
                 ActionButton { objectName: "findInNoteButton"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
@@ -436,6 +476,49 @@ ApplicationWindow {
         }
         TabStrip {
             width: parent.width; viewState: window.viewState; tabs: window.tabsState; activeTabId: window.activeTabId; shortcutLabels: window.shortcutLabels
+        }
+        Rectangle {
+            id: agentJumpBar
+            objectName: "agentJumpBar"
+            visible: Boolean(viewState.agentJumpTab && viewState.agentJumpTab.id)
+            width: parent.width
+            height: visible ? 42 : 0
+            color: viewState.colors["surface-high"]
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 18
+                anchors.rightMargin: 14
+                spacing: 10
+                Rectangle { width: 8; height: 8; radius: 4; color: viewState.colors.primary }
+                Label {
+                    objectName: "agentJumpLabel"
+                    text: viewState.agentJumpTab ? ("AI updated " + viewState.agentJumpTab.name + " in the background · draft staged") : ""
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                    font.pixelSize: 13
+                    font.weight: Font.Medium
+                    color: viewState.colors.text
+                }
+                ActionButton {
+                    objectName: "agentJumpButton"
+                    text: "Jump"
+                    compact: true
+                    prominent: true
+                    focusPolicy: Qt.NoFocus
+                    ToolTip.text: "Switch to edited tab"
+                    onClicked: if (viewState.agentJumpTab) studio.selectTab(viewState.agentJumpTab.id)
+                }
+                ActionButton {
+                    objectName: "agentJumpDismissButton"
+                    glyph: "X"
+                    compact: true
+                    implicitWidth: 34
+                    focusPolicy: Qt.NoFocus
+                    Accessible.name: "Dismiss background edit notice"
+                    ToolTip.text: "Dismiss notice"
+                    onClicked: studio.dismissAgentJump()
+                }
+            }
         }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
     }
@@ -673,7 +756,7 @@ ApplicationWindow {
         id: settingsDialog
         objectName: "settingsDialog"; width: Math.min(840, window.width - 48); height: Math.min(760, window.height - 48); padding: 0
         onClosed: settingsOpen = false
-        SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
+        SettingsPage { id: settingsPageItem; objectName: "settingsPage"; ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
     }
     footer: Pane {
         visible: !viewState.fullscreen && !viewState.imageOverlay

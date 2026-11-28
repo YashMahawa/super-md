@@ -59,7 +59,8 @@ ScrollView {
                 tabName: String(entry.name || ""),
                 tabPath: String(entry.path || ""),
                 tabDirty: Boolean(entry.dirty),
-                tabConflict: Boolean(entry.conflict)
+                tabConflict: Boolean(entry.conflict),
+                tabAgentEdited: Boolean(entry.agentEdited)
             })
         }
         let structureChanged = false
@@ -92,6 +93,7 @@ ScrollView {
             if (currentEntry.tabPath !== nextEntry.tabPath) tabModel.setProperty(index, "tabPath", nextEntry.tabPath)
             if (currentEntry.tabDirty !== nextEntry.tabDirty) tabModel.setProperty(index, "tabDirty", nextEntry.tabDirty)
             if (currentEntry.tabConflict !== nextEntry.tabConflict) tabModel.setProperty(index, "tabConflict", nextEntry.tabConflict)
+            if (currentEntry.tabAgentEdited !== nextEntry.tabAgentEdited) tabModel.setProperty(index, "tabAgentEdited", nextEntry.tabAgentEdited)
         }
         if (tabModel.count > desired.length) {
             tabModel.remove(desired.length, tabModel.count - desired.length)
@@ -241,8 +243,9 @@ ScrollView {
                 required property string tabPath
                 required property bool tabDirty
                 required property bool tabConflict
+                required property bool tabAgentEdited
                 readonly property bool isActive: tabId === strip.activeTabId
-                width: Math.min(260, label.implicitWidth + 64)
+                width: Math.min(tab.tabAgentEdited ? 280 : 260, label.implicitWidth + (tab.tabAgentEdited ? 98 : 64))
                 height: 40
                 y: (strip.height - height) / 2
                 onXChanged: if (isActive) strip.scheduleRevealActiveTab()
@@ -296,7 +299,25 @@ ScrollView {
                 RowLayout {
                     anchors.fill: parent
                     spacing: 0
-                    ActionButton { id: label; objectName: "noteTabLabel"; compact: true; text: (tab.tabDirty ? "• " : "") + tab.tabName; Layout.fillWidth: true; ToolTip.text: tab.tabPath || tab.tabName; onClicked: studio.selectTab(tab.tabId) }
+                    ActionButton { id: label; objectName: "noteTabLabel"; compact: true; text: (tab.tabDirty ? "• " : "") + tab.tabName; Layout.fillWidth: true; ToolTip.text: (tab.tabAgentEdited ? "Updated by AI agent · " : "") + (tab.tabPath || tab.tabName); onClicked: studio.selectTab(tab.tabId) }
+                    Rectangle {
+                        objectName: "agentTabBadge"
+                        visible: tab.tabAgentEdited
+                        Layout.alignment: Qt.AlignVCenter
+                        implicitWidth: 28
+                        implicitHeight: 20
+                        radius: 10
+                        color: strip.viewState.colors["primary-container"]
+                        border.width: 1
+                        border.color: strip.viewState.colors.primary
+                        Label {
+                            anchors.centerIn: parent
+                            text: "AI"
+                            font.pixelSize: 10
+                            font.weight: Font.Bold
+                            color: strip.viewState.colors["on-primary-container"]
+                        }
+                    }
                     ActionButton { objectName: "noteTabCloseButton"; glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + tab.tabName; ToolTip.text: tab.isActive ? strip.shortcutHint("Close " + tab.tabName, "close_tab", "") : "Close " + tab.tabName; onClicked: { const id = tab.tabId; Qt.callLater(function() { studio.closeTabSafely(id) }) } }
                 }
                 DropArea {

@@ -1169,6 +1169,9 @@ class Studio(QObject):
         self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
         self.ready = False
         self._last_reader_text = None
+        self._last_reader_agent_seq: dict[str, int] = {}
+        self._agent_edit_seq = 0
+        self._agent_jump_tab_id = ""
         self._export_jobs = ExportJobRegistry()
         self._python_jobs = python_runtime.PythonJobRegistry()
         self._agent_exports: dict[str, dict] = {}
@@ -1256,6 +1259,16 @@ class Studio(QObject):
             tab.setdefault("assets_dirty", False)
             tab.setdefault("conflict", False)
             tab["agent_staged"] = bool(tab.get("agent_staged", False))
+            tab["agent_unreviewed"] = bool(tab.get("agent_unreviewed", False))
+            raw_edits = tab.get("agent_edits")
+            valid_edits = []
+            if isinstance(raw_edits, list):
+                for entry in raw_edits[-60:]:
+                    if isinstance(entry, dict) and isinstance(entry.get("seq"), int) and isinstance(entry.get("before"), str) and isinstance(entry.get("after"), str):
+                        valid_edits.append({"seq": entry["seq"], "before": entry["before"], "after": entry["after"]})
+                        if entry["seq"] > self._agent_edit_seq:
+                            self._agent_edit_seq = entry["seq"]
+            tab["agent_edits"] = self._bound_agent_edits(valid_edits)
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         with self.session._rename_state_lock:
             self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
@@ -1388,11 +1401,29 @@ class Studio(QObject):
         assets = dict(assets) if assets else {}
         return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
                 "assets": assets, "saved_assets": dict(assets), "assets_dirty": False,
-                "portable": portable, "conflict": False, "agent_staged": False}
+                "portable": portable, "conflict": False,
+                "agent_staged": False, "agent_unreviewed": False, "agent_edits": []}
+
+    @staticmethod
+    def _bound_agent_edits(edits: list[dict]) -> list[dict]:
+        bounded = list(edits[-60:])
+        def _total_bytes(items: list[dict]) -> int:
+            return sum(len(item["before"].encode("utf-8")) + len(item["after"].encode("utf-8")) for item in items)
+        while len(bounded) > 1 and _total_bytes(bounded) > 2_000_000:
+            bounded.pop(0)
+        return bounded if _total_bytes(bounded) <= 4_000_000 else []
+
+    def _append_agent_edit(self, tab: dict, before: str, after: str) -> None:
+        edits = list(tab.get("agent_edits") or [])
+        self._agent_edit_seq = max(self._agent_edit_seq, max((int(item.get("seq", 0)) for item in edits), default=0)) + 1
+        edits.append({"seq": self._agent_edit_seq, "before": before, "after": after})
+        tab["agent_edits"] = self._bound_agent_edits(edits)
 
     def _activate_tab_state(self, tab: dict | None) -> None:
         if not tab:
             return
+        if self._agent_jump_tab_id == tab["id"]:
+            self._agent_jump_tab_id = ""
         if tab.get("agent_staged"):
             tab["agent_staged"] = False
             if (
@@ -1407,6 +1438,9 @@ class Studio(QObject):
         if not tab:
             return
         tab["agent_staged"] = False
+        tab["agent_unreviewed"] = False
+        if getattr(self, "_agent_jump_tab_id", "") == tab.get("id"):
+            self._agent_jump_tab_id = ""
 
     def _is_dirty(self, tab: dict) -> bool:
         if tab.get("content") != tab.get("saved"):
@@ -1416,6 +1450,37 @@ class Studio(QObject):
         if tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}):
             return True
         return False
+
+    def _agent_connection_snapshot(self) -> dict:
+        bridge = getattr(self.session, "agent_bridge", None)
+        cloud_enabled = bool(bridge and bridge.cloudClient.enabled)
+        cloud_opt_in = bool(self.settings.get("cloudAgentEnabled"))
+        cloud_status = self.cloudAgentStatus
+        if self._cloud_revocation_pending:
+            return {"visible": True, "state": "connecting", "label": "Disconnecting…", "detail": cloud_status}
+        if cloud_enabled or (cloud_opt_in and self._agent_cloud_error):
+            if cloud_status == "Connected to relay":
+                return {"visible": True, "state": "connected", "label": "AI connected", "detail": cloud_status}
+            if cloud_status.startswith("Connecting"):
+                return {"visible": True, "state": "connecting", "label": "AI connecting…", "detail": cloud_status}
+            return {"visible": True, "state": "retrying", "label": "AI retrying…", "detail": cloud_status}
+        if bool(bridge and bridge.enabled):
+            return {"visible": True, "state": "local", "label": "AI live", "detail": self.agentAccessStatus}
+        return {"visible": False, "state": "off", "label": "", "detail": ""}
+
+    def _agent_jump_snapshot(self) -> dict | None:
+        if not self._agent_jump_tab_id or self._agent_jump_tab_id == self.active:
+            return None
+        target = next((t for t in self.tabs if t["id"] == self._agent_jump_tab_id), None)
+        if target is None:
+            return None
+        return {"id": target["id"], "name": target["name"]}
+
+    @Slot()
+    def dismissAgentJump(self):
+        if self._agent_jump_tab_id:
+            self._agent_jump_tab_id = ""
+            self._emit(False)
 
     def _mark_tab_touched(self, tab_id: str | None) -> None:
         if not tab_id:
@@ -1429,7 +1494,14 @@ class Studio(QObject):
         tab_id = tab.get("id")
         if not tab_id or tab_id in self._touched_tab_ids:
             return False
-        if self._is_dirty(tab) or tab.get("agent_staged") or tab.get("path") or tab.get("assets") or tab.get("conflict"):
+        if (
+            self._is_dirty(tab)
+            or tab.get("path")
+            or tab.get("assets")
+            or tab.get("conflict")
+            or tab.get("agent_staged")
+            or tab.get("agent_unreviewed")
+        ):
             return False
         session_entry = self.reader_edits.sessions.get(tab_id)
         if session_entry is not None and session_entry[1] > 0:
@@ -1543,6 +1615,14 @@ class Studio(QObject):
             if seeded_find is not None:
                 payload["seededFind"] = seeded_find
             payload["editProtocol"]=1
+            if tab.get("agent_unreviewed"):
+                payload["agentUnreviewed"] = True
+            edits = tab.get("agent_edits") or []
+            last_sent = self._last_reader_agent_seq.get(tab["id"], 0)
+            unseen_edits = [item for item in edits if isinstance(item, dict) and item.get("seq", 0) > last_sent]
+            if unseen_edits:
+                payload["pendingAgentEdits"] = unseen_edits
+                self._last_reader_agent_seq[tab["id"]] = unseen_edits[-1]["seq"]
             previous=self._last_reader_text
             if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
             else:payload["content"]=tab["content"]
@@ -2307,8 +2387,16 @@ class Studio(QObject):
         return encoded
 
     def _tabs_slice_key(self):
+        active_id = self.active if self.tabs else ""
         return tuple(
-            (t["id"], t["name"], t["path"], self._is_dirty(t), bool(t.get("conflict")))
+            (
+                t["id"],
+                t["name"],
+                t["path"],
+                self._is_dirty(t),
+                bool(t.get("conflict")),
+                bool(t["id"] != active_id and (t.get("agent_staged") or t.get("agent_unreviewed"))),
+            )
             for t in self.tabs
         )
 
@@ -2319,8 +2407,15 @@ class Studio(QObject):
         if cached is not None and cached[0] == tabs_key:
             return cached[1]
         encoded = json.dumps([
-            {"id": tid, "name": name, "path": path, "dirty": dirty, "conflict": conflict}
-            for tid, name, path, dirty, conflict in tabs_key
+            {
+                "id": tid,
+                "name": name,
+                "path": path,
+                "dirty": dirty,
+                "conflict": conflict,
+                "agentEdited": agent_edited,
+            }
+            for tid, name, path, dirty, conflict, agent_edited in tabs_key
         ])
         self._tabs_slice_cache = (tabs_key, encoded)
         return encoded
@@ -2400,6 +2495,9 @@ class Studio(QObject):
             "busy": self.busy > 0,
             "message": self.message,
             "messageRevision": getattr(self, "_message_revision", 0),
+            "agentConnection": self._agent_connection_snapshot(),
+            "agentJumpTab": self._agent_jump_snapshot(),
+            "activeAgentUnreviewed": bool(tab.get("agent_unreviewed")),
         })[1:-1]
         return (
             '{"tabs": ' + tabs_json
@@ -2689,7 +2787,9 @@ class Studio(QObject):
 
     @Slot(str)
     def _cloud_status_changed(self, _status):
-        self._emit(False)
+        for window in list(self.session.windows.values()):
+            if not window.retired:
+                window._emit(False)
 
     @Slot(str, result=bool)
     def createAgentPairing(self, server_origin):
@@ -3203,7 +3303,11 @@ class Studio(QObject):
 
     def _build_startup_snapshot_locked(self):
         # Clean tabs need only paths, never another copy of their image bytes.
-        window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t) or t.get("agent_staged")]
+        window_tabs = [
+            {"path":t["path"],"id":t["id"]}
+            for t in self.tabs
+            if t["path"] or self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed")
+        ]
         self.session.workspace[self.window_id] = window_tabs
         self.session.window_workspaces[self.window_id] = {
             "folder": self.folder,
@@ -3247,8 +3351,8 @@ class Studio(QObject):
         return [
             _snapshot_tab_state(t, include_view_state=False)
             for t in source_tabs
-            if (self._is_dirty(t) or t.get("agent_staged"))
-            and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged"))
+            if (self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed"))
+            and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged") or t.get("agent_unreviewed"))
         ]
 
     def _combined_recovery_drafts(self, window_drafts):
@@ -3621,6 +3725,9 @@ class Studio(QObject):
             note.setdefault("saved_assets", dict(note.get("assets", {})))
             note.setdefault("assets_dirty", False)
             note.setdefault("conflict", False)
+            note.setdefault("agent_staged", False)
+            note.setdefault("agent_unreviewed", False)
+            note.setdefault("agent_edits", [])
             next_refs=[item for item in self.closed_tabs if item is not reference]
             try:self.session.closed_note_store.save_index(next_refs)
             except Exception as failure:
@@ -4123,6 +4230,7 @@ class Studio(QObject):
             self._python_jobs.cancel_tab(self.active)
             self.ready=False
             self._last_reader_text=None
+            self._last_reader_agent_seq.clear()
             self.reader_overlay=False
             self.image_overlay=False
             self._emit(False)
@@ -4271,6 +4379,8 @@ class Studio(QObject):
                 portable=bool(captured.get("portable")),
                 conflict=False,
                 agent_staged=False,
+                agent_unreviewed=False,
+                agent_edits=[],
             )
 
         def work():
@@ -5034,6 +5144,9 @@ class Studio(QObject):
         self.tabs.pop(current_index)
         if not self.tabs:
             self.tabs.append(self._note("Untitled.md"))
+        if self._agent_jump_tab_id == id:
+            self._agent_jump_tab_id = ""
+        self._last_reader_agent_seq.pop(id, None)
         if self.active == id:
             self._activation_generation += 1
             self.active = self.tabs[min(current_index, len(self.tabs)-1)]["id"]
@@ -5201,19 +5314,32 @@ class Studio(QObject):
         changed = edited != previous
         return tab, tab_id, previous, revision, edited, operation_results, changed
 
-    def _build_staged_recovery_candidate(self, tab_id: str, current_tab: dict, edited: str, changed: bool) -> list:
+    def _build_staged_recovery_candidate(self, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool):
+        existing_edits = list(current_tab.get("agent_edits") or [])
         if changed:
+            next_seq = max(
+                getattr(self, "_agent_edit_seq", 0),
+                max((int(item.get("seq", 0)) for item in existing_edits if isinstance(item, dict)), default=0),
+            ) + 1
+            candidate_edits = Studio._bound_agent_edits(
+                existing_edits + [{"seq": next_seq, "before": previous, "after": edited}]
+            )
             candidate_tab = {
                 **current_tab,
                 "content": edited,
                 "agent_staged": True,
+                "agent_unreviewed": True,
+                "agent_edits": candidate_edits,
             }
         else:
+            next_seq = getattr(self, "_agent_edit_seq", 0)
+            candidate_edits = existing_edits
             candidate_tab = dict(current_tab)
         with self.session._rename_state_lock:
             replaced_tabs = [candidate_tab if item["id"] == tab_id else item for item in self.tabs]
             window_drafts = self._window_recovery_drafts(replaced_tabs)
-            return self._combined_recovery_drafts(window_drafts)
+            all_drafts = self._combined_recovery_drafts(window_drafts)
+        return all_drafts, candidate_edits, next_seq
 
     def _commit_staged_patch_tab(
         self,
@@ -5222,11 +5348,17 @@ class Studio(QObject):
         edited: str,
         operation_results: list,
         changed: bool,
+        candidate_edits: list[dict],
+        next_seq: int,
     ) -> dict:
         if changed:
             current_tab["content"] = edited
+            self._agent_edit_seq = max(getattr(self, "_agent_edit_seq", 0), next_seq)
+            current_tab["agent_edits"] = candidate_edits
+            current_tab["agent_unreviewed"] = True
             if self.active != tab_id:
                 current_tab["agent_staged"] = True
+                self._agent_jump_tab_id = tab_id
             else:
                 current_tab["agent_staged"] = False
                 if (
@@ -5351,8 +5483,8 @@ class Studio(QObject):
                     had_recovery_timer = True
                     self.recovery_timer.stop()
                 candidate_path = current_tab.get("path", "")
-                all_drafts = self._build_staged_recovery_candidate(
-                    tab_id, current_tab, edited, changed
+                all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
+                    tab_id, current_tab, previous, edited, changed
                 )
                 decision_lock = threading.Lock()
                 attempt_state = {"decided": False, "outcome": None}
@@ -5411,7 +5543,7 @@ class Studio(QObject):
                     and now_tab.get("path", "") == candidate_path
                 ):
                     return self._commit_staged_patch_tab(
-                        now_tab, tab_id, edited, operation_results, changed
+                        now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq
                     )
                 if attempt + 1 < max_attempts:
                     continue
@@ -5441,7 +5573,7 @@ class Studio(QObject):
             result = self._agent_document_action(args)
             on_complete(result, None)
             return
-        if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged")):
+        if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
             on_complete({
                 "tabId": tab_id,
                 "windowId": self.window_id,
@@ -5552,8 +5684,8 @@ class Studio(QObject):
                 had_recovery_timer = True
                 self.recovery_timer.stop()
             candidate_path = current_tab.get("path", "")
-            all_drafts = self._build_staged_recovery_candidate(
-                tab_id, current_tab, edited, changed
+            all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
+                tab_id, current_tab, previous, edited, changed
             )
             decision_lock = threading.Lock()
             attempt_state = {"decided": False, "outcome": None}
@@ -5613,7 +5745,7 @@ class Studio(QObject):
                     and now_tab.get("path", "") == candidate_path
                 ):
                     result = self._commit_staged_patch_tab(
-                        now_tab, tab_id, edited, operation_results, changed
+                        now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq
                     )
                     finish_stage(result, None)
                     return
@@ -5657,6 +5789,8 @@ class Studio(QObject):
             if tab_id == self.active:
                 if changed:
                     tab["content"] = edited
+                    self._append_agent_edit(tab, previous, edited)
+                    tab["agent_unreviewed"] = True
                     self.recovery_timer.start(800)
                     self.autosave_timer.start(900)
                     self._emit(load=True)
@@ -5665,7 +5799,7 @@ class Studio(QObject):
                         "sourceLength": len(edited), "changed": changed,
                         "applied": len(operation_results), "operation_results": operation_results,
                         "isDirty": edited != tab["saved"]}
-            if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged")):
+            if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
                 return {"tabId": tab_id, "windowId": self.window_id,
                         "revision": revision,
                         "sourceLength": len(edited), "changed": False,
@@ -6543,7 +6677,32 @@ class Studio(QObject):
                 self.replied.emit(id, json.dumps({"stopped": self._python_jobs.cancel_job(job_id, tab_id=tab_filter)}), "")
                 return
             tab = self._current()
-            if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
+            if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._last_reader_agent_seq.clear(); self._emit(); self.replied.emit(id,"true",""); return
+            if command == "agent_banner_shown":
+                target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
+                if target:
+                    before_text = args.get("before")
+                    after_text = args.get("after")
+                    recorded = False
+                    if isinstance(before_text, str) and isinstance(after_text, str) and before_text != after_text:
+                        self._append_agent_edit(target, before_text, after_text)
+                        if target.get("agent_edits"):
+                            self._last_reader_agent_seq[target["id"]] = target["agent_edits"][-1]["seq"]
+                        recorded = True
+                    if not target.get("agent_unreviewed") or recorded:
+                        target["agent_unreviewed"] = True
+                        self.recovery_timer.start(800)
+                        self._emit(False)
+                self.replied.emit(id, "true", "")
+                return
+            if command == "agent_banner_dismissed":
+                target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
+                if target and target.get("agent_unreviewed"):
+                    target["agent_unreviewed"] = False
+                    self.recovery_timer.start(800)
+                    self._emit(False)
+                self.replied.emit(id, "true", "")
+                return
             if command == "reader_chrome":
                 action = args.get("action")
                 if action not in ("show", "hide", "toggle"): raise ValueError("Invalid reading chrome action")
@@ -7030,6 +7189,7 @@ class Studio(QObject):
         # a renderer must not restore an older recovery snapshot or run cells.
         self.ready=False
         self._last_reader_text=None
+        self._last_reader_agent_seq.clear()
         self.reader_overlay=False
         self.image_overlay=False
         self._emit(False)

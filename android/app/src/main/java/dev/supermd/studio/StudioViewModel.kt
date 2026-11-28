@@ -45,7 +45,20 @@ internal data class UriRemap(
     val newRelative: String? = null,
 )
 
-data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null, val assetsDirty: Boolean = false) {
+data class AgentEditStep(val seq: Long, val before: String, val after: String)
+data class Note(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Untitled.md",
+    val uri: String? = null,
+    val content: String = "",
+    val saved: String = "",
+    val relative: String? = null,
+    val assetDirectory: String? = null,
+    val assetsDirty: Boolean = false,
+    val agentStaged: Boolean = false,
+    val agentUnreviewed: Boolean = false,
+    val agentEdits: List<AgentEditStep> = emptyList(),
+) {
     val dirty get() = content != saved || assetsDirty
     val portable get() = assetDirectory != null
     val requiresCloseConfirmation get() = if (uri == null) (content.isNotBlank() || assetsDirty) && dirty else dirty
@@ -57,6 +70,24 @@ internal data class OpenDocumentTarget(
     val externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
 )
 internal const val MAX_AGENT_SNAPSHOT_BYTES = 2 * 1024 * 1024
+internal const val MAX_AGENT_EDIT_STEPS = 60
+internal const val MAX_AGENT_STAGE_ATTEMPTS = 3
+internal fun boundAgentEditSteps(steps: List<AgentEditStep>): List<AgentEditStep> {
+    if (steps.isEmpty()) return emptyList()
+    val candidate = steps.takeLast(MAX_AGENT_EDIT_STEPS).toMutableList()
+    fun totalBytes(items: List<AgentEditStep>): Long =
+        items.sumOf { it.before.toByteArray(Charsets.UTF_8).size.toLong() + it.after.toByteArray(Charsets.UTF_8).size.toLong() }
+    while (candidate.size > 1 && totalBytes(candidate) > MAX_AGENT_SNAPSHOT_BYTES) {
+        candidate.removeAt(0)
+    }
+    return if (totalBytes(candidate) <= MAX_AGENT_SNAPSHOT_BYTES * 2L) candidate.toList() else emptyList()
+}
+internal fun appendAgentEditSteps(
+    existing: List<AgentEditStep>,
+    nextSeq: Long,
+    before: String,
+    after: String,
+): List<AgentEditStep> = if (before == after) existing else boundAgentEditSteps(existing + AgentEditStep(nextSeq, before, after))
 internal enum class PortableSaveRecovery { ORIGINAL_INTACT, RESTORE_OUR_WRITE, LEAVE_CONCURRENT_BYTES }
 internal fun agentContentRevision(content: String): String = java.security.MessageDigest.getInstance("SHA-256")
     .digest(content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
@@ -79,7 +110,7 @@ private fun renamedRelative(relative:String?,name:String)=relative?.let {val par
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
 private val EMPTY_NOTE = Note(id = "", name = "Super MD", content = "", saved = "")
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.5,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val agentJumpTabId: String? = null, val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.5,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
@@ -621,7 +652,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private var listFolderSeq = 0L
     private var listFolderJob: Job? = null
     private val mutable = MutableStateFlow(restore())
+    private val recoveryStateLock = Any()
+    private var agentEditSeq: Long = mutable.value.tabs.flatMap { it.agentEdits }.maxOfOrNull { it.seq } ?: 0L
     internal val viewModelRetired = AtomicBoolean(false)
+    @Volatile internal var maxAgentStageAttempts: Int = MAX_AGENT_STAGE_ATTEMPTS
+    @Volatile internal var recoverySnapshotWriter: (java.io.Writer, StudioState) -> Unit = NoteRecovery::write
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
         scope = RecoveryWriterScope.scope,
         debounceMillis = 1_200,
@@ -631,7 +666,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             try {
                 java.io.FileOutputStream(temporary).use { stream ->
                     val writer = stream.bufferedWriter(Charsets.UTF_8)
-                    NoteRecovery.write(writer, state)
+                    recoverySnapshotWriter(writer, state)
                     writer.flush()
                     stream.fd.sync()
                 }
@@ -670,6 +705,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 .copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         }
     }
+    private val observedUrisLock = Any()
     private var observedUris=emptySet<String>()
     private var themeJob:Job?=null
     private var themeReloadPending=false
@@ -959,7 +995,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (uri == null || matchesOpenTab) refreshExternal(uri)
         }
     }
-    private fun observeActive() {
+    private fun observeActive() = synchronized(observedUrisLock) {
         val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}+listOfNotNull(mutable.value.folder)).toSet()
         if(uris==observedUris)return
         resolver.unregisterContentObserver(documentObserver);observedUris=uris
@@ -1139,11 +1175,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     override fun onCleared() {
         activeStudioViewModels.remove(this)
-        viewModelRetired.set(true)
         readerFlushRequester = null
+        synchronized(recoveryStateLock) {
+            viewModelRetired.set(true)
+            recoveryWriter.closeAfterLatest(mutable.value)
+        }
         folderSearchController.cancel()
         invalidateAllNoteAssets()
-        recoveryWriter.closeAfterLatest(mutable.value)
         prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
         resolver.unregisterContentObserver(documentObserver)
         resolver.unregisterContentObserver(themeObserver)
@@ -1161,60 +1199,74 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
             ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.lastPathSegment?.takeIf(String::isNotBlank)
 
+    private val autosaveLock = Any()
     private var autosaveJob: Job? = null
-    private val autosavePending = mutableSetOf<String>()
+    private val autosavePending: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     private fun scheduleAutosave(id: String) {
         if (!mutable.value.autosave || id in mutable.value.conflictedTabIds) return
-        if (mutable.value.tabs.firstOrNull { it.id == id }?.uri?.let(::writeIsBlocked) == true) return
+        val scheduledNote = mutable.value.tabs.firstOrNull { it.id == id }
+        if (scheduledNote?.agentStaged == true) return
+        if (scheduledNote?.uri?.let(::writeIsBlocked) == true) return
         autosavePending.add(id)
-        if (autosaveJob?.isActive == true) return
-        autosaveJob = viewModelScope.launch {
-            while (autosavePending.isNotEmpty()) {
-                delay(900)
-                val next = autosavePending.firstOrNull() ?: break
-                autosavePending.remove(next)
-                var note=mutable.value.tabs.find { it.id==next && it.uri!=null && it.dirty } ?: continue
-                if (note.id in mutable.value.conflictedTabIds) continue
-                if (writeIsBlocked(note.uri!!)) continue
-                if (!mutable.value.autosave) continue
-                try {
-                    if (mutable.value.active.id == note.id) {
-                        if (!performReaderBarrier(note.id) { }) {
-                            mutable.value = mutable.value.copy(message = "Autosave paused because the reader could not confirm its latest edits.")
-                            continue
-                        }
-                        note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty } ?: continue
-                        if (note.id in mutable.value.conflictedTabIds) continue
-                    }
-                    // Do not cancel an in-flight write when another keystroke or
-                    // window transition arrives. Recovery remains an independent stream.
-                    withContext(kotlinx.coroutines.NonCancellable) {
-                        documentWrites.withLock {
-                        if (closingNoteIds.contains(note.id) || mutable.value.tabs.none {
-                                it.id == note.id && it.uri == note.uri && it.content == note.content && it.assetsDirty == note.assetsDirty
-                            }) return@withLock
-                        val writtenTarget = withContext(Dispatchers.IO) {
-                            val target = resolveVerifiedWriteDestination(Uri.parse(note.uri))
-                            if (!diskMatchesBaseline(target, note)) throw ExternalConflictDetectedException()
-                            val staged=File(getApplication<Application>().cacheDir,"autosave-${UUID.randomUUID()}.tmp")
-                            try {
-                                staged.outputStream().use { if(note.portable) media.writeLocalPortable(it,note.content,note.assetDirectory) else it.write(note.content.toByteArray()) }
-                                if (!note.portable) copyAttachments(note,target)
-                                resolver.openOutputStream(target,"wt")?.use { staged.inputStream().use { input->input.copyTo(it) } } ?: error("Cannot write this document")
-                            } finally {staged.delete()}
-                            target
-                        }
-                        if (note.portable) recordPortableBaseline(note.id, note.assetDirectory)
-                        clearDocumentAccessFailure(writtenTarget.toString())
-                        change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,assetsDirty=false,uri=writtenTarget.toString()) else it }, conflictedTabIds=s.conflictedTabIds-note.id) }
-                        mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
-                        if(mutable.value.tabs.any {it.id==note.id && it.dirty && it.id !in mutable.value.conflictedTabIds})autosavePending.add(note.id)
+        synchronized(autosaveLock) {
+            if (autosaveJob?.isActive == true) return
+            autosaveJob = viewModelScope.launch {
+                while (true) {
+                    val empty = synchronized(autosaveLock) {
+                        if (autosavePending.isEmpty()) {
+                            autosaveJob = null
+                            true
+                        } else {
+                            false
                         }
                     }
-                } catch (_: ExternalConflictDetectedException) {
-                    autosavePending.remove(note.id)
-                    change { s -> s.copy(conflictedTabIds = s.conflictedTabIds + note.id, message = "This file changed on disk. Autosave is paused for this tab.") }
-                } catch(error:Exception) {if(isDocumentAccessFailure(error))requestDocumentAccess(note.uri!!,note,writing=true) else fail("Autosave paused: ${error.message}")}
+                    if (empty) break
+                    delay(900)
+                    val next = autosavePending.firstOrNull() ?: continue
+                    autosavePending.remove(next)
+                    var note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty && !it.agentStaged } ?: continue
+                    if (note.id in mutable.value.conflictedTabIds) continue
+                    if (writeIsBlocked(note.uri!!)) continue
+                    if (!mutable.value.autosave) continue
+                    try {
+                        if (mutable.value.active.id == note.id) {
+                            if (!performReaderBarrier(note.id) { }) {
+                                mutable.value = mutable.value.copy(message = "Autosave paused because the reader could not confirm its latest edits.")
+                                continue
+                            }
+                            note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty && !it.agentStaged } ?: continue
+                            if (note.id in mutable.value.conflictedTabIds) continue
+                        }
+                        // Do not cancel an in-flight write when another keystroke or
+                        // window transition arrives. Recovery remains an independent stream.
+                        withContext(kotlinx.coroutines.NonCancellable) {
+                            documentWrites.withLock {
+                            if (closingNoteIds.contains(note.id) || mutable.value.tabs.none {
+                                    it.id == note.id && it.uri == note.uri && it.content == note.content && it.assetsDirty == note.assetsDirty && !it.agentStaged
+                                }) return@withLock
+                            val writtenTarget = withContext(Dispatchers.IO) {
+                                val target = resolveVerifiedWriteDestination(Uri.parse(note.uri))
+                                if (!diskMatchesBaseline(target, note)) throw ExternalConflictDetectedException()
+                                val staged=File(getApplication<Application>().cacheDir,"autosave-${UUID.randomUUID()}.tmp")
+                                try {
+                                    staged.outputStream().use { if(note.portable) media.writeLocalPortable(it,note.content,note.assetDirectory) else it.write(note.content.toByteArray()) }
+                                    if (!note.portable) copyAttachments(note,target)
+                                    resolver.openOutputStream(target,"wt")?.use { staged.inputStream().use { input->input.copyTo(it) } } ?: error("Cannot write this document")
+                                } finally {staged.delete()}
+                                target
+                            }
+                            if (note.portable) recordPortableBaseline(note.id, note.assetDirectory)
+                            clearDocumentAccessFailure(writtenTarget.toString())
+                            change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,assetsDirty=false,uri=writtenTarget.toString()) else it }, conflictedTabIds=s.conflictedTabIds-note.id) }
+                            mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
+                            if(mutable.value.tabs.any {it.id==note.id && it.dirty && !it.agentStaged && it.id !in mutable.value.conflictedTabIds})autosavePending.add(note.id)
+                            }
+                        }
+                    } catch (_: ExternalConflictDetectedException) {
+                        autosavePending.remove(note.id)
+                        change { s -> s.copy(conflictedTabIds = s.conflictedTabIds + note.id, message = "This file changed on disk. Autosave is paused for this tab.") }
+                    } catch(error:Exception) {if(isDocumentAccessFailure(error))requestDocumentAccess(note.uri!!,note,writing=true) else fail("Autosave paused: ${error.message}")}
+                }
             }
         }
     }
@@ -1359,12 +1411,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
 
     private fun change(block: (StudioState) -> StudioState) {
-        val previous = mutable.value
-        val next = block(previous)
-        mutable.value = next
+        val (previous, next) = synchronized(recoveryStateLock) {
+            val previous = mutable.value
+            val next = block(previous)
+            mutable.value = next
+            if (!viewModelRetired.get()) recoveryWriter.schedule(next)
+            previous to next
+        }
         syncNoteAssetScopes(previous, next)
         observeActive()
-        schedulePersist()
     }
     private fun restore(): StudioState {
         val restoredFolder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null)
@@ -1389,8 +1444,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if(indexResult.isSuccess)closedNoteIndexError=null else closedNoteIndexError=indexResult.exceptionOrNull()?.message ?: "invalid closed-note index"
         val refs=indexResult.getOrDefault(emptyList()).filterNot {it.id in activeIds}.take(ClosedNoteStore.LIMIT)
         closedNoteRefs=refs
-        return s.copy(activeId=activeId, closedTabs=closedNotesForRestore(refs,s.closedTabs,activeIds,indexResult.isSuccess),
-            error=closedNoteIndexError?.let {"Closed-note recovery index could not be read; historical snapshots were left untouched. $it"} ?: s.error)
+        return clearStagedOnActivate(s.copy(activeId=activeId, closedTabs=closedNotesForRestore(refs,s.closedTabs,activeIds,indexResult.isSuccess),
+            error=closedNoteIndexError?.let {"Closed-note recovery index could not be read; historical snapshots were left untouched. $it"} ?: s.error), activeId)
     }
     private lateinit var studioSettingsCache: StudioSettingsCoordinator
     private val studioSettings: StudioSettingsCoordinator
@@ -1416,11 +1471,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun readingLocation(uri: String?): JSONObject? = studioSettings.readingLocation(uri)
     fun readingPosition(id: String, location: JSONObject) = studioSettings.readingPosition(id, location)
     private fun recoverySignature(state: StudioState) = RecoverySnapshotSignature(
-        state.tabs, state.closedTabs, state.activeId, state.mode, state.normalZoom, state.fullscreenZoom,
+        state.tabs, state.closedTabs, state.activeId, state.mode, state.normalZoom, state.fullscreenZoom, state.agentJumpTabId,
     )
-    private fun schedulePersist() { recoveryWriter.schedule(mutable.value) }
-    fun flush(): Job? = recoveryWriter.flush(mutable.value)
-    internal suspend fun flushRecoveryAndAwait(): Boolean = recoveryWriter.flushAndAwait(mutable.value)
+    private fun schedulePersist() { synchronized(recoveryStateLock) { if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value) } }
+    fun flush(): Job? = synchronized(recoveryStateLock) { recoveryWriter.flush(mutable.value) }
+    internal fun latestScheduledRecoveryRevision(): Long = recoveryWriter.latestScheduledRevision()
+    internal fun committedRecoveryRevision(): Long = recoveryWriter.committedRevision()
+    internal suspend fun flushRecoveryAndAwait(): Boolean {
+        val revision = synchronized(recoveryStateLock) { recoveryWriter.submitImmediate(mutable.value) } ?: return false
+        return recoveryWriter.awaitRevisionResult(revision)
+    }
     // The exact String the reader last sent per note. Echoing it back on every
     // keystroke re-serializes the whole note on both sides and costs battery.
     val readerEcho = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -1442,19 +1502,183 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun preserveMalformedReaderResync(id: String?, content: String?) =
         readerProtocolAndOutline.preserveMalformedReaderResync(id, content)
 
+    private fun clearStagedOnActivate(state: StudioState, targetId: String): StudioState = state.copy(
+        tabs = state.tabs.map { if (it.id == targetId && it.agentStaged) it.copy(agentStaged = false) else it },
+        agentJumpTabId = state.agentJumpTabId?.takeUnless { it == targetId || state.tabs.none { tab -> tab.id == it } },
+    )
+    private fun resumeAutosaveIfActivatedStaged(wasStaged: Boolean, targetId: String) {
+        if (!wasStaged) return
+        val note = mutable.value.tabs.firstOrNull { it.id == targetId } ?: return
+        if (note.dirty && note.uri != null) scheduleAutosave(targetId)
+    }
+    fun markAgentBannerShown(id: String, before: String? = null, after: String? = null) {
+        val hasEdit = before != null && after != null && before != after
+        if (mutable.value.tabs.any { it.id == id && (!it.agentUnreviewed || hasEdit) }) {
+            change { s ->
+                s.copy(
+                    tabs = s.tabs.map {
+                        if (it.id == id) {
+                            val updatedEdits = if (hasEdit) {
+                                val nextSeq = maxOf(agentEditSeq, it.agentEdits.maxOfOrNull { step -> step.seq } ?: 0L) + 1L
+                                agentEditSeq = nextSeq
+                                appendAgentEditSteps(it.agentEdits, nextSeq, before!!, after!!)
+                            } else it.agentEdits
+                            it.copy(agentUnreviewed = true, agentEdits = updatedEdits)
+                        } else it
+                    },
+                )
+            }
+        }
+    }
+    fun dismissAgentBanner(id: String) {
+        if (mutable.value.tabs.any { it.id == id && it.agentUnreviewed } || mutable.value.agentJumpTabId == id) {
+            change { s ->
+                s.copy(
+                    tabs = s.tabs.map { if (it.id == id && it.agentUnreviewed) it.copy(agentUnreviewed = false) else it },
+                    agentJumpTabId = s.agentJumpTabId?.takeUnless { it == id },
+                )
+            }
+        }
+    }
+    fun dismissAgentJump() {
+        if (mutable.value.agentJumpTabId != null) change { it.copy(agentJumpTabId = null) }
+    }
     fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
     internal suspend fun commitAgentSnapshotPatch(id: String, expectedRevision: String, patchedContent: String, patchedRevision: String) = documentWrites.withLock {
         require(patchedContent.toByteArray(Charsets.UTF_8).size <= MAX_AGENT_SNAPSHOT_BYTES) { "The patched document exceeds Android's 2 MiB relay snapshot limit" }
-        val note = mutable.value.tabs.firstOrNull { it.id == id } ?: error("The requested note is no longer open")
+        val baseState = synchronized(recoveryStateLock) { mutable.value }
+        val note = baseState.tabs.firstOrNull { it.id == id } ?: error("The requested note is no longer open")
         require(agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) { "Revision conflict: the note changed before the patch could be saved" }
         require(agentContentRevision(patchedContent).equals(patchedRevision, ignoreCase = true)) { "The computed patch failed revision verification" }
         require(!closingNoteIds.contains(id)) { "The note is closing; retry the patch after it remains open" }
+        val maxAttempts = maxAgentStageAttempts.coerceAtLeast(1)
         if (note.content != patchedContent) {
-            readerEcho.remove(id)
-            readerEditProtocol.clear(id)
-            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(content = patchedContent) else it }) }
-            scheduleAutosave(id)
+            val nextSeq = maxOf(agentEditSeq, note.agentEdits.maxOfOrNull { it.seq } ?: 0L) + 1L
+            val updatedEdits = appendAgentEditSteps(note.agentEdits, nextSeq, note.content, patchedContent)
+            fun buildPatchedState(source: StudioState): StudioState {
+                val targetInactive = source.active.id != id
+                return source.copy(
+                    tabs = source.tabs.map {
+                        if (it.id == id) it.copy(
+                            content = patchedContent,
+                            agentStaged = if (targetInactive) true else it.agentStaged,
+                            agentUnreviewed = true,
+                            agentEdits = updatedEdits,
+                        ) else it
+                    },
+                    agentJumpTabId = if (targetInactive) id else source.agentJumpTabId?.takeUnless { it == id },
+                )
+            }
+            var observedBase = baseState
+            var stagedState = buildPatchedState(observedBase)
+            var anyAttemptCommitted = false
+            var committedTransition: Pair<StudioState, StudioState>? = null
+            for (attempt in 0 until maxAttempts) {
+                val outcome = recoveryWriter.flushAndAwaitExact(stagedState)
+                if (outcome.result == LatestRecoveryWriter.ExactFlushResult.COMMITTED) {
+                    anyAttemptCommitted = true
+                }
+                if (outcome.result == LatestRecoveryWriter.ExactFlushResult.FAILED) {
+                    synchronized(recoveryStateLock) {
+                        if (!viewModelRetired.get()) {
+                            if (anyAttemptCommitted) recoveryWriter.flush(mutable.value)
+                            else recoveryWriter.schedule(mutable.value)
+                        }
+                    }
+                    throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                }
+                val isLastAttempt = attempt == maxAttempts - 1
+                synchronized(recoveryStateLock) {
+                    if (viewModelRetired.get()) {
+                        throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                    }
+                    while (true) {
+                        val latest = mutable.value
+                        val latestNote = latest.tabs.firstOrNull { it.id == id }
+                        if (latestNote == null || closingNoteIds.contains(id)) {
+                            recoveryWriter.flush(latest)
+                            error(if (latestNote == null) "The requested note is no longer open" else "The note is closing; retry the patch after it remains open")
+                        }
+                        if (latestNote.content != note.content) {
+                            recoveryWriter.flush(latest)
+                            throw IllegalArgumentException("Revision conflict: the note changed before the patch could be saved")
+                        }
+                        if (outcome.result == LatestRecoveryWriter.ExactFlushResult.COMMITTED &&
+                            recoverySignature(latest) == recoverySignature(observedBase) &&
+                            recoveryWriter.committedRevision() == outcome.revision &&
+                            recoveryWriter.latestScheduledRevision() == outcome.revision
+                        ) {
+                            val committedState = if (latest === observedBase) {
+                                stagedState
+                            } else {
+                                latest.copy(tabs = stagedState.tabs, agentJumpTabId = stagedState.agentJumpTabId)
+                            }
+                            if (!mutable.compareAndSet(latest, committedState)) continue
+                            agentEditSeq = maxOf(agentEditSeq, nextSeq)
+                            readerEcho.remove(id)
+                            clearReaderEditProtocol(id)
+                            committedTransition = latest to committedState
+                        } else if (isLastAttempt) {
+                            recoveryWriter.flush(latest)
+                            throw IllegalStateException("Could not confirm recovery snapshot for the agent patch during concurrent workspace activity; retry the patch")
+                        } else {
+                            observedBase = latest
+                            stagedState = buildPatchedState(observedBase)
+                        }
+                        break
+                    }
+                }
+                val transition = committedTransition
+                if (transition != null) {
+                    val (previous, committedState) = transition
+                    val isInactive = committedState.active.id != id
+                    syncNoteAssetScopes(previous, committedState)
+                    observeActive()
+                    if (!isInactive) scheduleAutosave(id)
+                    break
+                }
+            }
+        } else if (baseState.active.id != id && (note.dirty || note.agentStaged)) {
+            var currentState = baseState
+            for (attempt in 0 until maxAttempts) {
+                val outcome = recoveryWriter.flushAndAwaitExact(currentState)
+                if (outcome.result == LatestRecoveryWriter.ExactFlushResult.FAILED) {
+                    synchronized(recoveryStateLock) {
+                        if (!viewModelRetired.get()) recoveryWriter.schedule(mutable.value)
+                    }
+                    throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                }
+                val isLastAttempt = attempt == maxAttempts - 1
+                var confirmed = false
+                synchronized(recoveryStateLock) {
+                    if (viewModelRetired.get()) {
+                        throw IllegalStateException("Could not save recovery snapshot for the agent patch; retry the patch")
+                    }
+                    val latest = mutable.value
+                    val latestNote = latest.tabs.firstOrNull { it.id == id }
+                    if (latestNote == null || closingNoteIds.contains(id)) {
+                        recoveryWriter.flush(latest)
+                        error(if (latestNote == null) "The requested note is no longer open" else "The note is closing; retry the patch after it remains open")
+                    }
+                    if (latestNote.content != note.content) {
+                        recoveryWriter.flush(latest)
+                        throw IllegalArgumentException("Revision conflict: the note changed before the patch could be saved")
+                    }
+                    if (outcome.result == LatestRecoveryWriter.ExactFlushResult.COMMITTED &&
+                        recoveryWriter.committedRevision() == outcome.revision &&
+                        recoveryWriter.latestScheduledRevision() == outcome.revision
+                    ) {
+                        confirmed = true
+                    } else if (isLastAttempt) {
+                        recoveryWriter.flush(latest)
+                        throw IllegalStateException("Could not confirm recovery snapshot for the agent patch during concurrent workspace activity; retry the patch")
+                    } else {
+                        currentState = latest
+                    }
+                }
+                if (confirmed) break
+            }
         }
     }
     fun newNote(titleHint: String? = null, content: String? = null, background: Boolean = false, format: String = "md", onCreated: ((Note?) -> Unit)? = null) {
@@ -1495,16 +1719,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         // that began earlier and is still waiting on I/O or the reader flush.
         openRequests.invalidate()
         viewModelScope.launch {
+            var wasStaged = false
             var switchedUri: Uri? = null
             val accepted=performReaderBarrier(expectedActiveId) {
                 val target = mutable.value.tabs.find { it.id == targetId }
-                if(target != null) {
-                    change {it.copy(activeId=targetId)}
+                if (target != null) {
+                    wasStaged = target.agentStaged
+                    change { clearStagedOnActivate(it.copy(activeId = targetId), targetId) }
                     if (target.id !in mutable.value.conflictedTabIds) switchedUri = target.uri?.let(Uri::parse)
                 }
             }
-            if(!accepted)readerBarrierFailed()
-            else if(switchedUri != null)refreshExternal(switchedUri, immediate = true)
+            if (!accepted) {
+                readerBarrierFailed()
+            } else {
+                resumeAutosaveIfActivatedStaged(wasStaged, targetId)
+                if (switchedUri != null) refreshExternal(switchedUri, immediate = true)
+            }
         }
     }
     private data class RefreshTabSnapshot(
@@ -1640,13 +1870,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         change { state ->
             val remaining = state.tabs.filterNot { it.id == id }
             val next = remaining.ifEmpty { listOf(Note()) }
-            state.copy(
-                tabs = next,
-                activeId = if (state.active.id == id) next.first().id else state.activeId,
-                conflictedTabIds = state.conflictedTabIds - id,
-                pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
-                pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
-                message = "Empty tab discarded",
+            val nextActive = if (state.active.id == id) next.first().id else state.activeId
+            clearStagedOnActivate(
+                state.copy(
+                    tabs = next,
+                    activeId = nextActive,
+                    conflictedTabIds = state.conflictedTabIds - id,
+                    pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
+                    pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
+                    message = "Empty tab discarded",
+                ),
+                nextActive,
             )
         }
     }
@@ -1673,14 +1907,21 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     ) {
         var previousActiveId = ""
         var requestedConfirmation = false
+        var activatedStagedOnConfirm = false
+        var stagedBeforeClose = emptySet<String>()
         var preserve = false
         var revisionError: String? = null
         var closeError: String? = null
         val accepted = performCurrentReaderBarrier { currentActiveId ->
             previousActiveId = currentActiveId
+            stagedBeforeClose = mutable.value.tabs.filter { it.agentStaged }.map { it.id }.toSet()
             val note = mutable.value.tabs.find { it.id == id } ?: return@performCurrentReaderBarrier
             if (confirmIfRequired && note.requiresCloseConfirmation) {
-                change { state -> state.copy(activeId = if (state.tabs.any { it.id == id }) id else state.activeId, pendingCloseNoteId = id) }
+                activatedStagedOnConfirm = id != currentActiveId && note.agentStaged
+                change { state ->
+                    val nextActive = if (state.tabs.any { it.id == id }) id else state.activeId
+                    clearStagedOnActivate(state.copy(activeId = nextActive, pendingCloseNoteId = id), nextActive)
+                }
                 requestedConfirmation = true
                 return@performCurrentReaderBarrier
             }
@@ -1704,16 +1945,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             return
         }
         if (requestedConfirmation) {
+            resumeAutosaveIfActivatedStaged(activatedStagedOnConfirm, id)
             onComplete?.invoke(null)
             return
         }
         if (revisionError != null) { onComplete?.invoke(revisionError); return }
         if (closeError != null) { onComplete?.invoke(closeError); return }
-        if (preserve) closeAfterReaderBarrier(id)
+        if (preserve) {
+            stagedBeforeClose = stagedBeforeClose + mutable.value.tabs.filter { it.agentStaged }.map { it.id }
+            closeAfterReaderBarrier(id)
+        }
         val afterClose = mutable.value
         if (afterClose.tabs.any { it.id == id }) {
             onComplete?.invoke("The note could not be closed; it remains open")
             return
+        }
+        if (afterClose.active.id != previousActiveId && afterClose.active.id in stagedBeforeClose) {
+            resumeAutosaveIfActivatedStaged(true, afterClose.active.id)
         }
         if (afterClose.active.id != previousActiveId && !awaitReaderSnapshot(afterClose.active.id)) {
             val message = "The note was closed and preserved, but the active reader is still loading; refresh the tabs before the next action."
@@ -1777,12 +2025,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             change { state ->
                 val remaining = state.tabs.filterNot { it.id == id }
                 val next = remaining.ifEmpty { listOf(Note()) }
-                state.copy(tabs = next, closedTabs = (listOf(reference.placeholder()) + state.closedTabs.filterNot { it.id == id }).take(ClosedNoteStore.LIMIT),
-                    activeId = if (state.active.id == id) next.first().id else state.activeId,
+                val nextActive = if (state.active.id == id) next.first().id else state.activeId
+                clearStagedOnActivate(state.copy(tabs = next, closedTabs = (listOf(reference.placeholder()) + state.closedTabs.filterNot { it.id == id }).take(ClosedNoteStore.LIMIT),
+                    activeId = nextActive,
                     conflictedTabIds = state.conflictedTabIds - id,
                     pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
                     pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
-                    message = "Tab closed. Reopen from the menu to recover edits.")
+                    message = "Tab closed. Reopen from the menu to recover edits."), nextActive)
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
@@ -1801,6 +2050,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         viewModelScope.launch {
             val note=try {if(reference==null)referenceNote else withContext(Dispatchers.IO){closedNoteStore.load(reference)}}
                 catch(error:Exception) {mutable.value=mutable.value.copy(message="Could not reopen the closed note: ${error.message}");return@launch}
+            var wasStaged = false
             var updatedRefs: List<ClosedNoteReference>? = null
             val accepted = closedNoteMutex.withLock {
                 performCurrentReaderBarrier {
@@ -1811,8 +2061,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     updatedRefs = closedNoteRefs
                     change { state ->
                         val existing=state.tabs.find {it.id==note.id}
+                        wasStaged = (existing ?: note).agentStaged
                         val tabs=if(existing==null)state.tabs+note else state.tabs
-                        state.copy(tabs=tabs,closedTabs=state.closedTabs.dropWhile {it.id==referenceNote.id}.filterNot {it.id==referenceNote.id},activeId=note.id)
+                        clearStagedOnActivate(state.copy(tabs=tabs,closedTabs=state.closedTabs.dropWhile {it.id==referenceNote.id}.filterNot {it.id==referenceNote.id},activeId=note.id), note.id)
                     }
                 }.also { barrierAccepted ->
                     if (barrierAccepted) {
@@ -1825,6 +2076,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
             }
             if(!accepted)readerBarrierFailed()
+            else resumeAutosaveIfActivatedStaged(wasStaged, note.id)
         }
     }
     fun recoverDeletedDraft() {
@@ -1840,14 +2092,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 // draft. A failed snapshot read falls back to that durable source.
                 val restored=if(ref!=null)withContext(Dispatchers.IO){closedNoteStore.loadForRecovery(ref,note)}
                     else legacy?.takeIf {it.content.isNotEmpty() || it.saved.isNotEmpty() || it.assetDirectory!=null} ?: note
+                var wasStaged = false
                 val accepted=performReaderBarrier(expectedActiveId) {
                     closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                     change {s->
-                        if(s.tabs.any {it.id==note.id})s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
+                        val existing = s.tabs.find { it.id == note.id }
+                        wasStaged = (existing ?: restored).agentStaged
+                        val updated = if(existing != null)s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
                         else s.copy(tabs=s.tabs+restored,activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
+                        clearStagedOnActivate(updated, note.id)
                     }
                 }
-                if(!accepted)readerBarrierFailed()
+                if(accepted)resumeAutosaveIfActivatedStaged(wasStaged, note.id) else readerBarrierFailed()
             }
         }
     }
@@ -2200,14 +2456,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun retainOpenedNote(note: Note, activate: Boolean, headingFragment: String? = null): String {
         val existing = mutable.value.tabs.find { it.uri != null && note.uri != null && sameDocumentUri(it.uri, note.uri) }
         val targetId = existing?.id ?: note.id
+        val wasStaged = activate && (existing?.agentStaged == true || note.agentStaged)
         val jump = headingFragment?.takeIf { it.isNotBlank() }?.let { PendingHeadingJump(targetId, it, UUID.randomUUID().toString()) }
         change { state ->
-            state.copy(
+            val updated = state.copy(
                 tabs = if (existing != null) state.tabs.map { if (it.id == existing.id) it.copy(uri = note.uri, relative = note.relative ?: it.relative) else it } else state.tabs + note,
                 activeId = if (activate) targetId else state.activeId,
                 pendingHeading = if (activate) jump else state.pendingHeading,
             )
+            if (activate) clearStagedOnActivate(updated, targetId) else updated
         }
+        if (activate) resumeAutosaveIfActivatedStaged(wasStaged, targetId)
         mutable.value.tabs.firstOrNull { it.id == targetId }?.let(::remember)
         return targetId
     }
@@ -2480,7 +2739,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                     "The note changed while it was saving; the portable file was restored"
                                 }
                                 recordPortableBaseline(id, nextDirectory)
-                                change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = nextDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
+                                autosavePending.remove(id)
+                                change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = nextDirectory, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = state.agentJumpTabId?.takeUnless { it == id }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
                                 mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                                 openedDirectory = null
                             }
@@ -2524,7 +2784,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         "The note changed while Save As was writing; the new copy was removed"
                     }
                     if (note.portable) recordPortableBaseline(id, note.assetDirectory)
-                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(uri = destination.toString(), name = savedName, saved = note.content, assetsDirty = false, assetDirectory = note.assetDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id }, busy = false, message = "Saved as $savedName") }
+                    autosavePending.remove(id)
+                    change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(uri = destination.toString(), name = savedName, saved = note.content, assetsDirty = false, assetDirectory = note.assetDirectory, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = state.agentJumpTabId?.takeUnless { it == id }, conflictedTabIds = state.conflictedTabIds - id, pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id }, busy = false, message = "Saved as $savedName") }
                     mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                 }
             } catch (error: Exception) {
@@ -2592,13 +2853,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         portableForceOverwrite = false
         closeAfterSaveNoteId = null
     }
-    private suspend fun synchronizeNoteForSave(noteId: String): Boolean {
+    private suspend fun synchronizeNoteForSave(noteId: String, resumeAutosave: Boolean = false): Boolean {
         var targetOpen = false
+        var wasStaged = false
         val barrierAccepted = try {
             performCurrentReaderBarrier { currentActiveId ->
                 targetOpen = mutable.value.tabs.any { it.id == noteId }
                 if (targetOpen && currentActiveId != noteId) {
-                    change { it.copy(activeId = noteId) }
+                    wasStaged = mutable.value.tabs.firstOrNull { it.id == noteId }?.agentStaged == true
+                    change { clearStagedOnActivate(it.copy(activeId = noteId), noteId) }
                 }
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -2613,6 +2876,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if (!targetOpen) {
             closeAfterSaveNoteId = null
             return false
+        }
+        if (resumeAutosave) {
+            resumeAutosaveIfActivatedStaged(wasStaged, noteId)
         }
         return true
     }
@@ -2649,7 +2915,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun beginSaveAs(noteId: String = mutable.value.active.id) {
         if (mutable.value.busy) return
         viewModelScope.launch {
-            if (!synchronizeNoteForSave(noteId)) return@launch
+            if (!synchronizeNoteForSave(noteId, resumeAutosave = true)) return@launch
             val note = mutable.value.tabs.find { it.id == noteId } ?: return@launch
             val picker = requestSaveAs
             if (picker != null) picker(note) else closeAfterSaveNoteId = null
@@ -2812,7 +3078,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             savedPortableAssets.remove(note.id)
             autosavePending.remove(note.id)
             clearDocumentAccessFailure(writtenTarget.toString())
-            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, relative = openRel ?: it.relative, assetsDirty = false, assetDirectory = null) else it }, conflictedTabIds = s.conflictedTabIds - note.id, pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == note.id }, message = "Saved") }
+            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, relative = openRel ?: it.relative, assetsDirty = false, assetDirectory = null, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = s.agentJumpTabId?.takeUnless { it == note.id }, conflictedTabIds = s.conflictedTabIds - note.id, pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == note.id }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
             if (openRel != null) mutable.value.folder?.let { listFolder(Uri.parse(it), listedRelative) }
             if (closeAfterSaveNoteId == note.id) {
@@ -3811,8 +4077,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                         uri = destination.toString(),
                                         relative = openRel ?: it.relative,
                                         assetDirectory = nextDirectory,
+                                        agentStaged = false,
+                                        agentUnreviewed = false,
                                     ) else it
                                 },
+                                agentJumpTabId = s.agentJumpTabId?.takeUnless { it == effectiveId },
                                 conflictedTabIds = s.conflictedTabIds - effectiveId,
                                 pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == effectiveId },
                                 busy = false,

@@ -650,6 +650,265 @@ test('get_context reads visible text, reading.offset, and active selection acros
   expect(liveCtx.selection.text).toBe('Target phrase');
 });
 
+test('background agent edits record isolated cross-mode undo steps and support one-tap banner undo',async({page})=>{
+  const initial='# Project Plan\n\nOriginal paragraph.\n';
+  await page.addInitScript(seed=>{
+    const native={content:seed,revision:0,bannerEvents:[] as Array<{command:string;args:any}>};
+    (window as any).__agentNative=native;
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);let result:any=true;
+      if(command==='document_sync'){
+        result={accepted:args.content===native.content,revision:native.revision};
+      }else if(command==='document_patch'){
+        if(args.baseRevision!==native.revision)result={accepted:false,revision:native.revision};
+        else{
+          for(const change of [...args.changes].reverse())native.content=native.content.slice(0,change.from)+change.insert+native.content.slice(change.to);
+          native.revision=args.revision;result={accepted:true,revision:native.revision};
+        }
+      }else if(command==='document_resync'){
+        native.content=args.content;native.revision=0;result={accepted:true,revision:0};
+      }else if(command==='agent_banner_shown'||command==='agent_banner_dismissed'){
+        native.bannerEvents.push({command,args});
+      }
+      window.setTimeout(()=>window.supermdReply?.(id,result,null),0);
+    }};
+  },initial);
+
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const baseState={id:'bg-undo-note',path:'/tmp/plan.md',content:initial,mode:'editor' as const,dark:false,
+    fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,editProtocol:1,restorePosition:false};
+  await page.evaluate(value=>window.supermdLoad?.(value),baseState);
+
+  const editor=page.locator('.cm-content');
+  await expect(editor).toBeVisible();
+  await editor.click();
+  await page.keyboard.press('Control+End');
+  await page.keyboard.insertText('User line.\n');
+  const afterUser=initial+'User line.\n';
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(afterUser);
+
+  // Simulate switching away and receiving two background agent patches before re-opening this tab in Live mode.
+  const patch1=afterUser.replace('Original paragraph.','Agent revision one.');
+  const patch2=patch1+'Agent summary section.\n';
+  await page.evaluate(({state,patch1,patch2,afterUser})=>{
+    (window as any).__agentNative.content=patch2;
+    (window as any).__agentNative.revision=0;
+    window.supermdLoad?.({
+      ...state,
+      mode:'live',
+      content:patch2,
+      agentUnreviewed:true,
+      pendingAgentEdits:[
+        {seq:1,before:afterUser,after:patch1},
+        {seq:2,before:patch1,after:patch2},
+      ],
+    });
+  },{state:baseState,patch1,patch2,afterUser});
+
+  const banner=page.getByTestId('agent-edit-banner');
+  await expect(banner).toBeVisible();
+  await expect(banner).toContainText('Updated by AI agent');
+
+  // Step 1 (Live mode): One-tap Undo on banner reverts patch 2 -> patch 1 and dismisses banner.
+  await page.getByTestId('agent-banner-undo').click();
+  await expect(banner).toBeHidden();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(patch1);
+  expect(await page.evaluate(()=>(window as any).__agentNative.bannerEvents.map((e:any)=>e.command))).toContain('agent_banner_dismissed');
+
+  // Step 2 (Split mode): Undo reverts patch 1 -> afterUser in a single step.
+  await page.evaluate(({state,patch1})=>window.supermdLoad?.({...state,mode:'split',content:patch1,contentUnchanged:true,agentUnreviewed:false}),{state:baseState,patch1});
+  await page.evaluate(()=>window.supermdHistory?.('undo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(afterUser);
+
+  // Step 3 (Read mode): Undo still preserves and reverts the earlier user edit (afterUser -> initial).
+  await page.evaluate(({state,afterUser})=>window.supermdLoad?.({...state,mode:'reader',content:afterUser,contentUnchanged:true,agentUnreviewed:false}),{state:baseState,afterUser});
+  await page.evaluate(()=>window.supermdHistory?.('undo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(initial);
+
+  // Step 4 (Source mode): Redo restores user edit, patch 1, and patch 2, and Undo reverts patch 2 in Source mode.
+  await page.evaluate(({state,initial})=>window.supermdLoad?.({...state,mode:'editor',content:initial,contentUnchanged:true,agentUnreviewed:false}),{state:baseState,initial});
+  await expect(page.locator('.cm-content')).toBeVisible();
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(afterUser);
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(patch1);
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(patch2);
+  await page.evaluate(()=>window.supermdHistory?.('undo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toBe(patch1);
+});
+
+test('active-tab agent edit displays dismissible banner and one-tap undo restores pre-edit content',async({page})=>{
+  const content='# Active Note\n\nBaseline content.\n';
+  await page.addInitScript(seed=>{
+    const native={content:seed,revision:0,bannerEvents:[] as string[]};
+    (window as any).__agentNative=native;
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);let result:any=true;
+      if(command==='document_sync')result={accepted:args.content===native.content,revision:native.revision};
+      else if(command==='document_patch'){
+        for(const change of [...args.changes].reverse())native.content=native.content.slice(0,change.from)+change.insert+native.content.slice(change.to);
+        native.revision=args.revision;result={accepted:true,revision:native.revision};
+      }else if(command==='document_resync'){
+        native.content=args.content;native.revision=0;result={accepted:true,revision:0};
+      }else if(command==='agent_banner_shown'||command==='agent_banner_dismissed'){
+        native.bannerEvents.push(command);
+      }
+      window.setTimeout(()=>window.supermdReply?.(id,result,null),0);
+    }};
+  },content);
+
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:'active-banner-note',path:null,content,mode:'reader',
+    dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,editProtocol:1,restorePosition:false});
+  await expect(page.getByRole('heading',{name:'Active Note',exact:true})).toBeVisible();
+
+  const ctx1:any=await agent(page,{action:'get_context',tabId:'active-banner-note'});
+  await agent(page,{action:'patch_tab',tabId:'active-banner-note',expectedRevision:ctx1.revision,
+    operations:[{type:'replace',old:'Baseline content.',new:'First AI update.'}]});
+
+  const banner=page.getByTestId('agent-edit-banner');
+  await expect(banner).toBeVisible();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.bannerEvents)).toContain('agent_banner_shown');
+
+  await page.getByTestId('agent-banner-dismiss').click();
+  await expect(banner).toBeHidden();
+  expect(await page.evaluate(()=>(window as any).__agentNative.content)).toContain('First AI update.');
+  expect(await page.evaluate(()=>(window as any).__agentNative.bannerEvents)).toContain('agent_banner_dismissed');
+
+  const ctx2:any=await agent(page,{action:'get_context',tabId:'active-banner-note'});
+  await agent(page,{action:'patch_tab',tabId:'active-banner-note',expectedRevision:ctx2.revision,
+    operations:[{type:'replace',old:'First AI update.',new:'Second AI update.'}]});
+  await expect(banner).toBeVisible();
+  await page.getByTestId('agent-banner-undo').click();
+  await expect(banner).toBeHidden();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toContain('First AI update.');
+});
+
+test('dirty draft coauthoring in current reader survives session restore, undoes back to dirty draft, and saves cleanly',async({page})=>{
+  const diskInitial='# Field Notes\n\nCommitted disk paragraph.\n';
+  await page.addInitScript(seed=>{
+    const key='__supermdDirtyDraftHost';
+    const persisted=window.sessionStorage.getItem(key);
+    const host=persisted?JSON.parse(persisted):{
+      diskContent:seed,
+      saved:seed,
+      content:seed,
+      revision:0,
+      seq:0,
+      agentUnreviewed:false,
+      agentEdits:[] as Array<{seq:number;before:string;after:string}>,
+    };
+    const persist=()=>window.sessionStorage.setItem(key,JSON.stringify(host));
+    persist();
+    (window as any).__dirtyHost=host;
+    (window as any).__saveDirtyHost=()=>{
+      host.diskContent=host.content;
+      host.saved=host.content;
+      host.agentUnreviewed=false;
+      persist();
+    };
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);let result:any=true;
+      if(command==='document_sync'){
+        result={accepted:args.content===host.content,revision:host.revision};
+      }else if(command==='document_patch'){
+        if(args.baseRevision!==host.revision)result={accepted:false,revision:host.revision};
+        else{
+          for(const change of [...args.changes].reverse())host.content=host.content.slice(0,change.from)+change.insert+host.content.slice(change.to);
+          host.revision=args.revision;persist();result={accepted:true,revision:host.revision};
+        }
+      }else if(command==='document_resync'){
+        host.content=args.content;host.revision=0;persist();result={accepted:true,revision:0};
+      }else if(command==='agent_banner_shown'){
+        host.agentUnreviewed=true;
+        if(typeof args.before==='string'&&typeof args.after==='string'&&args.before!==args.after){
+          host.seq+=1;
+          host.agentEdits.push({seq:host.seq,before:args.before,after:args.after});
+        }
+        persist();
+      }else if(command==='agent_banner_dismissed'){
+        host.agentUnreviewed=false;persist();
+      }
+      window.setTimeout(()=>window.supermdReply?.(id,result,null),0);
+    }};
+  },diskInitial);
+
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const baseState={id:'dirty-draft-note',path:'/tmp/FieldNotes.md',mode:'live' as const,dark:false,
+    fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,editProtocol:1,restorePosition:false};
+  await page.evaluate(state=>window.supermdLoad?.({...state,content:(window as any).__dirtyHost.content}),baseState);
+
+  // User edits a Live block to create an unsaved dirty draft while diskContent stays untouched.
+  await page.getByText('Committed disk paragraph.').dblclick();
+  const blockEditor=page.getByRole('textbox',{name:'Edit Markdown block'});
+  await expect(blockEditor).toBeFocused();
+  await blockEditor.press('End');
+  await blockEditor.type(' Unsaved user observation.');
+  await blockEditor.press('Escape');
+  await expect(blockEditor).toBeHidden();
+
+  const expectedDirty='# Field Notes\n\nCommitted disk paragraph. Unsaved user observation.\n';
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.content)).toBe(expectedDirty);
+  expect(await page.evaluate(()=>(window as any).__dirtyHost.diskContent)).toBe(diskInitial);
+
+  // AI coauthors on top of the active dirty draft; native echoes loadReader with pendingAgentEdits.
+  const ctx:any=await agent(page,{action:'get_context',tabId:'dirty-draft-note'});
+  const expectedCoauthored=expectedDirty+'\n## AI Appendix\n\nSynthesized takeaway.\n';
+  await agent(page,{action:'patch_tab',tabId:'dirty-draft-note',expectedRevision:ctx.revision,
+    operations:[{type:'replace',old:'Unsaved user observation.\n',new:'Unsaved user observation.\n\n## AI Appendix\n\nSynthesized takeaway.\n'}]});
+  await expect(page.getByTestId('agent-edit-banner')).toBeVisible();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.agentEdits.length)).toBe(1);
+  await page.evaluate(state=>{
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,content:host.content,contentUnchanged:true,agentUnreviewed:host.agentUnreviewed,pendingAgentEdits:host.agentEdits});
+  },baseState);
+
+  // Cold reload / restore into a brand-new current reader instance before saving to disk.
+  await page.reload();
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(state=>{
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,content:host.content,agentUnreviewed:host.agentUnreviewed,pendingAgentEdits:host.agentEdits});
+  },baseState);
+
+  const restoredBanner=page.getByTestId('agent-edit-banner');
+  await expect(restoredBanner).toBeVisible();
+  await expect(page.getByRole('heading',{name:'AI Appendix',exact:true})).toBeVisible();
+  expect(await page.evaluate(()=>(window as any).__dirtyHost.diskContent)).toBe(diskInitial);
+
+  // One-tap Undo on the restored banner reverts to the user's dirty draft without losing unsaved text!
+  await page.getByTestId('agent-banner-undo').click();
+  await expect(restoredBanner).toBeHidden();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.content)).toBe(expectedDirty);
+  expect(await page.evaluate(()=>(window as any).__dirtyHost.diskContent)).toBe(diskInitial);
+
+  // Switch to Source mode, Redo back to the coauthored draft, then Save to disk and verify reader stays clean.
+  await page.evaluate(state=>{
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,mode:'editor',content:host.content,contentUnchanged:true,agentUnreviewed:host.agentUnreviewed});
+  },baseState);
+  await expect(page.locator('.cm-content')).toBeVisible();
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.content)).toBe(expectedCoauthored);
+
+  await page.evaluate(state=>{
+    (window as any).__saveDirtyHost();
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,mode:'live',content:host.content,contentUnchanged:true,agentUnreviewed:false});
+  },baseState);
+  await expect(page.locator('.reader-edit-error')).toHaveCount(0);
+  await expect(page.getByRole('heading',{name:'AI Appendix',exact:true})).toBeVisible();
+  expect(await page.evaluate(()=>({
+    disk:(window as any).__dirtyHost.diskContent,
+    saved:(window as any).__dirtyHost.saved,
+    content:(window as any).__dirtyHost.content,
+  }))).toEqual({disk:expectedCoauthored,saved:expectedCoauthored,content:expectedCoauthored});
+});
+
 test('get_context includes displayed frontmatter title, author, and tags while preserving canonical source offsets across scroll positions',async({page})=>{
   const paragraphs=Array.from({length:45},(_,i)=>`Paragraph ${i}: body prose with Unicode 🧭 and canonical offset tracking.`).join('\n\n');
   const content=[

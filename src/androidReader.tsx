@@ -70,9 +70,10 @@ function isTextEntryField(target: EventTarget | null): boolean {
   return !/^(?:checkbox|radio|range|button|submit|reset|file|color|image|hidden)$/i.test(target.type);
 }
 interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing';completed:number;total:number;cancelRequested?:boolean}
+interface PendingAgentEdit {seq:number;before:string;after:string}
 
 import { handoffSharedSourceAnchorOnLoad, parseImportedAnchor, snapshotOutgoingTabOrPathAnchor, useSharedSourceAnchor, type NoteView, type PendingHeadingNavigation } from "./useSharedSourceAnchor";
-interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; portable?: boolean; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
+interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; portable?: boolean; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView; pendingAgentEdits?: PendingAgentEdit[]; agentUnreviewed?: boolean }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
 declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
@@ -206,6 +207,16 @@ export function Reader() {
   if(!edits.current)edits.current=new ReaderEdits((command,args)=>invoke(command,args));
   const [editError,setEditError]=useState('');
   const [themeGuide,setThemeGuide]=useState(false);
+  const [agentBannerNotes,setAgentBannerNotes]=useState<Record<string,boolean>>({});
+  const appliedAgentSeq=useRef(new Map<string,number>());
+  const localAgentEdits=useRef(new Map<string,Array<{before:string;after:string}>>());
+  const showAgentBanner=useCallback((noteId:string)=>{
+    setAgentBannerNotes(prev=>prev[noteId]?prev:{...prev,[noteId]:true});
+  },[]);
+  const dismissAgentBanner=useCallback((noteId:string)=>{
+    setAgentBannerNotes(prev=>{if(!prev[noteId])return prev;const next={...prev};delete next[noteId];return next;});
+    void invoke('agent_banner_dismissed',{id:noteId}).catch(()=>{});
+  },[]);
   const zoomReference = useRef(100);
   const zoomGestureAt = useRef(0);
   const pendingChange = useRef(0);
@@ -269,7 +280,7 @@ export function Reader() {
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
-      const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      const {contentUnchanged,seededFind,pendingAgentEdits,agentUnreviewed,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
       const applyIncomingFind=(targetContent:string)=>{
         if(seededFind&&typeof seededFind.query==='string'){
           if(willSeedNavigate(targetContent,seededFind.query,seededFind.caseSensitive,seededFind.sourceStart,seededFind.sourceEnd,seededFind.matchText)){
@@ -282,6 +293,43 @@ export function Reader() {
           requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:false}})));
         }
       };
+      const applyPendingAgentEdits = (targetId: string) => {
+        if (!Array.isArray(pendingAgentEdits) || pendingAgentEdits.length === 0 || !targetId) return;
+        let lastSeq = appliedAgentSeq.current.get(targetId) ?? 0;
+        const unseen = pendingAgentEdits
+          .filter((item): item is PendingAgentEdit => !!item && typeof item.seq === "number" && item.seq > lastSeq && typeof item.before === "string" && typeof item.after === "string")
+          .sort((a, b) => a.seq - b.seq);
+        if (unseen.length === 0) return;
+        const localQueue = localAgentEdits.current.get(targetId);
+        let history = histories.current.get(targetId);
+        let recordedAny = false;
+        for (const step of unseen) {
+          const localIdx = localQueue ? localQueue.findIndex(item => item.before === step.before && item.after === step.after) : -1;
+          if (localIdx >= 0 && localQueue) {
+            localQueue.splice(0, localIdx + 1);
+            if (localQueue.length === 0) localAgentEdits.current.delete(targetId);
+          } else {
+            if (!history) history = { undo: [], redo: [], last: -1000 };
+            history.last = -1000;
+            applyHistoryEdit(history, step.before, step.after, 0, { isolateHistory: true });
+            history.last = -1000;
+            window.dispatchEvent(new CustomEvent("supermd-sync-cached-editor", { detail: { id: targetId, before: step.before, after: step.after } }));
+            recordedAny = true;
+          }
+          lastSeq = step.seq;
+        }
+        appliedAgentSeq.current.set(targetId, lastSeq);
+        if (recordedAny && history) {
+          histories.current.delete(targetId);
+          histories.current.set(targetId, history);
+          trimHistories(targetId);
+        }
+      };
+      if (agentUnreviewed === true && typeof rest.id === "string") {
+        setAgentBannerNotes(prev => prev[rest.id] ? prev : { ...prev, [rest.id]: true });
+      } else if (agentUnreviewed === false && typeof rest.id === "string") {
+        setAgentBannerNotes(prev => { if (!prev[rest.id]) return prev; const nextBanner = { ...prev }; delete nextBanner[rest.id]; return nextBanner; });
+      }
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
       const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
       const rawPending=(rest as {pendingHeading?:PendingHeadingNavigation|string|null}).pendingHeading;
@@ -320,7 +368,7 @@ export function Reader() {
         refs: { consumedHeadingToken, suppressedRestoreToken, savePosition, modeAnchor, splitPane },
         onHistoryBoundary: () => { const history = histories.current.get(next.id); if (history) history.last = 0; },
       });
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind(next.content);return;}
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyPendingAgentEdits(next.id);applyIncomingFind(next.content);return;}
       snapshotOutgoingTabOrPathAnchor({
         old,
         next,
@@ -341,6 +389,7 @@ export function Reader() {
       } else if (old && old.id !== next.id) {
         trimHistories(next.id);
       }
+      applyPendingAgentEdits(next.id);
       // Native snapshots may have been queued before the latest pinch frame.
       // Within one workspace mode the reader owns its gesture scale; explicit
       // native zoom controls use supermdSetZoom instead of echoing a snapshot.
@@ -391,16 +440,21 @@ export function Reader() {
       if(isTextEntryField(activeEl)){
         const inLiveBlock=activeEl instanceof HTMLTextAreaElement&&Boolean(activeEl.closest('.live-active-block'));
         if(!inLiveBlock){document.execCommand(direction);return;}
-        if(tryLiveTextareaHistory(direction))return;
+        if(tryLiveTextareaHistory(direction)){
+          if(direction==="undo"&&reference.current)dismissAgentBanner(reference.current.id);
+          return;
+        }
       }
       const current=reference.current;if(!current)return;
       replaying.current=true;
+      let applied=false;
       try{
         const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
-        if(next!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(next);}
-        else if(current.mode==="editor"||current.mode==="split")editorHistory(current.id,direction);
-        else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(cached);}}
+        if(next!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(next);applied=true;}
+        else if(current.mode==="editor"||current.mode==="split")applied=editorHistory(current.id,direction);
+        else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined){if(current.mode==='live')setHistoryReplayToken(n=>n+1);update(cached);applied=true;}}
       }finally{replaying.current=false;}
+      if(applied&&direction==="undo")dismissAgentBanner(current.id);
     };
     window.supermdFormat=action=>{
       if(hasReaderOverlay())return false;
@@ -825,6 +879,7 @@ export function Reader() {
   const update = useCallback((content: string,changes?:SourceChange[],historyMeta?:LiveHistoryEditMeta) => {
     const previous=reference.current!;
     if(content===previous.content)return;
+    window.dispatchEvent(new CustomEvent("supermd-sync-cached-editor",{detail:{id:previous.id,before:previous.content,after:content}}));
     if(!replaying.current){
       const history=histories.current.get(previous.id)||{undo:[],redo:[],last:0},now=Date.now();
       applyHistoryEdit(history,previous.content,content,now,historyMeta);
@@ -1195,10 +1250,20 @@ export function Reader() {
           content=applyMathRepairs(note.content,indices.map(index=>repairs[index]));applied=indices.length;
         }else {const patch=applyAgentPatchesDetailed(note.content,request.operations);content=patch.text;applied=patch.applied;patchOperations=patch.operations;}
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: typing changed the note before the edit');
-        const history=histories.current.get(note.id);if(history)history.last=0;
-        update(content);const nextHistory=histories.current.get(note.id);if(nextHistory)nextHistory.last=0;
+        const beforeContent=note.content;
+        const changed=content!==beforeContent;
+        const history=histories.current.get(note.id);if(history)history.last=-1000;
+        update(content,undefined,{isolateHistory:true});const nextHistory=histories.current.get(note.id);if(nextHistory)nextHistory.last=-1000;
+        if(changed){
+          const queue=localAgentEdits.current.get(note.id)??[];
+          queue.push({before:beforeContent,after:content});
+          if(queue.length>60)queue.splice(0,queue.length-60);
+          localAgentEdits.current.set(note.id,queue);
+          showAgentBanner(note.id);
+          void invoke('agent_banner_shown',{id:note.id,before:beforeContent,after:content}).catch(()=>{});
+        }
         if(note.editProtocol===1)await edits.current!.flush(note.id);
-        const response:{tabId:string;revision:string;changed:boolean;applied:number;operations?:unknown[]}={tabId:note.id,revision:await agentRevision(content),changed:content!==note.content,applied};
+        const response:{tabId:string;revision:string;changed:boolean;applied:number;operations?:unknown[]}={tabId:note.id,revision:await agentRevision(content),changed,applied};
         if(patchOperations)response.operations=patchOperations;
         return response;
       }
@@ -1267,6 +1332,14 @@ export function Reader() {
       {pdfExport.phase!=='publishing'&&<button type="button" autoFocus disabled={pdfExport.cancelRequested} onClick={()=>void cancelPdfExport()}>Cancel export</button>}
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
+    {agentBannerNotes[state.id] && <div role="status" aria-label="Agent edit notice" className="reader-agent-banner" data-testid="agent-edit-banner">
+      <span className="reader-agent-banner-dot" aria-hidden="true" />
+      <span className="reader-agent-banner-label">Updated by AI agent</span>
+      <div className="reader-agent-banner-actions">
+        <button type="button" className="reader-agent-banner-undo" data-testid="agent-banner-undo" onClick={() => { if (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement) document.activeElement.blur(); window.supermdHistory?.("undo"); dismissAgentBanner(state.id); }}>Undo</button>
+        <button type="button" className="reader-agent-banner-dismiss" data-testid="agent-banner-dismiss" aria-label="Dismiss agent notice" onClick={() => dismissAgentBanner(state.id)}>Dismiss</button>
+      </div>
+    </div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
     {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed} initialReplace={searchReplace}/>}
     <ImageViewer />

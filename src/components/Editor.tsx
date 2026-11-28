@@ -20,6 +20,7 @@ import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersona
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
+import { textEdit } from "../noteHistory";
 import {navigateExternalLink,navigateWorkspaceLink,resolveHeadingOffset} from '../documentNavigation';
 import {findSourceLinkAtOffset} from '../workspaceLinks';
 import {
@@ -341,6 +342,20 @@ export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:st
   const cached=sessions.get(id);if(!cached||cached.state.doc.toString()!==content)return;
   const changed=(direction==='undo'?undo:redo)({state:cached.state,dispatch:transaction=>{cached.state=transaction.state;}});
   return changed?cached.state.doc.toString():undefined;
+}
+if(typeof window!=="undefined"){
+  window.addEventListener("supermd-sync-cached-editor",(event:Event)=>{
+    const detail=(event as CustomEvent<{id?:string;before?:string;after?:string}>).detail;
+    if(!detail||typeof detail.id!=="string"||typeof detail.before!=="string"||typeof detail.after!=="string")return;
+    if(detail.before===detail.after||visibleEditors.has(detail.id))return;
+    const cached=sessions.get(detail.id);
+    if(!cached||cached.state.doc.toString()!==detail.before)return;
+    const edit=textEdit(detail.before,detail.after);
+    cached.state=cached.state.update({
+      changes:{from:edit.from,to:edit.from+edit.remove,insert:edit.insert},
+      annotations:[Transaction.addToHistory.of(false),isolateHistory.of("full")],
+    }).state;
+  });
 }
 export function editorFindQuery(id:string,query:string,caseSensitive:boolean,options?:{wholeWord?:boolean;regexp?:boolean}) {
   const wholeWord=!!options?.wholeWord,regexp=!!options?.regexp;
