@@ -1,9 +1,11 @@
 package dev.supermd.studio
 
 import android.content.ContentResolver
+import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
 import android.util.Base64
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import kotlinx.coroutines.Dispatchers
@@ -12,8 +14,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal class ReaderAssetCoordinator(
+    private val context: Context,
     private val prefs: SharedPreferences,
     private val resolver: ContentResolver,
+    private val documentAccess: () -> DocumentAccess,
     private val media: MediaStorage,
     private val readerFolderIndex: ReaderFolderIndex,
     private val readerCapabilities: MutableSet<ReaderAssetCapabilities>,
@@ -23,6 +27,36 @@ internal class ReaderAssetCoordinator(
     private val resolveLinkedAssetUri: (Note, String) -> Uri,
     private val openWorkspaceLink: suspend (documentPath: String, target: String, fragment: String, wikilink: Boolean) -> JSONObject,
 ) {
+    private fun resolveAuthorizedAssetUri(rawUri: Uri): Uri {
+        ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(
+            context = context,
+            uri = rawUri,
+            allowAppCacheFiles = true,
+        )
+        return if (rawUri.scheme.equals("content", ignoreCase = true)) {
+            val resolved = documentAccess().resolve(rawUri)
+            ExternalDocumentEntryGuard.requireUserAuthorizedContentReadPermission(
+                context = context,
+                uri = resolved,
+                documentAccess = documentAccess(),
+                allowExportedNonSafPickerProvider = true,
+            )
+            resolved
+        } else {
+            rawUri
+        }
+    }
+
+    private fun openAuthorizedAssetStream(uri: Uri) =
+        ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+            context = context,
+            resolver = resolver,
+            uri = uri,
+            documentAccess = documentAccess(),
+            allowExportedNonSafPickerProvider = true,
+            allowAppCacheFiles = true,
+        )
+
     fun attachReaderCapabilities(capabilities: ReaderAssetCapabilities) {
         readerCapabilities += capabilities
     }
@@ -69,9 +103,21 @@ internal class ReaderAssetCoordinator(
 
     suspend fun textAsset(document: String, source: String): JSONObject = withContext(Dispatchers.IO) {
         require(Uri.decode(source).substringBefore('?').substringBefore('#').substringAfterLast('.').lowercase() in setOf("mmd", "mermaid")) { "Choose a Mermaid source file" }
-        val uri = resolveLinkedAssetUri(noteForAsset(document), source)
-        querySafAssetMetadata(resolver, uri)
-        val bytes = resolver.openInputStream(uri)?.use { readLimited(it, 2_000_000) } ?: error("Cannot read diagram source")
+        val uri = resolveAuthorizedAssetUri(resolveLinkedAssetUri(noteForAsset(document), source))
+        val bytes = ExternalDocumentEntryGuard.admitUserAuthorizedUri(
+            context = context,
+            resolver = resolver,
+            uri = uri,
+            documentAccess = documentAccess(),
+            allowExportedNonSafPickerProvider = true,
+            allowAppCacheFiles = true,
+            deniedMessage = "Cannot read diagram source",
+        ).use { admitted ->
+            if (admitted.uri.scheme.equals("content", ignoreCase = true)) {
+                querySafAssetMetadata(resolver, admitted.uri)
+            }
+            admitted.openInputStream().use { readLimited(it, 2_000_000) }
+        }
         val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
             .decode(ByteBuffer.wrap(bytes)).toString()
         JSONObject().put("text", text)
@@ -80,10 +126,24 @@ internal class ReaderAssetCoordinator(
     suspend fun asset(document: String, source: String): String = withContext(Dispatchers.IO) {
         val note = noteForAsset(document)
         media.localTarget(source, note.assetDirectory, note.uri, note.relative)?.let { return@withContext media.data(it.file) }
-        val uri = resolveLinkedAssetUri(note, source)
-        val meta = querySafAssetMetadata(resolver, uri)
-        if (meta.size >= 0L) require(meta.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
-        val bytes = resolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Cannot read image")
+        val uri = resolveAuthorizedAssetUri(resolveLinkedAssetUri(note, source))
+        val (meta, bytes) = ExternalDocumentEntryGuard.admitUserAuthorizedUri(
+            context = context,
+            resolver = resolver,
+            uri = uri,
+            documentAccess = documentAccess(),
+            allowExportedNonSafPickerProvider = true,
+            allowAppCacheFiles = true,
+            deniedMessage = "Cannot read image",
+        ).use { admitted ->
+            val metadata = if (admitted.uri.scheme.equals("content", ignoreCase = true)) {
+                querySafAssetMetadata(resolver, admitted.uri)
+            } else {
+                SafAssetMetadata(admitted.uri.path?.let { File(it).name }, null, -1L, 0L)
+            }
+            if (metadata.size >= 0L) require(metadata.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+            metadata to admitted.openInputStream().use { readLimited(it, 25_000_000) }
+        }
         val mime = media.imageMime(meta.displayName ?: Uri.decode(source).substringAfterLast('/'), meta.mimeType)
         "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
@@ -91,10 +151,17 @@ internal class ReaderAssetCoordinator(
     fun resolveReaderAsset(document: String, source: String): Pair<String, ReaderAssetSource> {
         val note = noteForAsset(document)
         media.localTarget(source, note.assetDirectory, note.uri, note.relative)?.let { return note.id to media.readerAsset(it) }
-        val uri = resolveLinkedAssetUri(note, source)
-        val meta = querySafAssetMetadata(resolver, uri)
+        val uri = resolveAuthorizedAssetUri(resolveLinkedAssetUri(note, source))
+        val meta = if (uri.scheme.equals("content", ignoreCase = true)) {
+            querySafAssetMetadata(resolver, uri)
+        } else {
+            ExternalDocumentEntryGuard.openSafeRegularFileHandle(context, uri, allowAppCacheFiles = true).use { handle ->
+                val rawFile = File(handle.rawPath)
+                SafAssetMetadata(rawFile.name, null, -1L, 0L)
+            }
+        }
         if (meta.size >= 0L) require(meta.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
-        val open = { resolver.openInputStream(uri) ?: error("Cannot read image") }
+        val open = { openAuthorizedAssetStream(uri) }
         val mime = media.imageMime(meta.displayName ?: Uri.decode(source).substringAfterLast('/'), meta.mimeType)
         val identity = "${note.id}|$source|$uri"
         val fingerprint = readerAssetFingerprint(identity, meta.size, meta.lastModified, open)
@@ -120,10 +187,17 @@ internal class ReaderAssetCoordinator(
                 OpenReaderAsset(current.mime, current.fingerprint, current.open())
             }
             is ReaderAssetTarget.SafDocument -> {
-                val meta = querySafAssetMetadata(resolver, target.uri) { IllegalStateException("Image not found") }
+                val verifiedUri = resolveAuthorizedAssetUri(target.uri)
+                val meta = if (verifiedUri.scheme.equals("content", ignoreCase = true)) {
+                    querySafAssetMetadata(resolver, verifiedUri) { IllegalStateException("Image not found") }
+                } else {
+                    ExternalDocumentEntryGuard.openSafeRegularFileHandle(context, verifiedUri, allowAppCacheFiles = true).use { handle ->
+                        SafAssetMetadata(File(handle.rawPath).name, null, -1L, 0L)
+                    }
+                }
                 if (meta.size >= 0L) require(meta.size <= BoundedAssetInputStream.MAX_READER_ASSET_BYTES) { "Image exceeds 25 MB" }
+                val open = { openAuthorizedAssetStream(verifiedUri) }
                 val mime = media.imageMime(meta.displayName ?: Uri.decode(capability.source).substringAfterLast('/'), meta.mimeType)
-                val open = { resolver.openInputStream(target.uri) ?: error("Cannot read image") }
                 val currentFingerprint = readerAssetFingerprint(target.identity, meta.size, meta.lastModified, open)
                 require(currentFingerprint == capability.fingerprint && mime == capability.mime) {
                     "The image changed; reload the document image"

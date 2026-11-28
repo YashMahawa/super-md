@@ -5,20 +5,29 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.provider.DocumentsContract
+import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
+import android.system.StructStat
+import java.io.Closeable
 import java.io.File
+import java.io.FileDescriptor
+import java.io.IOException
 import java.io.InputStream
+import java.io.InterruptedIOException
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class ExternalIntentCaller(
     val uid: Int? = null,
     val callerGrantedOwnShareUri: Boolean = false,
+    val allowGrantedShareFile: Boolean = true,
 )
 
 internal sealed interface ExternalDocumentDecision {
@@ -28,18 +37,270 @@ internal sealed interface ExternalDocumentDecision {
     data class Rejected(val uri: Uri, val reason: String) : ExternalDocumentDecision
 }
 
+internal class ExternalFolderUriException(message: String) : IllegalArgumentException(message)
+
+internal interface ExternalFileSyscalls {
+    fun openReadOnlyNonBlockingNoFollow(path: String): FileDescriptor
+    fun fstat(fd: FileDescriptor): StructStat?
+    fun lstat(path: String): StructStat?
+    fun pread(fd: FileDescriptor, buffer: ByteArray, offset: Int, length: Int, position: Long): Int
+    fun close(fd: FileDescriptor)
+    fun resolveDescriptorPath(fd: FileDescriptor): String?
+}
+
+internal object AndroidOsFileSyscalls : ExternalFileSyscalls {
+    override fun openReadOnlyNonBlockingNoFollow(path: String): FileDescriptor {
+        val flags = OsConstants.O_RDONLY or
+            OsConstants.O_NOFOLLOW or
+            OsConstants.O_NONBLOCK or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) OsConstants.O_CLOEXEC else 0
+        return Os.open(path, flags, 0)
+    }
+
+    override fun fstat(fd: FileDescriptor): StructStat? = Os.fstat(fd)
+
+    override fun lstat(path: String): StructStat? = Os.lstat(path)
+
+    override fun pread(
+        fd: FileDescriptor,
+        buffer: ByteArray,
+        offset: Int,
+        length: Int,
+        position: Long,
+    ): Int {
+        if (length == 0) return 0
+        while (true) {
+            try {
+                val count = Os.pread(fd, buffer, offset, length, position)
+                return if (count <= 0) -1 else count
+            } catch (errno: ErrnoException) {
+                if (errno.errno == OsConstants.EINTR) continue
+                throw IOException("Failed to read file descriptor", errno)
+            } catch (interrupted: InterruptedIOException) {
+                throw interrupted
+            }
+        }
+    }
+
+    override fun close(fd: FileDescriptor) {
+        runCatching { Os.close(fd) }
+    }
+
+    override fun resolveDescriptorPath(fd: FileDescriptor): String? {
+        val directFd = extractRawFdNumber(fd)
+        if (directFd >= 3) {
+            resolveProcFdPath(directFd)?.let { return it }
+        }
+        val dupResolved = runCatching {
+            ParcelFileDescriptor.dup(fd).use { dupPfd ->
+                val dupFd = runCatching { dupPfd.fd }.getOrDefault(-1)
+                if (dupFd >= 3) resolveProcFdPath(dupFd) else null
+            }
+        }.getOrNull()
+        return dupResolved
+    }
+
+    internal fun resolveProcFdPath(fdNumber: Int): String? {
+        if (fdNumber < 3) return null
+        val procEntry = "/proc/self/fd/$fdNumber"
+        runCatching { Os.readlink(procEntry) }.getOrNull()?.takeIf(String::isNotBlank)?.let { return it }
+        runCatching { Files.readSymbolicLink(Paths.get(procEntry)).toString() }.getOrNull()
+            ?.takeIf(String::isNotBlank)?.let { return it }
+        return null
+    }
+
+    private fun extractRawFdNumber(fd: FileDescriptor): Int {
+        for (fieldName in listOf("descriptor", "fd")) {
+            val num = runCatching {
+                val field = FileDescriptor::class.java.getDeclaredField(fieldName)
+                field.isAccessible = true
+                field.getInt(fd)
+            }.getOrDefault(-1)
+            if (num >= 0) return num
+        }
+        return -1
+    }
+}
+
+internal class OpenedRegularFileHandle(
+    val rawPath: String,
+    private val fd: FileDescriptor,
+    private val syscalls: ExternalFileSyscalls,
+) : Closeable {
+    private val consumed = AtomicBoolean(false)
+    private val closed = AtomicBoolean(false)
+
+    fun consumeInputStream(): InputStream {
+        check(consumed.compareAndSet(false, true)) { "Regular file handle was already consumed" }
+        check(!closed.get()) { "Regular file handle is already closed" }
+        return OwnedFileDescriptorInputStream(fd, syscalls) {
+            closed.set(true)
+        }
+    }
+
+    override fun close() {
+        if (!consumed.get() && closed.compareAndSet(false, true)) {
+            syscalls.close(fd)
+        }
+    }
+}
+
+private class OwnedFileDescriptorInputStream(
+    private val fd: FileDescriptor,
+    private val syscalls: ExternalFileSyscalls,
+    private val onClose: () -> Unit,
+) : InputStream() {
+    private val lock = Any()
+    private var position = 0L
+    private var isClosed = false
+
+    override fun read(): Int {
+        val single = ByteArray(1)
+        val count = read(single, 0, 1)
+        return if (count <= 0) -1 else (single[0].toInt() and 0xff)
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (off < 0 || len < 0 || len > b.size - off) {
+            throw IndexOutOfBoundsException("off=$off len=$len size=${b.size}")
+        }
+        if (len == 0) return 0
+        synchronized(lock) {
+            if (isClosed) throw IOException("Stream closed")
+            val count = syscalls.pread(fd, b, off, len, position)
+            if (count > 0) {
+                position += count
+            }
+            return count
+        }
+    }
+
+    override fun close() {
+        val shouldClose = synchronized(lock) {
+            if (isClosed) false else {
+                isClosed = true
+                true
+            }
+        }
+        if (shouldClose) {
+            try {
+                syscalls.close(fd)
+            } finally {
+                onClose()
+            }
+        }
+    }
+}
+
+internal class OpenedContentDescriptorHandle(
+    private val pfd: ParcelFileDescriptor,
+) : Closeable {
+    private val consumed = AtomicBoolean(false)
+    private val closed = AtomicBoolean(false)
+
+    fun consumeInputStream(): InputStream {
+        check(consumed.compareAndSet(false, true)) { "Content descriptor handle was already consumed" }
+        check(!closed.get()) { "Content descriptor handle is already closed" }
+        return ParcelFileDescriptor.AutoCloseInputStream(pfd)
+    }
+
+    override fun close() {
+        if (!consumed.get() && closed.compareAndSet(false, true)) {
+            runCatching { pfd.close() }
+        }
+    }
+}
+
+internal class AdmittedUserAuthorizedUri(
+    val uri: Uri,
+    private val fileHandle: OpenedRegularFileHandle? = null,
+    private val contentHandle: OpenedContentDescriptorHandle? = null,
+) : Closeable {
+    fun openInputStream(): InputStream {
+        if (fileHandle != null) return fileHandle.consumeInputStream()
+        if (contentHandle != null) return contentHandle.consumeInputStream()
+        error("Admitted URI handle has no backing descriptor")
+    }
+
+    override fun close() {
+        fileHandle?.close()
+        contentHandle?.close()
+    }
+}
+
+internal class AdmittedExternalDrop(
+    val uri: Uri,
+    val intentFlags: Int,
+    private val fileHandle: OpenedRegularFileHandle? = null,
+    private val contentHandle: OpenedContentDescriptorHandle? = null,
+) : Closeable {
+    fun openInputStream(context: Context, resolver: ContentResolver): InputStream {
+        if (fileHandle != null) {
+            return fileHandle.consumeInputStream()
+        }
+        if (contentHandle != null) {
+            return contentHandle.consumeInputStream()
+        }
+        return ExternalDocumentEntryGuard.openVerifiedExternalInputStream(
+            context = context,
+            resolver = resolver,
+            uri = uri,
+            intentFlags = intentFlags,
+            caller = ExternalIntentCaller(allowGrantedShareFile = false),
+        )
+    }
+
+    override fun close() {
+        fileHandle?.close()
+        contentHandle?.close()
+    }
+}
+
+internal sealed interface ExternalDropUriDecision : Closeable {
+    data class Allowed(
+        val uri: Uri,
+        val admitted: AdmittedExternalDrop,
+    ) : ExternalDropUriDecision {
+        val intentFlags: Int get() = admitted.intentFlags
+        override fun close() = admitted.close()
+    }
+
+    data class MissingGrant(val uri: Uri) : ExternalDropUriDecision {
+        override fun close() = Unit
+    }
+
+    data class Rejected(
+        val uri: Uri,
+        val reason: String,
+        val isFolder: Boolean = false,
+    ) : ExternalDropUriDecision {
+        override fun close() = Unit
+    }
+}
+
 /**
- * Validates untrusted external document entry points (MainActivity incoming Intents)
- * before persisting permissions, resolving URIs, or reading document bytes.
+ * Shared defensive entry guard for untrusted external document/media entry points (incoming
+ * Intents and drag-and-drop URIs) and user-authorized note/media entry points (SAF/picker opens,
+ * access restoration, reload-from-disk, and linked reader assets).
  *
- * Normal system picker selections (ACTION_OPEN_DOCUMENT / RestoreDocumentAccess) and
- * internal workspace/folder/recent restores do not pass through this gate.
+ * Enforces permission and descriptor-type/containment validation before metadata or byte I/O while
+ * preserving bounded provider streams (`S_ISFIFO` / `S_ISSOCK`) and existing Android workspace grants.
  */
 internal object ExternalDocumentEntryGuard {
+    @Volatile
+    internal var fileSyscalls: ExternalFileSyscalls = AndroidOsFileSyscalls
+
     private val allowedActions = setOf(
         Intent.ACTION_VIEW,
         Intent.ACTION_EDIT,
         Intent.ACTION_MAIN,
+    )
+
+    private val alwaysRestrictedSystemRoots = listOf(
+        "/proc",
+        "/sys",
+        "/dev",
+        "/data/misc",
     )
 
     private val restrictedSystemRoots = listOf(
@@ -51,6 +312,15 @@ internal object ExternalDocumentEntryGuard {
         "/data/user_de",
         "/data/misc",
     )
+
+    private fun providerAuthority(uri: Uri): String? =
+        uri.authority?.substringAfter('@')?.takeIf { it.isNotBlank() }
+
+    private fun isBareTreeUri(uri: Uri): Boolean {
+        if (!DocumentsContract.isTreeUri(uri)) return false
+        val segments = uri.pathSegments
+        return segments.size < 4 || segments[2] != "document"
+    }
 
     fun dispatchIncomingIntent(
         context: Context,
@@ -106,7 +376,7 @@ internal object ExternalDocumentEntryGuard {
         intentFlags: Int,
         caller: ExternalIntentCaller,
     ): ExternalDocumentDecision {
-        if (uri.authority.isNullOrBlank()) {
+        if (providerAuthority(uri) == null) {
             return ExternalDocumentDecision.Rejected(uri, "Missing document provider authority")
         }
         if (DocumentsContract.isTreeUri(uri)) {
@@ -122,21 +392,419 @@ internal object ExternalDocumentEntryGuard {
     }
 
     private fun validateFileIntent(context: Context, uri: Uri, intentFlags: Int): ExternalDocumentDecision {
-        if (!uri.authority.isNullOrEmpty() && !uri.authority.equals("localhost", ignoreCase = true)) {
-            return ExternalDocumentDecision.Rejected(uri, "Remote file URIs are not supported")
-        }
-        val rawPath = uri.path
-        if (rawPath.isNullOrBlank() || '\u0000' in rawPath) {
-            return ExternalDocumentDecision.Rejected(uri, "Invalid file path")
-        }
-        val check = runCatching { requireSafeExternalFile(context, File(rawPath)) }
+        val check = runCatching { openSafeRegularFileHandle(context, uri).use { } }
         if (check.isFailure) {
-            return ExternalDocumentDecision.Rejected(
-                uri,
-                check.exceptionOrNull()?.message ?: "App-private paths cannot be opened externally",
-            )
+            val error = check.exceptionOrNull()
+            val reason = when (error) {
+                is ExternalFolderUriException -> "Folder URIs cannot be opened as a note"
+                else -> error?.message ?: "App-private paths cannot be opened externally"
+            }
+            return ExternalDocumentDecision.Rejected(uri, reason)
         }
         return ExternalDocumentDecision.Allowed(uri, intentFlags)
+    }
+
+    /**
+     * Admits a dropped URI for note-open or inline-image import.
+     *
+     * For a `file:` URI, opens a single `O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`
+     * descriptor, requires a confirmed regular-file `fstat` (`S_ISREG`) and path containment on
+     * that descriptor, and retains the open handle inside [ExternalDropUriDecision.Allowed] so
+     * callers read from the exact verified descriptor without reopening the path.
+     *
+     * For a `content:` URI, enforces explicit drag read permission and direct URI grant while
+     * keeping legitimate streamed content providers working when opened.
+     */
+    fun admitDroppedUri(
+        context: Context,
+        uri: Uri,
+        dragReadPermissionGranted: Boolean,
+    ): ExternalDropUriDecision {
+        return when (uri.scheme?.lowercase()) {
+            "content" -> {
+                val authority = providerAuthority(uri)
+                    ?: return ExternalDropUriDecision.Rejected(uri, "Missing content provider authority")
+                if (authority.equals("${context.packageName}.share", ignoreCase = true)) {
+                    return ExternalDropUriDecision.Rejected(uri, "App-private share URIs cannot be dropped")
+                }
+                if (DocumentsContract.isTreeUri(uri)) {
+                    val bareTree = isBareTreeUri(uri)
+                    return ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = if (bareTree) "Folder drops are not supported" else "Tree-scoped document URIs cannot be dropped",
+                        isFolder = bareTree,
+                    )
+                }
+                if (!dragReadPermissionGranted || !hasDirectReadUriPermission(context, uri)) {
+                    return ExternalDropUriDecision.MissingGrant(uri)
+                }
+                val pfd = try {
+                    context.contentResolver.openFileDescriptor(uri, "r")
+                } catch (_: SecurityException) {
+                    return ExternalDropUriDecision.MissingGrant(uri)
+                } catch (error: Throwable) {
+                    return ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = error.message ?: "Dropped file could not be opened",
+                    )
+                } ?: return ExternalDropUriDecision.Rejected(uri, "Dropped file could not be opened")
+                try {
+                    verifyOpenedContentDescriptor(
+                        context = context,
+                        uri = uri,
+                        pfd = pfd,
+                        allowGrantedShareFile = false,
+                    )
+                    ExternalDropUriDecision.Allowed(
+                        uri = uri,
+                        admitted = AdmittedExternalDrop(
+                            uri = uri,
+                            intentFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                            contentHandle = OpenedContentDescriptorHandle(pfd),
+                        ),
+                    )
+                } catch (folder: ExternalFolderUriException) {
+                    runCatching { pfd.close() }
+                    ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = folder.message ?: "Folder drops are not supported",
+                        isFolder = true,
+                    )
+                } catch (error: Throwable) {
+                    runCatching { pfd.close() }
+                    ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = error.message ?: "Dropped file was rejected",
+                        isFolder = false,
+                    )
+                }
+            }
+            "file" -> {
+                try {
+                    val handle = openSafeRegularFileHandle(context, uri)
+                    ExternalDropUriDecision.Allowed(
+                        uri = uri,
+                        admitted = AdmittedExternalDrop(uri = uri, intentFlags = 0, fileHandle = handle),
+                    )
+                } catch (folder: ExternalFolderUriException) {
+                    ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = folder.message ?: "Folder drops are not supported",
+                        isFolder = true,
+                    )
+                } catch (error: Throwable) {
+                    ExternalDropUriDecision.Rejected(
+                        uri = uri,
+                        reason = error.message ?: "App-private paths cannot be opened externally",
+                        isFolder = false,
+                    )
+                }
+            }
+            else -> ExternalDropUriDecision.Rejected(uri, "Unsupported drop URI scheme")
+        }
+    }
+
+    fun validateDroppedUri(
+        context: Context,
+        uri: Uri,
+        dragReadPermissionGranted: Boolean,
+    ): ExternalDropUriDecision {
+        return when (val decision = admitDroppedUri(context, uri, dragReadPermissionGranted)) {
+            is ExternalDropUriDecision.Allowed -> {
+                val flags = decision.intentFlags
+                decision.close()
+                ExternalDropUriDecision.Allowed(uri, AdmittedExternalDrop(uri, flags))
+            }
+            else -> decision
+        }
+    }
+
+    fun openVerifiedDroppedInputStream(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        dragReadPermissionGranted: Boolean,
+    ): InputStream {
+        return when (val decision = admitDroppedUri(context, uri, dragReadPermissionGranted)) {
+            is ExternalDropUriDecision.MissingGrant ->
+                throw SecurityException("Dropped file read access was not granted")
+            is ExternalDropUriDecision.Rejected ->
+                throw IllegalArgumentException(decision.reason)
+            is ExternalDropUriDecision.Allowed -> {
+                try {
+                    decision.admitted.openInputStream(context, resolver)
+                } catch (error: Throwable) {
+                    decision.close()
+                    throw error
+                }
+            }
+        }
+    }
+
+    fun canPersistUserAuthorizedDocumentGrant(context: Context, uri: Uri): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val authority = providerAuthority(uri) ?: return false
+        if (authority.equals("${context.packageName}.share", ignoreCase = true)) return false
+        return !isBareTreeUri(uri)
+    }
+
+    fun validateUserAuthorizedDocumentUri(
+        context: Context,
+        uri: Uri,
+        allowOwnShareNote: Boolean = false,
+        allowAppCacheFiles: Boolean = false,
+        unsupportedMessage: String = "Unsupported document URI",
+        bareTreeMessage: String = "Folder URIs are not supported",
+    ) {
+        when (uri.scheme?.lowercase()) {
+            "content" -> {
+                val authority = providerAuthority(uri) ?: throw IllegalArgumentException(unsupportedMessage)
+                if (authority.equals("${context.packageName}.share", ignoreCase = true)) {
+                    require(allowOwnShareNote && uri.authority == "${context.packageName}.share") {
+                        unsupportedMessage
+                    }
+                }
+                require(!isBareTreeUri(uri)) { bareTreeMessage }
+            }
+            "file" -> {
+                require(uri.authority.isNullOrEmpty() || uri.authority.equals("localhost", ignoreCase = true)) {
+                    "Remote file URIs are not supported"
+                }
+                val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
+                    ?: throw IllegalArgumentException("Invalid file path")
+                val normalizedLexical = File(rawPath).absoluteFile.toPath().normalize().toString()
+                require(!isForbiddenExternalPath(context, normalizedLexical, allowAppCacheFiles = allowAppCacheFiles)) {
+                    "App-private paths cannot be opened externally"
+                }
+            }
+            else -> throw IllegalArgumentException(unsupportedMessage)
+        }
+    }
+
+    fun hasUserAuthorizedContentReadPermission(
+        context: Context,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+    ): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val authority = providerAuthority(uri) ?: return false
+        if (authority.equals("${context.packageName}.share", ignoreCase = true)) {
+            return allowOwnShareNote && uri.authority == "${context.packageName}.share"
+        }
+        if (isBareTreeUri(uri)) return false
+        if (TestAuthorityGrants.check(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) == true) {
+            return true
+        }
+        if (hasDirectReadUriPermission(context, uri, ExternalIntentCaller(allowGrantedShareFile = false))) {
+            return true
+        }
+        if (documentAccess?.hasAnyReadOrPendingGrant(uri) == true) {
+            return true
+        }
+        if (
+            allowExportedNonSafPickerProvider &&
+            !DocumentsContract.isTreeUri(uri) &&
+            runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() == null
+        ) {
+            return isReadableExportedProvider(context, authority)
+        }
+        return false
+    }
+
+    fun requireUserAuthorizedContentReadPermission(
+        context: Context,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+        deniedMessage: String = "Document permission is unavailable; choose it again",
+    ) {
+        if (
+            !hasUserAuthorizedContentReadPermission(
+                context = context,
+                uri = uri,
+                documentAccess = documentAccess,
+                allowOwnShareNote = allowOwnShareNote,
+                allowExportedNonSafPickerProvider = allowExportedNonSafPickerProvider,
+            )
+        ) {
+            throw SecurityException(deniedMessage)
+        }
+    }
+
+    fun verifyUserAuthorizedContentDescriptor(
+        context: Context,
+        uri: Uri,
+        pfd: ParcelFileDescriptor,
+        allowOwnShareNote: Boolean = false,
+    ) {
+        verifyOpenedContentDescriptor(
+            context = context,
+            uri = uri,
+            pfd = pfd,
+            allowGrantedShareFile = allowOwnShareNote && uri.authority == "${context.packageName}.share",
+        )
+    }
+
+    fun admitUserAuthorizedUri(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+        allowAppCacheFiles: Boolean = false,
+        unsupportedMessage: String = "Unsupported document URI",
+        bareTreeMessage: String = "Folder URIs are not supported",
+        deniedMessage: String = "Document permission is unavailable; choose it again",
+    ): AdmittedUserAuthorizedUri {
+        validateUserAuthorizedDocumentUri(
+            context = context,
+            uri = uri,
+            allowOwnShareNote = allowOwnShareNote,
+            allowAppCacheFiles = allowAppCacheFiles,
+            unsupportedMessage = unsupportedMessage,
+            bareTreeMessage = bareTreeMessage,
+        )
+        return when (uri.scheme?.lowercase()) {
+            "content" -> {
+                val resolved = if (uri.authority == "${context.packageName}.share") {
+                    uri
+                } else {
+                    documentAccess?.resolve(uri) ?: uri
+                }
+                requireUserAuthorizedContentReadPermission(
+                    context = context,
+                    uri = resolved,
+                    documentAccess = documentAccess,
+                    allowOwnShareNote = allowOwnShareNote,
+                    allowExportedNonSafPickerProvider = allowExportedNonSafPickerProvider,
+                    deniedMessage = deniedMessage,
+                )
+                val pfd = resolver.openFileDescriptor(resolved, "r")
+                    ?: throw SecurityException(deniedMessage)
+                try {
+                    verifyUserAuthorizedContentDescriptor(
+                        context = context,
+                        uri = resolved,
+                        pfd = pfd,
+                        allowOwnShareNote = allowOwnShareNote,
+                    )
+                    AdmittedUserAuthorizedUri(
+                        uri = resolved,
+                        contentHandle = OpenedContentDescriptorHandle(pfd),
+                    )
+                } catch (error: Throwable) {
+                    runCatching { pfd.close() }
+                    throw error
+                }
+            }
+            "file" -> {
+                val handle = openSafeRegularFileHandle(context, uri, allowAppCacheFiles = allowAppCacheFiles)
+                AdmittedUserAuthorizedUri(uri = uri, fileHandle = handle)
+            }
+            else -> throw IllegalArgumentException(unsupportedMessage)
+        }
+    }
+
+    fun openVerifiedUserAuthorizedInputStream(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+        allowOwnShareNote: Boolean = false,
+        allowExportedNonSafPickerProvider: Boolean = false,
+        allowAppCacheFiles: Boolean = false,
+        unsupportedMessage: String = "Unsupported document URI",
+        bareTreeMessage: String = "Folder URIs are not supported",
+        deniedMessage: String = "Document permission is unavailable; choose it again",
+    ): InputStream {
+        val admitted = admitUserAuthorizedUri(
+            context = context,
+            resolver = resolver,
+            uri = uri,
+            documentAccess = documentAccess,
+            allowOwnShareNote = allowOwnShareNote,
+            allowExportedNonSafPickerProvider = allowExportedNonSafPickerProvider,
+            allowAppCacheFiles = allowAppCacheFiles,
+            unsupportedMessage = unsupportedMessage,
+            bareTreeMessage = bareTreeMessage,
+            deniedMessage = deniedMessage,
+        )
+        return try {
+            admitted.openInputStream()
+        } catch (error: Throwable) {
+            admitted.close()
+            throw error
+        }
+    }
+
+    fun validatePickedMediaUri(context: Context, uri: Uri) {
+        validateUserAuthorizedDocumentUri(
+            context = context,
+            uri = uri,
+            allowOwnShareNote = false,
+            unsupportedMessage = "Unsupported image URI",
+            bareTreeMessage = "Unsupported image URI",
+        )
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            openSafeRegularFileHandle(context, uri).use { }
+        }
+    }
+
+    fun admitUserAuthorizedMediaUri(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+    ): AdmittedUserAuthorizedUri = admitUserAuthorizedUri(
+        context = context,
+        resolver = resolver,
+        uri = uri,
+        documentAccess = documentAccess,
+        allowOwnShareNote = false,
+        allowExportedNonSafPickerProvider = true,
+        unsupportedMessage = "Unsupported image URI",
+        bareTreeMessage = "Unsupported image URI",
+        deniedMessage = "Image permission is unavailable",
+    )
+
+    fun openVerifiedPickedMediaInputStream(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        documentAccess: DocumentAccess? = null,
+    ): InputStream = openVerifiedUserAuthorizedInputStream(
+        context = context,
+        resolver = resolver,
+        uri = uri,
+        documentAccess = documentAccess,
+        allowOwnShareNote = false,
+        allowExportedNonSafPickerProvider = true,
+        unsupportedMessage = "Unsupported image URI",
+        bareTreeMessage = "Unsupported image URI",
+        deniedMessage = "Image permission is unavailable",
+    )
+
+    private fun isReadableExportedProvider(context: Context, authority: String): Boolean {
+        val providerInfo = runCatching { context.packageManager.resolveContentProvider(authority, 0) }.getOrNull()
+        if (providerInfo != null) {
+            if (!providerInfo.exported) return false
+            val readPerm = providerInfo.readPermission
+            return readPerm.isNullOrEmpty() ||
+                context.checkPermission(readPerm, Process.myPid(), Process.myUid()) == PackageManager.PERMISSION_GRANTED
+        }
+        val client = runCatching { context.contentResolver.acquireUnstableContentProviderClient(authority) }.getOrNull()
+            ?: return false
+        return client.use {
+            val local = it.localContentProvider ?: return@use false
+            if (local is androidx.core.content.FileProvider) return@use false
+            val readPerm = local.readPermission
+            readPerm.isNullOrEmpty() ||
+                context.checkPermission(readPerm, Process.myPid(), Process.myUid()) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     fun hasDirectReadUriPermission(
@@ -159,7 +827,8 @@ internal object ExternalDocumentEntryGuard {
         // record into mGrantedUriPermissions when targetUid already owns the provider
         // (${packageName}.share). Verify the kernel-authenticated caller instead so
         // legitimate own-share launches succeed while ungranted external callers fail.
-        if (uri.authority == "${context.packageName}.share") {
+        if (providerAuthority(uri)?.equals("${context.packageName}.share", ignoreCase = true) == true) {
+            if (!caller.allowGrantedShareFile) return false
             if (caller.callerGrantedOwnShareUri) return true
             val uid = caller.uid
             if (uid != null && uid > 0) {
@@ -206,18 +875,108 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
-    fun requireSafeExternalFile(context: Context, candidate: File): File {
-        val normalizedLexical = candidate.absoluteFile.toPath().normalize().toString()
-        require(!isForbiddenExternalPath(context, normalizedLexical)) {
+    internal fun openSafeRegularFileHandle(
+        context: Context,
+        uri: Uri,
+        allowAppCacheFiles: Boolean = false,
+    ): OpenedRegularFileHandle {
+        require(uri.authority.isNullOrEmpty() || uri.authority.equals("localhost", ignoreCase = true)) {
+            "Remote file URIs are not supported"
+        }
+        val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
+            ?: throw IllegalArgumentException("Invalid file path")
+        val normalizedLexical = File(rawPath).absoluteFile.toPath().normalize().toString()
+        require(!isForbiddenExternalPath(context, normalizedLexical, allowAppCacheFiles = allowAppCacheFiles)) {
             "App-private paths cannot be opened externally"
         }
-        val canonical = runCatching { candidate.canonicalFile }.getOrElse {
-            throw IllegalArgumentException("File path could not be resolved")
+
+        val syscalls = fileSyscalls
+        val fd = try {
+            syscalls.openReadOnlyNonBlockingNoFollow(rawPath)
+        } catch (errno: ErrnoException) {
+            when (errno.errno) {
+                OsConstants.ELOOP -> throw IllegalArgumentException("Symbolic links cannot be opened externally", errno)
+                OsConstants.EISDIR -> throw ExternalFolderUriException("Folder drops are not supported")
+                else -> throw IllegalArgumentException("File path could not be opened", errno)
+            }
+        } catch (error: Throwable) {
+            throw IllegalArgumentException(error.message ?: "File path could not be opened", error)
         }
-        require(!isForbiddenExternalPath(context, canonical.path)) {
-            "App-private paths cannot be opened externally"
+
+        try {
+            val stat = runCatching { syscalls.fstat(fd) }.getOrNull()
+                ?: throw IllegalArgumentException("Could not confirm file descriptor status")
+            if (stat.st_mode == 0) {
+                throw IllegalArgumentException("Could not confirm file descriptor status")
+            }
+            if (OsConstants.S_ISDIR(stat.st_mode)) {
+                throw ExternalFolderUriException("Folder drops are not supported")
+            }
+            require(OsConstants.S_ISREG(stat.st_mode)) {
+                "Document is not a regular file"
+            }
+
+            val fdPath = syscalls.resolveDescriptorPath(fd)?.takeIf { it.startsWith("/") }
+            if (fdPath != null) {
+                val wasDeleted = fdPath.endsWith(" (deleted)")
+                val cleanFdPath = fdPath.removeSuffix(" (deleted)")
+                require(!isForbiddenExternalPath(context, cleanFdPath, allowAppCacheFiles = allowAppCacheFiles)) {
+                    "App-private paths cannot be opened externally"
+                }
+                if (!wasDeleted) {
+                    val sameInode = runCatching { syscalls.lstat(cleanFdPath) }.getOrNull()?.let { pathStat ->
+                        pathStat.st_mode != 0 &&
+                            OsConstants.S_ISREG(pathStat.st_mode) &&
+                            pathStat.st_dev == stat.st_dev &&
+                            pathStat.st_ino == stat.st_ino
+                    } ?: false
+                    if (sameInode) {
+                        val canonicalFdPath = runCatching { File(cleanFdPath).canonicalPath }.getOrNull()
+                        if (canonicalFdPath != null) {
+                            require(!isForbiddenExternalPath(context, canonicalFdPath, allowAppCacheFiles = allowAppCacheFiles)) {
+                                "App-private paths cannot be opened externally"
+                            }
+                        }
+                    }
+                    val rawSameInode = runCatching { syscalls.lstat(rawPath) }.getOrNull()?.let { rawStat ->
+                        rawStat.st_mode != 0 &&
+                            OsConstants.S_ISREG(rawStat.st_mode) &&
+                            rawStat.st_dev == stat.st_dev &&
+                            rawStat.st_ino == stat.st_ino
+                    } ?: false
+                    if (rawSameInode) {
+                        val canonicalRawPath = runCatching { File(rawPath).canonicalPath }.getOrNull()
+                        if (canonicalRawPath != null) {
+                            require(!isForbiddenExternalPath(context, canonicalRawPath, allowAppCacheFiles = allowAppCacheFiles)) {
+                                "App-private paths cannot be opened externally"
+                            }
+                        }
+                    }
+                }
+            } else {
+                val canonical = runCatching { File(rawPath).canonicalFile }.getOrElse {
+                    throw IllegalArgumentException("Could not confirm file descriptor path")
+                }
+                require(!isForbiddenExternalPath(context, canonical.path, allowAppCacheFiles = allowAppCacheFiles)) {
+                    "App-private paths cannot be opened externally"
+                }
+                val pathStat = runCatching { syscalls.lstat(canonical.path) }.getOrNull()
+                    ?: throw IllegalArgumentException("Could not confirm file descriptor status")
+                if (
+                    pathStat.st_mode == 0 ||
+                    !OsConstants.S_ISREG(pathStat.st_mode) ||
+                    pathStat.st_dev != stat.st_dev ||
+                    pathStat.st_ino != stat.st_ino
+                ) {
+                    throw IllegalArgumentException("Could not confirm file descriptor status")
+                }
+            }
+
+            return OpenedRegularFileHandle(rawPath = rawPath, fd = fd, syscalls = syscalls)
+        } catch (error: Throwable) {
+            runCatching { syscalls.close(fd) }
+            throw error
         }
-        return canonical
     }
 
     fun openVerifiedExternalInputStream(
@@ -229,6 +988,11 @@ internal object ExternalDocumentEntryGuard {
     ): InputStream {
         return when (uri.scheme?.lowercase()) {
             "content" -> {
+                val authority = providerAuthority(uri)
+                    ?: throw IllegalArgumentException("Missing document provider authority")
+                if (!caller.allowGrantedShareFile && authority.equals("${context.packageName}.share", ignoreCase = true)) {
+                    throw IllegalArgumentException("App-private share URIs cannot be opened externally")
+                }
                 require(!DocumentsContract.isTreeUri(uri)) { "Folder URIs cannot be opened as a note" }
                 require((intentFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
                     "Document read access was not granted by the caller"
@@ -240,7 +1004,12 @@ internal object ExternalDocumentEntryGuard {
                 val pfd = resolver.openFileDescriptor(uri, "r")
                     ?: error("Document permission is unavailable; choose it again")
                 try {
-                    verifyOpenedDescriptor(context, uri, pfd)
+                    verifyOpenedContentDescriptor(
+                        context = context,
+                        uri = uri,
+                        pfd = pfd,
+                        allowGrantedShareFile = caller.allowGrantedShareFile,
+                    )
                     ParcelFileDescriptor.AutoCloseInputStream(pfd)
                 } catch (error: Throwable) {
                     runCatching { pfd.close() }
@@ -248,18 +1017,11 @@ internal object ExternalDocumentEntryGuard {
                 }
             }
             "file" -> {
-                require(uri.authority.isNullOrEmpty() || uri.authority.equals("localhost", ignoreCase = true)) {
-                    "Remote file URIs are not supported"
-                }
-                val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
-                    ?: throw IllegalArgumentException("Invalid file path")
-                val safeFile = requireSafeExternalFile(context, File(rawPath))
-                val pfd = ParcelFileDescriptor.open(safeFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                val handle = openSafeRegularFileHandle(context, uri)
                 try {
-                    verifyOpenedDescriptor(context, uri, pfd)
-                    ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                    handle.consumeInputStream()
                 } catch (error: Throwable) {
-                    runCatching { pfd.close() }
+                    handle.close()
                     throw error
                 }
             }
@@ -267,17 +1029,34 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
-    private fun verifyOpenedDescriptor(context: Context, uri: Uri, pfd: ParcelFileDescriptor) {
-        val stat = runCatching { Os.fstat(pfd.fileDescriptor) }.getOrNull()
-        if (stat != null && stat.st_mode != 0) {
-            require(OsConstants.S_ISREG(stat.st_mode) || OsConstants.S_ISFIFO(stat.st_mode)) {
-                "Document is not a regular file"
-            }
+    private fun verifyOpenedContentDescriptor(
+        context: Context,
+        uri: Uri,
+        pfd: ParcelFileDescriptor,
+        allowGrantedShareFile: Boolean,
+    ) {
+        val stat = runCatching { fileSyscalls.fstat(pfd.fileDescriptor) }.getOrNull()
+            ?: throw IllegalArgumentException("Could not confirm file descriptor status")
+        if (stat.st_mode == 0) {
+            throw IllegalArgumentException("Could not confirm file descriptor status")
         }
-        val fdPath = resolveDescriptorPath(pfd) ?: return
+        if (OsConstants.S_ISDIR(stat.st_mode)) {
+            throw ExternalFolderUriException("Folder URIs are not supported")
+        }
+        require(
+            OsConstants.S_ISREG(stat.st_mode) ||
+                OsConstants.S_ISFIFO(stat.st_mode) ||
+                OsConstants.S_ISSOCK(stat.st_mode),
+        ) {
+            "Document is not a regular file"
+        }
+        val fdPath = fileSyscalls.resolveDescriptorPath(pfd.fileDescriptor)
+            ?: resolveParcelDescriptorPath(pfd)
+            ?: return
         if (!fdPath.startsWith("/")) return
         val cleanFdPath = fdPath.removeSuffix(" (deleted)")
-        if (isAllowedGrantedShareFile(context, uri, cleanFdPath)) return
+        if (allowGrantedShareFile && isAllowedGrantedShareFile(context, uri, cleanFdPath)) return
+        if (isAllowedRegisteredTestDocsFile(context, uri, cleanFdPath)) return
         require(!isForbiddenExternalPath(context, cleanFdPath)) {
             "App-private paths cannot be opened externally"
         }
@@ -291,38 +1070,96 @@ internal object ExternalDocumentEntryGuard {
 
     private fun isAllowedGrantedShareFile(context: Context, uri: Uri, resolvedPath: String): Boolean {
         if (!uri.scheme.equals("content", ignoreCase = true)) return false
-        if (uri.authority != "${context.packageName}.share") return false
+        if (providerAuthority(uri)?.equals("${context.packageName}.share", ignoreCase = true) != true) return false
         val shareRoot = runCatching { File(context.cacheDir, "share").canonicalPath }.getOrNull() ?: return false
         val canonicalCandidate = runCatching { File(resolvedPath).canonicalPath }.getOrDefault(resolvedPath)
         return canonicalCandidate.startsWith("$shareRoot${File.separator}")
     }
 
-    private fun resolveDescriptorPath(pfd: ParcelFileDescriptor): String? {
-        val fdNumber = runCatching { pfd.fd }.getOrDefault(-1)
-        if (fdNumber >= 3) {
-            val procEntry = "/proc/self/fd/$fdNumber"
-            runCatching { Os.readlink(procEntry) }.getOrNull()?.takeIf(String::isNotBlank)?.let { return it }
-            runCatching { Files.readSymbolicLink(Paths.get(procEntry)).toString() }.getOrNull()
-                ?.takeIf(String::isNotBlank)?.let { return it }
-        }
-        return null
+    private fun isAllowedRegisteredTestDocsFile(context: Context, uri: Uri, resolvedPath: String): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val authority = providerAuthority(uri) ?: return false
+        if (!authority.equals("${context.packageName}.testdocs", ignoreCase = true)) return false
+        if (!TestAuthorityGrants.isRegistered(authority)) return false
+        val testDocsRoot = runCatching { File(context.cacheDir, "revocable-test-docs").canonicalPath }.getOrNull()
+            ?: return false
+        val canonicalCandidate = runCatching { File(resolvedPath).canonicalPath }.getOrDefault(resolvedPath)
+        return canonicalCandidate.startsWith("$testDocsRoot${File.separator}")
     }
 
-    internal fun isForbiddenExternalPath(context: Context, rawPath: String): Boolean {
+    private fun resolveParcelDescriptorPath(pfd: ParcelFileDescriptor): String? {
+        val fdNumber = runCatching { pfd.fd }.getOrDefault(-1)
+        return AndroidOsFileSyscalls.resolveProcFdPath(fdNumber)
+    }
+
+    internal fun isForbiddenExternalPath(
+        context: Context,
+        rawPath: String,
+        allowAppCacheFiles: Boolean = false,
+    ): Boolean {
         val normalized = runCatching { Paths.get(rawPath).normalize().toString() }.getOrDefault(rawPath)
+        for (sysRoot in alwaysRestrictedSystemRoots) {
+            if (isSameOrChildPath(normalized, sysRoot)) return true
+        }
+        if (allowAppCacheFiles && isStrictChildOfAppCache(context, normalized)) {
+            val nonCacheForbidden = nonCacheAppPrivateRoots(context).any { isSameOrChildPath(normalized, it) }
+            if (!nonCacheForbidden) return false
+        }
         for (sysRoot in restrictedSystemRoots) {
             if (isSameOrChildPath(normalized, sysRoot)) return true
         }
         val pkg = context.packageName
         if (pkg.isNotBlank()) {
             for (segment in listOf("/Android/data/$pkg", "/Android/obb/$pkg", "/Android/media/$pkg")) {
-                if (normalized.endsWith(segment) || normalized.contains("$segment/")) return true
+                if (normalized.endsWith(segment, ignoreCase = true) || normalized.contains("$segment/", ignoreCase = true)) {
+                    return true
+                }
             }
         }
         for (privateRoot in appPrivateRoots(context)) {
             if (isSameOrChildPath(normalized, privateRoot)) return true
         }
         return false
+    }
+
+    private fun appCacheRoots(context: Context): Set<String> {
+        val roots = LinkedHashSet<String>()
+        fun addDir(dir: File?) {
+            if (dir == null) return
+            roots += dir.absoluteFile.toPath().normalize().toString()
+            runCatching { dir.canonicalPath }.getOrNull()?.let { roots += it }
+        }
+        addDir(context.cacheDir)
+        runCatching { context.externalCacheDirs }.getOrNull()?.forEach(::addDir)
+        return roots
+    }
+
+    private fun isStrictChildOfAppCache(context: Context, normalizedPath: String): Boolean {
+        for (cacheRoot in appCacheRoots(context)) {
+            val cleanRoot = cacheRoot.trimEnd('/')
+            if (cleanRoot.isNotEmpty() && normalizedPath.startsWith("$cleanRoot/")) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun nonCacheAppPrivateRoots(context: Context): Set<String> {
+        val roots = LinkedHashSet<String>()
+        fun addDir(dir: File?) {
+            if (dir == null) return
+            roots += dir.absoluteFile.toPath().normalize().toString()
+            runCatching { dir.canonicalPath }.getOrNull()?.let { roots += it }
+        }
+        addDir(context.filesDir)
+        addDir(context.codeCacheDir)
+        addDir(context.noBackupFilesDir)
+        addDir(File(context.dataDir, "shared_prefs"))
+        addDir(runCatching { context.getDatabasePath("supermd.db")?.parentFile }.getOrNull())
+        addDir(runCatching { context.createDeviceProtectedStorageContext().dataDir }.getOrNull())
+        runCatching { context.getExternalFilesDirs(null) }.getOrNull()?.forEach(::addDir)
+        runCatching { context.obbDirs }.getOrNull()?.forEach(::addDir)
+        return roots
     }
 
     private fun appPrivateRoots(context: Context): Set<String> {

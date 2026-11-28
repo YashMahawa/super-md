@@ -428,6 +428,271 @@ class ExternalDocumentEntryPointTest {
         assertEquals("# Shared note via FileProvider\n", model.state.value.active.content)
     }
 
+    @Test
+    fun userAuthorizedNoteOpenRestoreAndReloadSharePermissionAndDescriptorValidationBeforeIo() {
+        val model = newModel(attachOpenHandler = true)
+        val initialId = model.state.value.active.id
+        model.edit(initialId, "# Unsaved user draft\n")
+
+        // 1. Ungranted SAF document on user-authorized open fails permission check BEFORE query or openFile.
+        provider.queryCount = 0
+        provider.openCount = 0
+        model.open(plainNoteUri)
+        await { model.documentAccessRequests.value != null }
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.openCount)
+        assertEquals("# Unsaved user draft\n", model.state.value.active.content)
+        model.dismissDocumentAccess()
+
+        // 2. Redirected app-private descriptor on user-authorized open fails descriptor check BEFORE query.
+        val privateSecret = File(app.filesDir, "private-note-secret.md").apply { writeText("TOP SECRET") }
+        val redirectAuthority = "dev.supermd.test.useropen.redirect.${System.nanoTime()}"
+        val redirectProvider = PrivateFileRedirectProvider(privateSecret).also { it.attach(rawApp, redirectAuthority) }
+        ShadowContentResolver.registerProviderInternal(redirectAuthority, redirectProvider)
+        val redirectedUri = DocumentsContract.buildDocumentUri(redirectAuthority, "innocent.md")
+        app.grantUriPermission(app.packageName, redirectedUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        model.dismissError()
+        model.open(redirectedUri)
+        await { model.state.value.error != null }
+        assertEquals(0, redirectProvider.queryCount)
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        assertEquals("# Unsaved user draft\n", model.state.value.active.content)
+        model.dismissError()
+
+        // 3. Unconfirmed descriptor status (st_mode == 0) is rejected before reading bytes or querying metadata.
+        val originalSyscalls = ExternalDocumentEntryGuard.fileSyscalls
+        try {
+            ExternalDocumentEntryGuard.fileSyscalls = object : ExternalFileSyscalls by originalSyscalls {
+                override fun fstat(fd: java.io.FileDescriptor): android.system.StructStat? = null
+            }
+            app.grantUriPermission(app.packageName, secondNoteUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            provider.queryCount = 0
+            model.open(secondNoteUri)
+            await { model.state.value.error != null }
+            assertEquals(0, provider.queryCount)
+            assertTrue(model.state.value.error!!.contains("Could not confirm file descriptor status"))
+            assertEquals("# Unsaved user draft\n", model.state.value.active.content)
+            model.dismissError()
+            app.revokeUriPermission(secondNoteUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } finally {
+            ExternalDocumentEntryGuard.fileSyscalls = originalSyscalls
+        }
+
+        // 4. Bare SAF tree, app-private file://, and symlink file:// URIs are rejected non-destructively on user-authorized open.
+        app.grantUriPermission(app.packageName, treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        model.open(treeUri)
+        await { model.state.value.error != null }
+        assertTrue(model.state.value.error!!.contains("Folder URIs are not supported"))
+        model.dismissError()
+
+        model.open(Uri.fromFile(privateSecret))
+        await { model.state.value.error != null }
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        model.dismissError()
+
+        val symlinkNote = File(publicDir, "symlink-note.md")
+        Files.createSymbolicLink(symlinkNote.toPath(), privateSecret.toPath())
+        model.open(Uri.fromFile(symlinkNote))
+        await { model.state.value.error != null }
+        assertTrue(model.state.value.error!!.contains("Symbolic links cannot be opened externally"))
+        model.dismissError()
+
+        // 5. Existing Android workspace SAF folder grants continue to authorize child note opens cleanly.
+        TestAuthorityGrants.registerAuthority(authority)
+        try {
+            val grantFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            app.grantUriPermission(app.packageName, treeUri, grantFlags)
+            TestAuthorityGrants.grant(treeUri, grantFlags, persistable = true)
+            model.setFolder(treeUri)
+            await { model.state.value.folder == treeUri.toString() }
+
+            model.open(plainNoteUri)
+            await { model.state.value.active.content == "# First external note\n" }
+            val openedNote = model.state.value.active
+            assertEquals("Note.md", openedNote.name)
+            assertTrue(model.state.value.tabs.any { it.id == initialId && it.content == "# Unsaved user draft\n" })
+
+            // 6. ReloadFromDisk enforces permission & descriptor validation and preserves dirty draft on failure.
+            model.edit(openedNote.id, "# Modified workspace draft\n")
+            provider.redirectTarget = privateSecret
+            model.reloadFromDisk(openedNote.id)
+            await { model.state.value.error != null }
+            assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+            assertEquals("# Modified workspace draft\n", model.state.value.tabs.single { it.id == openedNote.id }.content)
+            provider.redirectTarget = null
+            model.dismissError()
+        } finally {
+            TestAuthorityGrants.clear()
+        }
+
+        // 7. Granted pipe-streamed content:// note (S_ISFIFO) opens cleanly via shared user-authorized guard.
+        val pipeAuthority = "dev.supermd.test.useropen.pipe.${System.nanoTime()}"
+        val pipeProvider = object : ContentProvider() {
+            override fun onCreate(): Boolean = true
+            override fun query(
+                uri: Uri,
+                projection: Array<out String>?,
+                selection: String?,
+                selectionArgs: Array<out String>?,
+                sortOrder: String?,
+            ): Cursor {
+                val cols = projection?.toList() ?: listOf(OpenableColumns.DISPLAY_NAME)
+                return MatrixCursor(cols.toTypedArray()).apply {
+                    addRow(cols.map { "StreamedNote.md" }.toTypedArray<Any?>())
+                }
+            }
+            override fun getType(uri: Uri): String = "text/markdown"
+            override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+            override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+            override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+            override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+                val pipe = ParcelFileDescriptor.createPipe()
+                ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { out ->
+                    out.write("# Streamed pipe note\n".toByteArray())
+                    out.flush()
+                }
+                return pipe[0]
+            }
+        }
+        pipeProvider.attachInfo(
+            rawApp,
+            ProviderInfo().apply {
+                authority = pipeAuthority
+                exported = true
+                grantUriPermissions = true
+            },
+        )
+        ShadowContentResolver.registerProviderInternal(pipeAuthority, pipeProvider)
+        val pipeNoteUri = DocumentsContract.buildDocumentUri(pipeAuthority, "streamed.md")
+        app.grantUriPermission(app.packageName, pipeNoteUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        model.open(pipeNoteUri)
+        await { model.state.value.active.uri == pipeNoteUri.toString() }
+        assertEquals("# Streamed pipe note\n", model.state.value.active.content)
+
+        // 8. restoreDocumentAccess enforces permission & descriptor checks before accepting re-selected URIs.
+        val restoreTargetUri = DocumentsContract.buildDocumentUri(redirectAuthority, "innocent.md")
+        app.revokeUriPermission(restoreTargetUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        model.open(restoreTargetUri)
+        await { model.documentAccessRequests.value != null }
+        val pendingReq = model.documentAccessRequests.value!!
+        app.grantUriPermission(app.packageName, restoreTargetUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        redirectProvider.queryCount = 0
+        model.restoreDocumentAccess(pendingReq, restoreTargetUri)
+        await { model.documentAccessRequests.value?.detail != null }
+        assertEquals(0, redirectProvider.queryCount)
+        assertTrue(model.documentAccessRequests.value!!.detail!!.contains("App-private paths cannot be opened externally"))
+
+        privateSecret.delete()
+    }
+
+    @Test
+    fun inProcessCacheStagingAndDebugTestDocsPreserveContainmentAndPreQueryFontThemeGuards() {
+        val model = newModel(attachOpenHandler = true)
+
+        // 1. In-process user-authorized open allows regular non-symlink staged files in app.cacheDir,
+        // while external Intents, drops, symlinks into filesDir, and third-party content:// redirects to cacheDir remain rejected.
+        val stagedCacheNote = File(app.cacheDir, "staged-relay-${System.nanoTime()}.md").apply {
+            writeText("# Staged cache note\n")
+        }
+        val stagedUri = Uri.fromFile(stagedCacheNote)
+        assertTrue(
+            ExternalDocumentEntryGuard.validateIncomingIntent(app, Intent(Intent.ACTION_VIEW, stagedUri))
+                is ExternalDocumentDecision.Rejected,
+        )
+        ExternalDocumentEntryGuard.admitDroppedUri(app, stagedUri, dragReadPermissionGranted = true).use { dropDecision ->
+            assertTrue(dropDecision is ExternalDropUriDecision.Rejected)
+        }
+        model.open(stagedUri)
+        await { model.state.value.active.uri == stagedUri.toString() }
+        assertEquals("# Staged cache note\n", model.state.value.active.content)
+
+        val privateTarget = File(app.filesDir, "hidden-workspace-${System.nanoTime()}.md").apply {
+            writeText("SECRET WORKSPACE")
+        }
+        val aliasDir = File(app.cacheDir, "files-alias-${System.nanoTime()}")
+        Files.createSymbolicLink(aliasDir.toPath(), app.filesDir.toPath())
+        val aliasedFileUri = Uri.fromFile(File(aliasDir, privateTarget.name))
+        model.dismissError()
+        model.open(aliasedFileUri)
+        await { model.state.value.error != null }
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        model.dismissError()
+
+        val cacheRedirectAuth = "com.attacker.cache.redirect.${System.nanoTime()}"
+        val cacheRedirectProvider = PrivateFileRedirectProvider(stagedCacheNote).also { it.attach(rawApp, cacheRedirectAuth) }
+        ShadowContentResolver.registerProviderInternal(cacheRedirectAuth, cacheRedirectProvider)
+        val cacheRedirectUri = DocumentsContract.buildDocumentUri(cacheRedirectAuth, "staged.md")
+        app.grantUriPermission(app.packageName, cacheRedirectUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        model.open(cacheRedirectUri)
+        await { model.state.value.error != null }
+        assertEquals(0, cacheRedirectProvider.queryCount)
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        model.dismissError()
+
+        // 2. Registered debug ${packageName}.testdocs SAF provider under cacheDir/revocable-test-docs works when registered,
+        // while non-testdocs providers pointing into revocable-test-docs remain rejected.
+        val testDocsDir = File(app.cacheDir, "revocable-test-docs").apply { mkdirs() }
+        val testDocFile = File(testDocsDir, "RevocableNote.md").apply { writeText("# Revocable test doc\n") }
+        val testDocsAuth = "${app.packageName}.testdocs"
+        val testDocsProvider = PrivateFileRedirectProvider(testDocFile).also { it.attach(rawApp, testDocsAuth) }
+        ShadowContentResolver.registerProviderInternal(testDocsAuth, testDocsProvider)
+        val testDocUri = DocumentsContract.buildDocumentUri(testDocsAuth, "RevocableNote.md")
+
+        val spoofedTestDocsAuth = "com.attacker.spoofed.testdocs.${System.nanoTime()}"
+        val spoofedProvider = PrivateFileRedirectProvider(testDocFile).also { it.attach(rawApp, spoofedTestDocsAuth) }
+        ShadowContentResolver.registerProviderInternal(spoofedTestDocsAuth, spoofedProvider)
+        val spoofedTestDocUri = DocumentsContract.buildDocumentUri(spoofedTestDocsAuth, "RevocableNote.md")
+        app.grantUriPermission(app.packageName, spoofedTestDocUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        model.open(spoofedTestDocUri)
+        await { model.state.value.error != null }
+        assertEquals(0, spoofedProvider.queryCount)
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+        model.dismissError()
+
+        TestAuthorityGrants.registerAuthority(testDocsAuth)
+        try {
+            TestAuthorityGrants.grant(testDocUri, Intent.FLAG_GRANT_READ_URI_PERMISSION, persistable = true)
+            model.open(testDocUri)
+            await { model.state.value.active.uri == testDocUri.toString() }
+            assertEquals("# Revocable test doc\n", model.state.value.active.content)
+        } finally {
+            TestAuthorityGrants.clear()
+        }
+
+        // 3. FontLibrary.import and importCustomTheme enforce permission and descriptor checks BEFORE provider queries.
+        val fontLibrary = FontLibrary(app)
+        val ungrantedFontUri = DocumentsContract.buildDocumentUri(authority, "Custom.ttf")
+        provider.queryCount = 0
+        provider.openCount = 0
+        org.junit.Assert.assertThrows(SecurityException::class.java) {
+            fontLibrary.import(ungrantedFontUri)
+        }
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.openCount)
+
+        val redirectFontUri = DocumentsContract.buildDocumentUri(cacheRedirectAuth, "Secret.ttf")
+        app.grantUriPermission(app.packageName, redirectFontUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        cacheRedirectProvider.queryCount = 0
+        val redirectFontErr = org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            fontLibrary.import(redirectFontUri)
+        }
+        assertEquals(0, cacheRedirectProvider.queryCount)
+        assertTrue(redirectFontErr.message!!.contains("App-private paths cannot be opened externally"))
+
+        model.dismissError()
+        model.importCustomTheme(redirectFontUri)
+        await { model.state.value.error != null }
+        assertEquals(0, cacheRedirectProvider.queryCount)
+        assertTrue(model.state.value.error!!.contains("App-private paths cannot be opened externally"))
+
+        stagedCacheNote.delete()
+        aliasDir.delete()
+        privateTarget.delete()
+        testDocFile.delete()
+    }
+
     private fun newModel(attachOpenHandler: Boolean): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = "entry-guard-${System.nanoTime()}".also(workspaceKeys::add)
@@ -513,6 +778,8 @@ private class EntryPointDocumentProvider(
     private val secondFile = File(directory, "Second.md").apply { writeText("# Second note\n") }
     var failRead = false
     var openCount = 0
+    var queryCount = 0
+    var redirectTarget: File? = null
 
     fun attach(context: Context, authority: String) {
         attachInfo(
@@ -543,6 +810,7 @@ private class EntryPointDocumentProvider(
         selectionArgs: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
+        queryCount++
         val segments = uri.pathSegments
         if (segments.lastOrNull() == "children" && segments.size >= 2) {
             val cols = projection?.toList() ?: listOf(
@@ -602,11 +870,13 @@ private class EntryPointDocumentProvider(
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
         openCount++
         if (mode == "r" && failRead) throw SecurityException("Simulated provider read failure")
-        return ParcelFileDescriptor.open(fileFor(uri), ParcelFileDescriptor.MODE_READ_ONLY)
+        val target = redirectTarget ?: fileFor(uri)
+        return ParcelFileDescriptor.open(target, ParcelFileDescriptor.MODE_READ_ONLY)
     }
 }
 
 private class PrivateFileRedirectProvider(private val target: File) : ContentProvider() {
+    var queryCount = 0
     fun attach(context: Context, authority: String) {
         attachInfo(
             context,
@@ -627,6 +897,7 @@ private class PrivateFileRedirectProvider(private val target: File) : ContentPro
         selectionArgs: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
+        queryCount++
         val cols = projection?.toList() ?: listOf(OpenableColumns.DISPLAY_NAME)
         return MatrixCursor(cols.toTypedArray()).apply {
             addRow(cols.map { "innocent.md" }.toTypedArray<Any?>())

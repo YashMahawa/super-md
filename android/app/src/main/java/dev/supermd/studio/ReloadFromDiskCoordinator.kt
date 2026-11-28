@@ -1,6 +1,7 @@
 package dev.supermd.studio
 
 import android.content.ContentResolver
+import android.content.Context
 import android.net.Uri
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -18,6 +19,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 internal class ReloadFromDiskCoordinator(
+    private val context: Context,
     private val scope: CoroutineScope,
     private val resolver: ContentResolver,
     private val documentAccess: () -> DocumentAccess,
@@ -136,8 +138,20 @@ internal class ReloadFromDiskCoordinator(
                             val noteUri = note.uri ?: return@withLock
                             snapshotNote = note
                             rawUri = noteUri
-                            val target = documentAccess().resolve(Uri.parse(noteUri))
-                            val loaded = resolver.openInputStream(target)?.use { stream ->
+                            val parsedUri = Uri.parse(noteUri)
+                            val target = if (parsedUri.scheme.equals("content", ignoreCase = true)) {
+                                documentAccess().resolve(parsedUri)
+                            } else {
+                                parsedUri
+                            }
+                            val loaded = ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                                context = context,
+                                resolver = resolver,
+                                uri = target,
+                                documentAccess = documentAccess(),
+                                allowOwnShareNote = true,
+                                allowAppCacheFiles = true,
+                            ).use { stream ->
                                 if (note.portable) {
                                     val opened = media.openFmd(stream)
                                     cleanupDirs.add(opened.directory)
@@ -163,7 +177,7 @@ internal class ReloadFromDiskCoordinator(
                                         assetsDirty = false,
                                     )
                                 }
-                            } ?: error("Document permission is unavailable; choose it again")
+                            }
                             reloaded = loaded
 
                             if (note.dirty) {

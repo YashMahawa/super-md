@@ -430,17 +430,21 @@ internal class ExternalDropDragController(
 
 internal fun shouldBlockNativeDrop(
     state: StudioState,
+    readerReady: Boolean = true,
     folderSearchVisible: Boolean = false,
     accessRequestOpen: Boolean = false,
     settingsOpen: Boolean = false,
     exporting: Boolean = false,
     renaming: Boolean = false,
+    folderDialogOpen: Boolean = false,
     contentsShown: Boolean = false,
     drawerOpen: Boolean = false,
 ): Boolean =
-    !state.welcomed ||
+    !readerReady ||
+        !state.welcomed ||
         state.busy ||
         state.readerOverlay ||
+        state.error != null ||
         folderSearchVisible ||
         accessRequestOpen ||
         state.folderAccessPrompt != null ||
@@ -449,6 +453,7 @@ internal fun shouldBlockNativeDrop(
         settingsOpen ||
         exporting ||
         renaming ||
+        folderDialogOpen ||
         contentsShown ||
         drawerOpen
 
@@ -902,7 +907,18 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         imageCallback?.onReceiveValue(null); imageCallback = null
-        if (uris.isNotEmpty()) model.importDropped(uris, imageNote) { images -> images?.let { web?.evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
+        if (uris.isNotEmpty()) {
+            model.importPickedImages(uris, imageNote) { images ->
+                if (images != null) {
+                    val activeWeb = web
+                    if (activeWeb != null && readerReady) {
+                        activeWeb.evaluateJavascript("window.supermdInsertImages?.($images)", null)
+                    } else {
+                        model.discardDroppedImages(images)
+                    }
+                }
+            }
+        }
     }
     LaunchedEffect(activity) { WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info -> hinge = info.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull { it.isSeparating && it.orientation == FoldingFeature.Orientation.VERTICAL } } }
     val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { uri -> activity.requestOpen(uri) } }
@@ -1177,32 +1193,55 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                 val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
                     if (shouldBlockNativeDrop(
                             model.state.value,
+                            readerReady = readerReady,
                             folderSearchVisible = model.folderSearch.value.visible,
-                            accessRequestOpen = model.documentAccessRequests.value != null,
+                            accessRequestOpen = !accessPickerShowing && model.documentAccessRequests.value != null,
                             settingsOpen = settings,
                             exporting = exporting,
                             renaming = renaming,
+                            folderDialogOpen = createFolderRequest != null || renameFolderTarget != null,
                             contentsShown = contentsShown,
                             drawerOpen = drawer.isOpen,
                         )) {
                         return@rememberUpdatedState
                     }
-                    val permissions = activity.requestDragAndDropPermissions(event)
                     val uris = extractDroppedFileUris(event.clipData)
+                    val hasContentUri = uris.any { it.scheme.equals("content", ignoreCase = true) }
+                    val permissions = if (hasContentUri) {
+                        runCatching { activity.requestDragAndDropPermissions(event) }.getOrNull()
+                    } else {
+                        null
+                    }
                     if (uris.isNotEmpty()) {
                         val id = model.state.value.active.id
                         val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
                         val x = event.x / currentDensity
                         val y = event.y / currentDensity
                         reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                        model.importDropped(uris, id) { images ->
-                            permissions?.release()
-                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                        val job = model.handleExternalDrop(
+                            uris = uris,
+                            activeNoteId = id,
+                            dragReadPermissionGranted = permissions != null,
+                        ) { images ->
+                            if (web === reader && readerReady) {
+                                if (images != null) {
+                                    reader.evaluateJavascript("window.supermdInsertImages?.($images)", null)
+                                } else {
+                                    reader.evaluateJavascript("window.supermdInsertImages?.([])", null)
+                                }
+                            } else if (images != null) {
+                                model.discardDroppedImages(images)
+                            }
                         }
+                        job.invokeOnCompletion { runCatching { permissions?.release() } }
                     } else {
-                        permissions?.release()
+                        runCatching { permissions?.release() }
                         if ((event.clipData?.itemCount ?: 0) > 0) {
-                            model.importDropped(emptyList(), model.state.value.active.id) {}
+                            model.handleExternalDrop(
+                                uris = emptyList(),
+                                activeNoteId = model.state.value.active.id,
+                                dragReadPermissionGranted = false,
+                            ) {}
                         }
                     }
                 }
@@ -2223,11 +2262,18 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
     val pairingImport = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
             val raw = runCatching { withContext(Dispatchers.IO) {
-                activity.contentResolver.openInputStream(uri)?.use { input ->
+                ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                    context = activity,
+                    resolver = activity.contentResolver,
+                    uri = uri,
+                    allowExportedNonSafPickerProvider = true,
+                    allowAppCacheFiles = true,
+                    deniedMessage = "The pairing file cannot be read",
+                ).use { input ->
                     val bytes = ByteArray(8 * 1024 + 1); val count = input.read(bytes)
                     require(count in 1..8 * 1024) { "Pairing file is empty or too large" }
                     String(bytes, 0, count, Charsets.UTF_8)
-                } ?: error("The pairing file cannot be read")
+                }
             } }
             raw.onSuccess { text ->
                 if (activity.agentAccessState.currentConfig() != null) revokeThen { joinWorkspace(text) }

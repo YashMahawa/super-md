@@ -111,6 +111,150 @@ class ReaderAssetCoordinatorTest {
         assertThrows(IllegalStateException::class.java) { model.openReaderAsset(cap) }
     }
 
+    @Test fun linkedReaderAssetsEnforceSharedPermissionAndDescriptorValidationWhilePreservingStreams() {
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val enforcingApp = object : Application() {
+            init {
+                attachBaseContext(app)
+            }
+            override fun grantUriPermission(toPackage: String?, uri: Uri?, modeFlags: Int) {
+                super.grantUriPermission(toPackage, uri, modeFlags)
+                if (uri != null) grantedUris[uri] = (grantedUris[uri] ?: 0) or modeFlags
+            }
+            override fun revokeUriPermission(uri: Uri?, modeFlags: Int) {
+                super.revokeUriPermission(uri, modeFlags)
+                if (uri != null) {
+                    val rem = (grantedUris[uri] ?: 0) and modeFlags.inv()
+                    if (rem == 0) grantedUris.remove(uri) else grantedUris[uri] = rem
+                }
+            }
+            override fun checkUriPermission(uri: Uri?, pid: Int, uid: Int, modeFlags: Int): Int {
+                val held = if (uri != null) grantedUris[uri] ?: 0 else 0
+                return if ((held and modeFlags) == modeFlags) {
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                } else {
+                    android.content.pm.PackageManager.PERMISSION_DENIED
+                }
+            }
+        }
+
+        val authority = "dev.supermd.test.reader.guard.${System.nanoTime()}"
+        val provider = SimpleAssetProvider(tempDir).also { it.attach(app, authority) }
+        ShadowContentResolver.registerProviderInternal(authority, provider)
+
+        val model = StudioViewModel(enforcingApp, "coord-guard-${System.nanoTime()}".also { cleanups += File(app.filesDir, "workspaces/$it") }).also {
+            it.readerFlushRequester = { true }
+            ViewModelStore().also(stores::add).put("m", it)
+        }
+        val note = model.state.value.active
+
+        val pngBytes = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3)
+        val ungrantedDiagramUri = provider.put("flow.mmd", "flowchart LR\n  A --> B\n".toByteArray())
+        val privateSecret = File(app.filesDir, "private-linked-secret.mmd").apply { writeText("flowchart LR\n  Secret --> Leak\n") }
+        val redirectedAssetUri = provider.putWithBackingFile("secret.mmd", privateSecret)
+
+        // 1. restoreDocumentAccess for a linked asset rejects ungranted SAF URIs before query or openFile.
+        provider.queryCount = 0
+        provider.openCount = 0
+        val ungrantedReq = DocumentAccessRequest(note.uri ?: note.id, "flow.mmd", note.id, false, assetSource = "diagrams/flow.mmd")
+        model.restoreDocumentAccess(ungrantedReq, ungrantedDiagramUri)
+        idleUntil { model.documentAccessRequests.value?.detail != null }
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.openCount)
+        model.dismissDocumentAccess()
+
+        // 2. restoreDocumentAccess rejects redirected app-private descriptors BEFORE querying display name.
+        enforcingApp.grantUriPermission(app.packageName, redirectedAssetUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        provider.queryCount = 0
+        provider.openCount = 0
+        val redirectReq = DocumentAccessRequest(note.uri ?: note.id, "secret.mmd", note.id, false, assetSource = "diagrams/secret.mmd")
+        model.restoreDocumentAccess(redirectReq, redirectedAssetUri)
+        idleUntil { model.documentAccessRequests.value?.detail != null }
+        assertEquals(1, provider.openCount)
+        assertEquals(0, provider.queryCount)
+        assertTrue(model.documentAccessRequests.value!!.detail!!.contains("App-private paths cannot be opened externally"))
+        model.dismissDocumentAccess()
+
+        // 3. Revoked grant on a remembered linked asset fails permission check before query/open and prompts access recovery.
+        val imageUri = provider.put("chart.png", pngBytes, mimeType = "image/png")
+        enforcingApp.grantUriPermission(app.packageName, imageUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        var linkedDone = false
+        model.assetAccessRestored = { _, restored -> if (restored == "images/chart.png") linkedDone = true }
+        model.restoreDocumentAccess(DocumentAccessRequest(note.uri ?: note.id, "chart.png", note.id, false, assetSource = "images/chart.png"), imageUri)
+        idleUntil { linkedDone && model.documentAccessRequests.value == null }
+
+        enforcingApp.revokeUriPermission(imageUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        provider.queryCount = 0
+        provider.openCount = 0
+        val revokedError = assertThrows(SecurityException::class.java) {
+            runBlocking { model.asset(note.id, "images/chart.png") }
+        }
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.openCount)
+        assertTrue(model.reportLinkedAssetFailure(note.id, "images/chart.png", revokedError))
+        assertNotNull(model.documentAccessRequests.value)
+        model.dismissDocumentAccess()
+
+        // 4. Granted pipe-streamed (S_ISFIFO) linked assets remain working and bounded across both textAsset and openReaderAsset.
+        val pipeUri = provider.putPipe("stream.mmd", "flowchart TD\n  Start --> Stop\n".toByteArray(), mimeType = "text/plain")
+        enforcingApp.grantUriPermission(app.packageName, pipeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        var streamLinked = false
+        model.assetAccessRestored = { _, restored -> if (restored == "diagrams/stream.mmd") streamLinked = true }
+        model.restoreDocumentAccess(DocumentAccessRequest(note.uri ?: note.id, "stream.mmd", note.id, false, assetSource = "diagrams/stream.mmd"), pipeUri)
+        idleUntil { streamLinked && model.documentAccessRequests.value == null }
+        assertEquals("flowchart TD\n  Start --> Stop\n", runBlocking { model.textAsset(note.id, "diagrams/stream.mmd") }.getString("text"))
+
+        val pipeImageUri = provider.putPipe("pipe-chart.png", pngBytes, mimeType = "image/png", unknownSize = true)
+        enforcingApp.grantUriPermission(app.packageName, pipeImageUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        var pipeImgLinked = false
+        model.assetAccessRestored = { _, restored -> if (restored == "images/pipe-chart.png") pipeImgLinked = true }
+        model.restoreDocumentAccess(DocumentAccessRequest(note.uri ?: note.id, "pipe-chart.png", note.id, false, assetSource = "images/pipe-chart.png"), pipeImageUri)
+        idleUntil { pipeImgLinked && model.documentAccessRequests.value == null }
+        val (_, resolvedPipeImg) = model.resolveReaderAsset(note.id, "images/pipe-chart.png")
+        val pipeCap = ReaderAssetCapabilities().register(note.id, "images/pipe-chart.png", resolvedPipeImg.mime, resolvedPipeImg.fingerprint, resolvedPipeImg.target)!!
+        assertArrayEquals(pngBytes, model.openReaderAsset(pipeCap).stream.use { it.readBytes() })
+
+        // 5. openReaderAsset(capability) enforces permission BEFORE querySafAssetMetadata, opens timestamped SAF
+        // assets only once on valid reads, and enforces descriptor containment before returning any stream.
+        enforcingApp.grantUriPermission(app.packageName, imageUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        provider.openCount = 0
+        val (_, resolvedChart) = model.resolveReaderAsset(note.id, "images/chart.png")
+        assertEquals("Timestamped SAF capability resolution does not open image stream", 0, provider.openCount)
+        val chartCap = ReaderAssetCapabilities().register(note.id, "images/chart.png", resolvedChart.mime, resolvedChart.fingerprint, resolvedChart.target)!!
+        provider.openCount = 0
+        assertArrayEquals(pngBytes, model.openReaderAsset(chartCap).stream.use { it.readBytes() })
+        assertEquals("Opening timestamped SAF capability opens descriptor once", 1, provider.openCount)
+
+        // Revoking grant before openReaderAsset(capability) fails before query or openFile.
+        enforcingApp.revokeUriPermission(imageUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        provider.queryCount = 0
+        provider.openCount = 0
+        assertThrows(SecurityException::class.java) {
+            model.openReaderAsset(chartCap)
+        }
+        assertEquals(0, provider.queryCount)
+        assertEquals(0, provider.openCount)
+
+        // Re-granting permission while swapping backing descriptor to an app-private file with matching metadata
+        // fails descriptor containment before returning OpenReaderAsset.
+        enforcingApp.grantUriPermission(app.packageName, imageUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val privateChart = File(app.filesDir, "private-chart-${System.nanoTime()}.png").apply {
+            writeBytes(pngBytes)
+        }
+        provider.putWithBackingFile("chart.png", privateChart, mimeType = "image/png")
+        val (_, redirectedResolved) = model.resolveReaderAsset(note.id, "images/chart.png")
+        val redirectedCap = ReaderAssetCapabilities().register(note.id, "images/chart.png", redirectedResolved.mime, redirectedResolved.fingerprint, redirectedResolved.target)!!
+        provider.openCount = 0
+        val redirectCapErr = assertThrows(IllegalArgumentException::class.java) {
+            model.openReaderAsset(redirectedCap)
+        }
+        assertEquals(1, provider.openCount)
+        assertTrue(redirectCapErr.message!!.contains("App-private paths cannot be opened externally"))
+        privateChart.delete()
+
+        privateSecret.delete()
+    }
+
     private fun grantLinkedAsset(model: StudioViewModel, note: Note, source: String, name: String, uri: Uri) {
         var done = false
         model.assetAccessRestored = { _, restored -> if (restored == source) done = true }
@@ -131,18 +275,53 @@ class ReaderAssetCoordinatorTest {
 }
 
 private class SimpleAssetProvider(private val dir: File) : ContentProvider() {
-    private val files = mutableMapOf<String, Pair<String, File>>()
+    private data class Entry(
+        val name: String,
+        val file: File?,
+        val mime: String,
+        val pipeBytes: ByteArray? = null,
+        val unknownSize: Boolean = false,
+    )
+    private val files = mutableMapOf<String, Entry>()
     private lateinit var auth: String
+    var queryCount = 0
+    var openCount = 0
     fun attach(ctx: Context, authority: String) { auth = authority; attachInfo(ctx, ProviderInfo().apply { this.authority = authority; exported = true; grantUriPermissions = true }) }
-    fun put(name: String, bytes: ByteArray): Uri = DocumentsContract.buildDocumentUri(auth, name).also { files[name] = name to File(dir, "${files.size}-$name").apply { writeBytes(bytes) } }
+    fun put(name: String, bytes: ByteArray, mimeType: String = "text/plain"): Uri =
+        DocumentsContract.buildDocumentUri(auth, name).also {
+            files[name] = Entry(name, File(dir, "${files.size}-$name").apply { writeBytes(bytes) }, mimeType)
+        }
+    fun putWithBackingFile(name: String, backing: File, mimeType: String = "text/plain"): Uri =
+        DocumentsContract.buildDocumentUri(auth, name).also {
+            files[name] = Entry(name, backing, mimeType)
+        }
+    fun putPipe(name: String, bytes: ByteArray, mimeType: String = "text/plain", unknownSize: Boolean = false): Uri =
+        DocumentsContract.buildDocumentUri(auth, name).also {
+            files[name] = Entry(name, null, mimeType, pipeBytes = bytes, unknownSize = unknownSize)
+        }
     override fun onCreate() = true
-    override fun getType(uri: Uri) = "text/plain"
+    override fun getType(uri: Uri) = files[DocumentsContract.getDocumentId(uri)]?.mime ?: "text/plain"
     override fun query(uri: Uri, proj: Array<out String>?, sel: String?, args: Array<out String>?, sort: String?): Cursor {
-        val (name, file) = files[DocumentsContract.getDocumentId(uri)] ?: return MatrixCursor(emptyArray())
+        queryCount++
+        val entry = files[DocumentsContract.getDocumentId(uri)] ?: return MatrixCursor(emptyArray())
         val cols = proj ?: arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE)
-        return MatrixCursor(cols).apply { addRow(cols.map<String, Any?> { when (it) { DocumentsContract.Document.COLUMN_DISPLAY_NAME -> name; DocumentsContract.Document.COLUMN_MIME_TYPE -> "text/plain"; DocumentsContract.Document.COLUMN_SIZE -> file.length(); DocumentsContract.Document.COLUMN_LAST_MODIFIED -> file.lastModified(); else -> null } }.toTypedArray()) }
+        val length = if (entry.unknownSize) -1L else (entry.file?.length() ?: entry.pipeBytes?.size?.toLong() ?: -1L)
+        val mtime = if (entry.unknownSize) 0L else (entry.file?.lastModified() ?: 1_000L)
+        return MatrixCursor(cols).apply { addRow(cols.map<String, Any?> { when (it) { DocumentsContract.Document.COLUMN_DISPLAY_NAME -> entry.name; DocumentsContract.Document.COLUMN_MIME_TYPE -> entry.mime; DocumentsContract.Document.COLUMN_SIZE -> length; DocumentsContract.Document.COLUMN_LAST_MODIFIED -> mtime; else -> null } }.toTypedArray()) }
     }
-    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor = ParcelFileDescriptor.open(files[DocumentsContract.getDocumentId(uri)]!!.second, ParcelFileDescriptor.MODE_READ_ONLY)
+    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        openCount++
+        val entry = files[DocumentsContract.getDocumentId(uri)]!!
+        if (entry.pipeBytes != null) {
+            val pipe = ParcelFileDescriptor.createPipe()
+            ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { out ->
+                out.write(entry.pipeBytes)
+                out.flush()
+            }
+            return pipe[0]
+        }
+        return ParcelFileDescriptor.open(entry.file!!, ParcelFileDescriptor.MODE_READ_ONLY)
+    }
     override fun insert(uri: Uri, v: ContentValues?): Uri? = null
     override fun delete(uri: Uri, s: String?, a: Array<out String>?) = 0
     override fun update(uri: Uri, v: ContentValues?, s: String?, a: Array<out String>?) = 0

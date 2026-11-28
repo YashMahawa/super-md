@@ -179,7 +179,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun matchesReaderAssetNote(noteId: String, target: ReaderAssetTarget? = null): Boolean =
         readerAssetCoordinator.matchesReaderAssetNote(noteId, target)
     var assetAccessRestored: ((String, String) -> Unit)? = null
-    fun retainDocumentAccess(uri: Uri) = documentAccess.persist(uri)
+    fun retainDocumentAccess(uri: Uri) {
+        if (ExternalDocumentEntryGuard.canPersistUserAuthorizedDocumentGrant(getApplication(), uri)) {
+            documentAccess.persist(uri)
+        }
+    }
     fun dismissDocumentAccess() { accessRequestsMutable.value = null }
     private fun linkedAssetUri(note: Note, source: String): Uri? = readerAssetCoordinator.linkedAssetUri(note, source)
     private fun rememberLinkedAsset(note: Note, source: String, uri: Uri) = readerAssetCoordinator.rememberLinkedAsset(note, source, uri)
@@ -301,10 +305,23 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val note = mutable.value.tabs.firstOrNull { it.id == request.noteId } ?: error("The note is no longer open")
                 require(sameDocumentUri(note.uri ?: note.id, request.uri)) { "The note's destination changed; its draft was left intact." }
                 withContext(Dispatchers.IO) {
-                    documentAccess.persist(chosen)
-                    val name = DocumentFile.fromSingleUri(getApplication(), chosen)?.name
+                    val app = getApplication<Application>()
+                    ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(app, chosen, allowAppCacheFiles = true)
+                    if (ExternalDocumentEntryGuard.canPersistUserAuthorizedDocumentGrant(app, chosen)) {
+                        documentAccess.persist(chosen)
+                    }
+                    val resolvedChosen = if (chosen.scheme.equals("content", ignoreCase = true)) documentAccess.resolve(chosen) else chosen
+                    ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                        context = app,
+                        resolver = resolver,
+                        uri = resolvedChosen,
+                        documentAccess = documentAccess,
+                        allowExportedNonSafPickerProvider = true,
+                        allowAppCacheFiles = true,
+                        deniedMessage = "Android did not grant read access",
+                    ).use { }
+                    val name = resolveDisplayName(resolvedChosen)
                     require(name == request.name) { "Choose ${request.name}; the selected file has a different name." }
-                    resolver.openFileDescriptor(chosen, "r")?.use { } ?: error("Android did not grant read access")
                 }
                 rememberLinkedAsset(note, request.assetSource, chosen)
                 promptedAssetAccess.remove("${note.id}\n${request.assetSource}")
@@ -314,30 +331,86 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 assetAccessRestored?.invoke(note.uri ?: note.id, request.assetSource)
                 return@launch
             }
+            val app = getApplication<Application>()
+            val allowOwnShare = Uri.parse(request.uri).authority == "${app.packageName}.share"
+            ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(
+                context = app,
+                uri = chosen,
+                allowOwnShareNote = allowOwnShare,
+                allowAppCacheFiles = true,
+            )
             require(sameDocument(Uri.parse(request.uri), chosen)) { "Choose the original ${request.name}. To use another destination, save a copy instead." }
             val (resolved, writeRestored) = withContext(Dispatchers.IO) {
-                documentAccess.persist(chosen)
-                val target = documentAccess.resolve(chosen, request.writing)
-                // Verify without truncating or writing any bytes. The existing
-                // draft and its saved baseline remain authoritative.
-                if (request.writing && DocumentsContract.isTreeUri(target) && !documentAccess.hasWriteGrant(target)) {
-                    throw SecurityException("Android did not grant write access to this file")
+                if (ExternalDocumentEntryGuard.canPersistUserAuthorizedDocumentGrant(app, chosen)) {
+                    documentAccess.persist(chosen)
                 }
-                resolver.openFileDescriptor(target, if (request.writing) "rw" else "r")?.use { }
-                    ?: error("Android did not grant access to this file")
-                if (request.writing) {
-                    target to true
+                val target = if (chosen.scheme.equals("content", ignoreCase = true)) {
+                    documentAccess.resolve(chosen, request.writing)
                 } else {
-                    val writeCandidate = documentAccess.resolve(chosen, writing = true)
-                    val candidateWritable = documentAccess.hasWriteGrant(writeCandidate) &&
-                        runCatching { resolver.openFileDescriptor(writeCandidate, "rw")?.use { true } == true }.getOrDefault(false)
-                    if (candidateWritable) {
-                        writeCandidate to true
+                    chosen
+                }
+                if (target.scheme.equals("file", ignoreCase = true)) {
+                    val writable = ExternalDocumentEntryGuard.openSafeRegularFileHandle(
+                        context = app,
+                        uri = target,
+                        allowAppCacheFiles = true,
+                    ).use { handle ->
+                        File(handle.rawPath).canWrite()
+                    }
+                    if (request.writing && !writable) {
+                        throw SecurityException("Android did not grant write access to this file")
+                    }
+                    target to writable
+                } else {
+                    ExternalDocumentEntryGuard.requireUserAuthorizedContentReadPermission(
+                        context = app,
+                        uri = target,
+                        documentAccess = documentAccess,
+                        allowOwnShareNote = allowOwnShare,
+                        deniedMessage = "Android did not grant access to this file",
+                    )
+                    // Verify without truncating or writing any bytes. The existing
+                    // draft and its saved baseline remain authoritative.
+                    if (request.writing && DocumentsContract.isTreeUri(target) && !documentAccess.hasWriteGrant(target)) {
+                        throw SecurityException("Android did not grant write access to this file")
+                    }
+                    resolver.openFileDescriptor(target, if (request.writing) "rw" else "r")?.use { pfd ->
+                        ExternalDocumentEntryGuard.verifyUserAuthorizedContentDescriptor(
+                            context = app,
+                            uri = target,
+                            pfd = pfd,
+                            allowOwnShareNote = allowOwnShare,
+                        )
+                    } ?: error("Android did not grant access to this file")
+                    if (request.writing) {
+                        target to true
                     } else {
-                        val targetWritable = target != writeCandidate &&
-                            documentAccess.hasWriteGrant(target) &&
-                            runCatching { resolver.openFileDescriptor(target, "rw")?.use { true } == true }.getOrDefault(false)
-                        target to targetWritable
+                        val writeCandidate = documentAccess.resolve(chosen, writing = true)
+                        val candidateWritable = documentAccess.hasWriteGrant(writeCandidate) &&
+                            runCatching {
+                                resolver.openFileDescriptor(writeCandidate, "rw")?.use { pfd ->
+                                    ExternalDocumentEntryGuard.verifyUserAuthorizedContentDescriptor(app, writeCandidate, pfd)
+                                    true
+                                } == true
+                            }.getOrDefault(false)
+                        if (candidateWritable) {
+                            writeCandidate to true
+                        } else {
+                            val targetWritable = target != writeCandidate &&
+                                documentAccess.hasWriteGrant(target) &&
+                                runCatching {
+                                    resolver.openFileDescriptor(target, "rw")?.use { pfd ->
+                                        ExternalDocumentEntryGuard.verifyUserAuthorizedContentDescriptor(
+                                            context = app,
+                                            uri = target,
+                                            pfd = pfd,
+                                            allowOwnShareNote = allowOwnShare,
+                                        )
+                                        true
+                                    } == true
+                                }.getOrDefault(false)
+                            target to targetWritable
+                        }
                     }
                 }
             }
@@ -354,7 +427,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val keepExistingNoteUri = !writeRestored &&
                     DocumentsContract.isTreeUri(resolved) &&
                     documentAccess.resolveReadAccess(resolved) is SafReadAccess.PendingTreeMembership &&
-                    runCatching { resolver.openFileDescriptor(Uri.parse(existingNoteUri), "r")?.use { true } == true }.getOrDefault(false)
+                    runCatching {
+                        val parsedExisting = Uri.parse(existingNoteUri)
+                        ExternalDocumentEntryGuard.requireUserAuthorizedContentReadPermission(app, parsedExisting, documentAccess, allowOwnShareNote = allowOwnShare)
+                        resolver.openFileDescriptor(parsedExisting, "r")?.use { pfd ->
+                            ExternalDocumentEntryGuard.verifyUserAuthorizedContentDescriptor(app, parsedExisting, pfd, allowOwnShareNote = allowOwnShare)
+                            true
+                        } == true
+                    }.getOrDefault(false)
                 val updatedNoteUri = if (keepExistingNoteUri) existingNoteUri else resolved.toString()
                 val currentActiveId = mutable.value.active.id
                 var barrierRejected = false
@@ -884,7 +964,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(!remember)delay(250)
             try {
                 val canonical=withContext(Dispatchers.IO){
-                    val raw = resolver.openInputStream(uri)?.use(::readBoundedThemeStream) ?: error("Cannot read theme")
+                    val raw = ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                        context = getApplication(),
+                        resolver = resolver,
+                        uri = uri,
+                        documentAccess = documentAccess,
+                        allowExportedNonSafPickerProvider = true,
+                        allowAppCacheFiles = true,
+                        deniedMessage = "Cannot read theme",
+                    ).use(::readBoundedThemeStream)
                     validateThemeRaw(raw, themeValidator)
                 }
                 val name = JSONObject(canonical).getString("name")
@@ -1157,9 +1245,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal val lastOutlineNoteId: String get() = readerProtocolAndOutline.lastOutlineNoteId
     fun outline(id: String, entries: JSONArray) = readerProtocolAndOutline.outline(id, entries)
     private fun resolveDisplayName(target: Uri): String? =
-        DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank)
-            ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
-            ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.lastPathSegment?.takeIf(String::isNotBlank)
+        if (target.scheme.equals("content", ignoreCase = true)) {
+            DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank)
+        } else {
+            target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
+                ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.lastPathSegment?.takeIf(String::isNotBlank)
+        }
 
     private var autosaveJob: Job? = null
     private val autosavePending = mutableSetOf<String>()
@@ -2132,8 +2223,21 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
-        documentAccess.persist(uri)
-        val target = documentAccess.resolve(uri)
+        val app = getApplication<Application>()
+        ExternalDocumentEntryGuard.validateUserAuthorizedDocumentUri(
+            context = app,
+            uri = uri,
+            allowOwnShareNote = true,
+            allowAppCacheFiles = true,
+        )
+        if (ExternalDocumentEntryGuard.canPersistUserAuthorizedDocumentGrant(app, uri)) {
+            documentAccess.persist(uri)
+        }
+        val target = if (uri.scheme.equals("content", ignoreCase = true) && uri.authority != "${app.packageName}.share") {
+            documentAccess.resolve(uri)
+        } else {
+            uri
+        }
         return loadResolvedNoteForOpen(target, uri, relative, externalIntentFlags = null, externalCaller = ExternalIntentCaller())
     }
     private fun loadNoteForOpen(
@@ -2162,7 +2266,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val verifyStream = if (externalIntentFlags != null) {
                 ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
             } else {
-                resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+                ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                    context = app,
+                    resolver = resolver,
+                    uri = target,
+                    documentAccess = documentAccess,
+                    allowOwnShareNote = true,
+                    allowAppCacheFiles = true,
+                )
             }
             verifyStream.use { }
             val keepExistingUri = existing.uri != null &&
@@ -2176,7 +2287,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val inputStream = if (externalIntentFlags != null) {
             ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
         } else {
-            resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+            ExternalDocumentEntryGuard.openVerifiedUserAuthorizedInputStream(
+                context = app,
+                resolver = resolver,
+                uri = target,
+                documentAccess = documentAccess,
+                allowOwnShareNote = true,
+                allowAppCacheFiles = true,
+            )
         }
         return inputStream.use { stream ->
             val name = resolveDisplayName(target)
@@ -2711,6 +2829,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         get() = if (::reloadCoordinatorCache.isInitialized) reloadCoordinatorCache else synchronized(this) {
             if (!::reloadCoordinatorCache.isInitialized) {
                 reloadCoordinatorCache = ReloadFromDiskCoordinator(
+                    context = getApplication(),
                     scope = viewModelScope,
                     resolver = resolver,
                     documentAccess = { documentAccess },
@@ -3510,7 +3629,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         get() = if (::readerAssetCoordinatorCache.isInitialized) readerAssetCoordinatorCache else synchronized(this) {
             if (!::readerAssetCoordinatorCache.isInitialized) {
                 readerAssetCoordinatorCache = ReaderAssetCoordinator(
-                    prefs = prefs, resolver = resolver, media = media,
+                    context = getApplication(),
+                    prefs = prefs, resolver = resolver, documentAccess = { documentAccess }, media = media,
                     readerFolderIndex = readerFolderIndex, readerCapabilities = readerCapabilities,
                     readState = { mutable.value }, sameDocumentUri = ::sameDocumentUri,
                     noteForAsset = ::noteForAsset, resolveLinkedAssetUri = ::resolveLinkedAssetUri,
@@ -3839,40 +3959,75 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } }
         closeTargetId?.let { close(it) }
     }
-    fun importDropped(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
+    internal fun discardDroppedImages(images: JSONArray) {
+        viewModelScope.launch(Dispatchers.IO) { media.discardImportedImages(images) }
+    }
+    fun importPickedImages(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
+        if (uris.isEmpty()) {
+            result(null)
+            return@launch
+        }
+        try {
+            val images = withContext(Dispatchers.IO) { media.importUris(uris, documentAccess) }
+            if (mutable.value.active.id != id) {
+                withContext(Dispatchers.IO) { media.discardImportedImages(images) }
+                mutable.value = mutable.value.copy(message = MediaStorage.SWITCHED_NOTE_IMPORT_MESSAGE)
+                result(null)
+                return@launch
+            }
+            markAssetsDirty(id)
+            result(images)
+        } catch (error: Exception) {
+            fail("Could not insert image: ${error.message}")
+            result(null)
+        }
+    }
+    fun importDropped(
+        uris: List<Uri>,
+        id: String,
+        dragReadPermissionGranted: Boolean = true,
+        result: (JSONArray?) -> Unit,
+    ) = viewModelScope.launch {
         if (uris.isEmpty()) {
             mutable.value = mutable.value.copy(message = MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE)
             result(null)
             return@launch
         }
         try {
-            val batch = withContext(Dispatchers.IO) { media.importDroppedUris(uris) }
+            val batch = withContext(Dispatchers.IO) { media.importDroppedUris(uris, dragReadPermissionGranted) }
             val images = batch.images
             if (images.length() == 0) {
-                mutable.value = mutable.value.copy(message = MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE)
+                val failureMessage = if (batch.missingGrantCount > 0 && batch.skippedCount == batch.missingGrantCount) {
+                    MediaStorage.UNGRANTED_DROP_IMAGE_MESSAGE
+                } else {
+                    MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE
+                }
+                mutable.value = mutable.value.copy(message = failureMessage)
+                result(null)
+                return@launch
+            }
+            if (mutable.value.active.id != id) {
+                withContext(Dispatchers.IO) { media.discardImportedImages(images) }
+                mutable.value = mutable.value.copy(message = MediaStorage.SWITCHED_NOTE_IMPORT_MESSAGE)
                 result(null)
                 return@launch
             }
             markAssetsDirty(id)
             if (batch.skippedCount > 0) {
-                val skippedMessage = if (batch.skippedCount == 1) {
+                val skippedMessage = if (batch.missingGrantCount > 0 && batch.skippedCount == batch.missingGrantCount) {
+                    if (batch.missingGrantCount == 1) {
+                        "Skipped 1 image without read permission."
+                    } else {
+                        "Skipped ${batch.missingGrantCount} images without read permission."
+                    }
+                } else if (batch.skippedCount == 1) {
                     "Skipped 1 unsupported file; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
                 } else {
                     "Skipped ${batch.skippedCount} unsupported files; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
                 }
                 mutable.value = mutable.value.copy(message = skippedMessage)
             }
-            if (mutable.value.active.id == id) {
-                result(images)
-            } else {
-                val insertion = (0 until images.length()).joinToString("\n\n") { i ->
-                    val image = images.getJSONObject(i)
-                    "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)"
-                }
-                val note = mutable.value.tabs.find { it.id == id }
-                if (note != null) edit(id, note.content + "\n\n" + insertion + "\n")
-                result(null)
-            }
+            result(images)
         } catch (error: Exception) {
             fail("Could not insert image: ${error.message}")
             result(null)
@@ -3908,5 +4063,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             job?.fail()
             throw error
         } finally { staging.deleteRecursively() }
+    }
+
+    internal fun handleExternalDrop(
+        uris: List<Uri>,
+        activeNoteId: String,
+        dragReadPermissionGranted: Boolean,
+        onComplete: () -> Unit = {},
+        result: (JSONArray?) -> Unit = {},
+    ): Job = importDropped(
+        uris = uris,
+        id = activeNoteId,
+        dragReadPermissionGranted = dragReadPermissionGranted,
+        result = result,
+    ).also { job ->
+        job.invokeOnCompletion { onComplete() }
     }
 }
