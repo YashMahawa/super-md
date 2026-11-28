@@ -649,6 +649,23 @@ class BackgroundTests(unittest.TestCase):
             QStandardPaths,
             "writableLocation",
             side_effect=lambda k, p=appdata_darwin: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
+        ), patch("instance.posix_ipc_exchange", return_value=(False, b"", True)), patch.object(
+            background_cli.sys, "platform", "darwin"
+        ), patch.object(
+            background_cli.subprocess, "Popen", side_effect=_capture_darwin_popen
+        ), redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError):
+                background_cli.main(["start"])
+            self.assertEqual(captured_darwin, {})
+            self.assertFalse((appdata_darwin / "qt-studio" / "agent-sessions").exists())
+            self.assertFalse((appdata_darwin / "background-service.log").exists())
+            self.assertEqual(background_cli.main(["approve"]), 0)
+            self.assertFalse((appdata_darwin / "qt-studio" / "agent-sessions").exists())
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_darwin: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
         ), patch("instance.posix_ipc_exchange", side_effect=[
             (False, b"", True),
             (True, b'{"ok":true,"running":true,"agentAccess":true}\n', True),
@@ -669,6 +686,20 @@ class BackgroundTests(unittest.TestCase):
             captured_linux["cmd"] = cmd
             captured_linux["kwargs"] = kwargs
             return _LiveProc()
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_linux: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
+        ), patch("instance.posix_ipc_exchange", return_value=(False, b"", True)), patch.object(
+            background_cli.sys, "platform", "linux"
+        ), patch.object(
+            background_cli.subprocess, "Popen", side_effect=_capture_linux_popen
+        ), redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError):
+                background_cli.main(["start"])
+            self.assertEqual(captured_linux, {})
+            self.assertEqual(background_cli.main(["approve"]), 0)
 
         with patch.object(
             QStandardPaths,
@@ -1023,6 +1054,14 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
                 self.broker.server.newConnection.connect(self.broker.accept)
                 self.broker.accept()
 
+        unapproved_res = self._call({"kind": "service", "action": "start", "appdata": str(self.temp_appdata), "spawnMarker": str(marker)})
+        self.assertEqual(unapproved_res["code"], 2, unapproved_res)
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.temp_appdata / "qt-studio" / "agent-sessions").exists())
+        approve_code, approve_payload = self._service("approve")
+        self.assertEqual((approve_code, approve_payload), (0, {"ok": True, "result": {"approved": True, "action": "approve"}}))
+        self.assertFalse((self.temp_appdata / "qt-studio" / "agent-sessions").exists())
+
         res = self._call({"kind": "service", "action": "start", "appdata": str(self.temp_appdata), "spawnMarker": str(marker)}, on_tick=bring_up_daemon, timeout=12.0)
         self.assertEqual(res["code"], 0, res)
         self.assertTrue(json.loads(res["stdout"])["result"]["running"])
@@ -1096,6 +1135,19 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
         )
 
         marker = unicode_appdata / "cold-spawn.json"
+        denied_code, denied_payload = self._service_for_appdata(unicode_appdata, "start", spawnMarker=str(marker))
+        self.assertEqual(denied_code, 2)
+        self.assertFalse(denied_payload["ok"])
+        self.assertEqual(denied_payload["error"]["type"], "ValueError")
+        self.assertFalse(marker.exists())
+        self.assertFalse((unicode_appdata / "qt-studio" / "agent-sessions").exists())
+        self.assertFalse((unicode_appdata / "background-service.log").exists())
+
+        approve_code, approve_payload = self._service_for_appdata(unicode_appdata, "approve")
+        self.assertEqual(approve_code, 0)
+        self.assertEqual(approve_payload, {"ok": True, "result": {"approved": True, "action": "approve"}})
+        self.assertFalse((unicode_appdata / "qt-studio" / "agent-sessions").exists())
+
         with patch.object(
             QStandardPaths,
             "writableLocation",
@@ -1811,6 +1863,11 @@ desktop_main._exit_process(rc)""",
             "SUPERMD_TEST_READY_MARKER": str(ready_marker),
         }
 
+        approve_code, approve_payload = self._service_for_appdata(occluded_appdata, "approve")
+        self.assertEqual(approve_code, 0)
+        self.assertEqual(approve_payload, {"ok": True, "result": {"approved": True, "action": "approve"}})
+        self.assertFalse((occluded_appdata / "qt-studio" / "agent-sessions").exists())
+
         code, start_payload = self._service_for_appdata(
             occluded_appdata,
             "start",
@@ -2148,6 +2205,9 @@ desktop_main._exit_process(rc)""",
                     self.session.background.set_forced(True)
                     self.assertTrue(fresh_replacement.claim_or_forward(None))
 
+        approve_code, _ = self._service_for_appdata(vanished_appdata, "approve")
+        self.assertEqual(approve_code, 0)
+
         res = self._call(
             {
                 "kind": "service",
@@ -2161,6 +2221,454 @@ desktop_main._exit_process(rc)""",
         self.assertEqual(res["code"], 0, res)
         self.assertTrue(json.loads(res["stdout"])["result"]["running"])
         self.assertEqual(len(spawned), 1)
+
+    def test_first_time_headless_startup_requires_prior_approval_without_creating_discovery_state_and_preserves_configured_setups(self):
+        self.broker.close()
+
+        # 1. Brand-new unconfigured profile (AppData directory not even created yet):
+        #    both `super-md agent service start` and direct `main.py --background` / `--agent-access`
+        #    fail before creating any live discovery state or legacy migration log markers.
+        fresh_appdata = (self.temp_appdata / "Unconfigured First-Time Headless Profile").resolve()
+        fresh_downloads = (self.temp_appdata / "Unconfigured Downloads").resolve()
+        fresh_downloads.mkdir(parents=True, exist_ok=True)
+        fresh_marker = fresh_appdata / "unexpected-spawn.json"
+
+        code, denied = self._service_for_appdata(fresh_appdata, "start", spawnMarker=str(fresh_marker))
+        self.assertEqual(code, 2)
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["error"]["type"], "ValueError")
+        self.assertIn("approve", denied["error"]["message"])
+        self.assertFalse(fresh_marker.exists())
+        self.assertFalse((fresh_appdata / "qt-studio" / "agent-sessions").exists())
+        self.assertFalse((fresh_appdata / "background-service.log").exists())
+
+        direct_probe = _HEADLESS_DAEMON_BOOTSTRAP.replace(
+            'sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]\n'
+            "desktop_main._exit_process(desktop_main.main())",
+            """import contextlib, io
+for flags in (
+    ["--background", "--agent-access", "--safe-graphics"],
+    ["--background", "--safe-graphics"],
+    ["--agent-access", "--safe-graphics"],
+):
+    err_buf = io.StringIO()
+    sys.argv = [str(Path(desktop_dir) / "main.py"), *flags]
+    with contextlib.redirect_stderr(err_buf):
+        rc = desktop_main.main()
+    assert rc == 2, f"Expected rc=2 for {flags}, got {rc}: {err_buf.getvalue()}"
+    assert "prior approval" in err_buf.getvalue(), err_buf.getvalue()
+    assert not (Path(appdata) / "qt-studio" / "agent-sessions").exists(), flags
+sys.exit(0)""",
+        )
+        direct_proc = subprocess.run(
+            [sys.executable, "-u", "-c", direct_probe],
+            env={
+                **os.environ,
+                "SUPERMD_TEST_APPDATA": str(fresh_appdata),
+                "SUPERMD_TEST_DOWNLOADS": str(fresh_downloads),
+                "SUPERMD_TEST_DESKTOP_DIR": str(DESKTOP_DIR),
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(direct_proc.returncode, 0, direct_proc.stderr or direct_proc.stdout)
+        self.assertFalse((fresh_appdata / "qt-studio" / "agent-sessions").exists())
+
+        # 2. Reader-only profile with existing preferences, malformed headlessServiceApproved values,
+        #    corrupt/malformed settings.json preservation, no-link validation (linked profile directory,
+        #    linked app-data parent, and linked settings.json), and I/O failure preservation before approval.
+        from core.headless_approval import approve_headless_startup, is_headless_startup_approved
+
+        def _try_create_link(link: Path, target: Path, *, target_is_directory: bool = False) -> bool:
+            try:
+                link.symlink_to(target, target_is_directory=target_is_directory)
+                return True
+            except (OSError, NotImplementedError) as exc:
+                if sys.platform == "win32" and target_is_directory and getattr(exc, "winerror", None) == 1314:
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return link.exists()
+                if sys.platform == "win32" and getattr(exc, "winerror", None) == 1314:
+                    return False
+                raise
+
+        # 2a. Linked profile directory (`<appdata>/qt-studio` -> external directory, both custom-named and `qt-studio`-named)
+        #     and linked app-data parent (`<linked_appdata>` -> `<real_appdata>` and dangling link):
+        #     approval must reject via both direct API and CLI without modifying target settings.json.
+        real_profile_custom = (self.temp_appdata / "External Profile Target").resolve()
+        real_profile_custom.mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            real_profile_custom / "settings.json",
+            {
+                "settings": {"theme": "sepia", "font": "Literata", "keepInBackground": False, "agentAccessEnabled": False},
+                "recent": ["external-note.smd"],
+                "pinned": ["external-note.smd"],
+            },
+        )
+        custom_target_bytes = (real_profile_custom / "settings.json").read_bytes()
+
+        real_appdata_target = (self.temp_appdata / "Real AppData Target").resolve()
+        (real_appdata_target / "qt-studio").mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            real_appdata_target / "qt-studio" / "settings.json",
+            {
+                "settings": {"theme": "dark", "font": "IBM Plex Sans", "keepInBackground": False, "agentAccessEnabled": False},
+                "recent": ["real-appdata-note.smd"],
+                "pinned": ["real-appdata-note.smd"],
+            },
+        )
+        real_appdata_bytes = (real_appdata_target / "qt-studio" / "settings.json").read_bytes()
+
+        linked_profile_appdata_a = (self.temp_appdata / "AppData With Linked Profile Custom").resolve()
+        linked_profile_appdata_a.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(
+            _try_create_link(linked_profile_appdata_a / "qt-studio", real_profile_custom, target_is_directory=True)
+        )
+        for candidate in (linked_profile_appdata_a, linked_profile_appdata_a / "qt-studio"):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(candidate)
+        link_prof_code_a, link_prof_err_a = self._service_for_appdata(linked_profile_appdata_a, "approve")
+        self.assertEqual(link_prof_code_a, 2, link_prof_err_a)
+        self.assertFalse(link_prof_err_a["ok"])
+        self.assertEqual(link_prof_err_a["error"]["type"], "ValueError")
+        self.assertEqual((real_profile_custom / "settings.json").read_bytes(), custom_target_bytes)
+        self.assertFalse((real_profile_custom / "qt-studio").exists())
+        self.assertFalse((real_profile_custom / "agent-sessions").exists())
+
+        linked_profile_appdata_b = (self.temp_appdata / "AppData With Linked Profile Named QtStudio").resolve()
+        linked_profile_appdata_b.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(
+            _try_create_link(
+                linked_profile_appdata_b / "qt-studio",
+                real_appdata_target / "qt-studio",
+                target_is_directory=True,
+            )
+        )
+        for candidate in (linked_profile_appdata_b, linked_profile_appdata_b / "qt-studio"):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(candidate)
+        link_prof_code_b, link_prof_err_b = self._service_for_appdata(linked_profile_appdata_b, "approve")
+        self.assertEqual(link_prof_code_b, 2, link_prof_err_b)
+        self.assertFalse(link_prof_err_b["ok"])
+        self.assertEqual((real_appdata_target / "qt-studio" / "settings.json").read_bytes(), real_appdata_bytes)
+
+        linked_appdata_parent = self.temp_appdata / "Linked AppData Parent"
+        self.assertTrue(_try_create_link(linked_appdata_parent, real_appdata_target, target_is_directory=True))
+        for candidate in (linked_appdata_parent, linked_appdata_parent / "qt-studio"):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(candidate)
+        link_parent_code, link_parent_err = self._service_for_appdata(linked_appdata_parent, "approve")
+        self.assertEqual(link_parent_code, 2, link_parent_err)
+        self.assertFalse(link_parent_err["ok"])
+        self.assertEqual(link_parent_err["error"]["type"], "ValueError")
+        self.assertEqual((real_appdata_target / "qt-studio" / "settings.json").read_bytes(), real_appdata_bytes)
+        self.assertFalse((real_appdata_target / "qt-studio" / "agent-sessions").exists())
+
+        missing_appdata_target = self.temp_appdata / "Missing Dangling AppData Target"
+        dangling_appdata_parent = self.temp_appdata / "Dangling Linked AppData Parent"
+        if _try_create_link(dangling_appdata_parent, missing_appdata_target, target_is_directory=True):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(dangling_appdata_parent)
+            dangling_code, dangling_err = self._service_for_appdata(dangling_appdata_parent, "approve")
+            self.assertEqual(dangling_code, 2, dangling_err)
+            self.assertFalse(dangling_err["ok"])
+            self.assertFalse(missing_appdata_target.exists())
+
+        linked_settings_appdata = (self.temp_appdata / "AppData With Linked Settings File").resolve()
+        (linked_settings_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+        outside_settings_file = (self.temp_appdata / "outside-settings.json").resolve()
+        outside_settings_file.write_bytes(custom_target_bytes)
+        if _try_create_link(
+            linked_settings_appdata / "qt-studio" / "settings.json",
+            outside_settings_file,
+            target_is_directory=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "settings.json must not be a symlink"):
+                approve_headless_startup(linked_settings_appdata)
+            link_settings_code, link_settings_err = self._service_for_appdata(linked_settings_appdata, "approve")
+            self.assertEqual(link_settings_code, 2, link_settings_err)
+            self.assertFalse(link_settings_err["ok"])
+            self.assertEqual(outside_settings_file.read_bytes(), custom_target_bytes)
+            self.assertTrue((linked_settings_appdata / "qt-studio" / "settings.json").is_symlink())
+
+        # 2b. Corrupt/malformed settings.json and I/O write failure leave existing settings.json unchanged.
+        reader_appdata = (self.temp_appdata / "Reader Profile — Explicit Approval Flow").resolve()
+        (reader_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+        pinned_note = str(reader_appdata / "pinned-lecture.smd")
+        for malformed_bytes in (
+            b'{"settings": {"theme": "dark", "broken": ',
+            b'[1, 2, 3]',
+            b'{"settings": ["not-a-dict"], "pinned": ["keep.smd"]}',
+        ):
+            (reader_appdata / "qt-studio" / "settings.json").write_bytes(malformed_bytes)
+            corrupt_start_code, corrupt_start_err = self._service_for_appdata(reader_appdata, "start")
+            self.assertEqual(corrupt_start_code, 2)
+            self.assertFalse(corrupt_start_err["ok"])
+            corrupt_approve_code, corrupt_approve_err = self._service_for_appdata(reader_appdata, "approve")
+            self.assertEqual(corrupt_approve_code, 2)
+            self.assertFalse(corrupt_approve_err["ok"])
+            self.assertEqual((reader_appdata / "qt-studio" / "settings.json").read_bytes(), malformed_bytes)
+            self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
+
+        for invalid_approval in (False, "true", 1, [True], {"approved": True}):
+            atomic_json(
+                reader_appdata / "qt-studio" / "settings.json",
+                {
+                    "settings": {
+                        "font": "Literata",
+                        "theme": "dark",
+                        "keepInBackground": False,
+                        "agentAccessEnabled": False,
+                        "headlessServiceApproved": invalid_approval,
+                    },
+                    "pinned": [pinned_note],
+                    "recent": [pinned_note],
+                },
+            )
+            bad_code, bad_payload = self._service_for_appdata(reader_appdata, "start")
+            self.assertEqual(bad_code, 2, invalid_approval)
+            self.assertFalse(bad_payload["ok"])
+            self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
+            self.assertFalse((reader_appdata / "background-service.log").exists())
+
+        atomic_json(
+            reader_appdata / "qt-studio" / "settings.json",
+            {
+                "settings": {
+                    "font": "Literata",
+                    "theme": "dark",
+                    "keepInBackground": False,
+                    "agentAccessEnabled": False,
+                    "headlessServiceApproved": False,
+                },
+                "pinned": [pinned_note],
+                "recent": [pinned_note],
+            },
+        )
+        valid_unapproved_bytes = (reader_appdata / "qt-studio" / "settings.json").read_bytes()
+        with patch("os.replace", side_effect=OSError("simulated atomic replace failure")):
+            with self.assertRaises(OSError):
+                approve_headless_startup(reader_appdata)
+        self.assertEqual((reader_appdata / "qt-studio" / "settings.json").read_bytes(), valid_unapproved_bytes)
+        self.assertEqual(list((reader_appdata / "qt-studio").glob("*.tmp")), [])
+        self.assertFalse(is_headless_startup_approved(reader_appdata))
+
+        # Subsequent GUI session on the unapproved profile still has keepInBackground=False & agentAccessEnabled=False.
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k: str(reader_appdata)
+            if k == QStandardPaths.StandardLocation.AppDataLocation
+            else self._orig_writable(k),
+        ):
+            unapproved_gui_session = Session(False)
+            try:
+                self.assertIs(unapproved_gui_session.settings["keepInBackground"], False)
+                self.assertIs(unapproved_gui_session.settings["agentAccessEnabled"], False)
+                self.assertIs(unapproved_gui_session.settings["headlessServiceApproved"], False)
+                self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
+            finally:
+                unapproved_gui_session.writes.shutdown(wait=True)
+
+        # 3. Explicit prior approval (`super-md agent service approve`) records approval without creating
+        #    any live discovery state, and subsequent `service start` launches cleanly and creates live state.
+        approve_code, approve_res = self._service_for_appdata(reader_appdata, "approve")
+        self.assertEqual(approve_code, 0)
+        self.assertEqual(approve_res, {"ok": True, "result": {"approved": True, "action": "approve"}})
+        self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
+        self.assertFalse((reader_appdata / "background-service.log").exists())
+        approved_on_disk = json.loads((reader_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
+        self.assertIs(approved_on_disk["settings"]["headlessServiceApproved"], True)
+        self.assertIs(approved_on_disk["settings"]["keepInBackground"], False)
+        self.assertIs(approved_on_disk["settings"]["agentAccessEnabled"], False)
+        self.assertEqual(approved_on_disk["settings"]["font"], "Literata")
+        self.assertEqual(approved_on_disk["pinned"], [pinned_note])
+
+        approved_spawn_marker = reader_appdata / "approved-daemon-spawn.json"
+        approved_session = Session(False, data=reader_appdata / "qt-studio")
+        approved_session.settings["python"] = sys.executable
+        approved_session.agent_bridge = agent_live.create_qt_bridge(approved_session, approved_session.data)
+        self.addCleanup(approved_session.agent_bridge.stop)
+        self.addCleanup(approved_session.writes.shutdown, wait=True)
+        approved_app = App()
+        approved_service = BackgroundService(approved_app, approved_session, ROOT, lambda _: None, force=False)
+        approved_session.background = approved_service
+        self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k: str(reader_appdata)
+            if k == QStandardPaths.StandardLocation.AppDataLocation
+            else self._orig_writable(k),
+        ):
+            approved_broker = InstanceBroker(self.qt_app, service_handler=approved_service.handle_service_request)
+            self.addCleanup(approved_broker.close)
+
+            def on_approved_tick():
+                if approved_spawn_marker.is_file() and not approved_broker.server.isListening():
+                    approved_service._cli_started_agent_access = True
+                    approved_session.settings["agentAccessEnabled"] = True
+                    approved_session.agent_bridge.start()
+                    approved_service.set_forced(True)
+                    self.assertTrue(approved_broker.claim_or_forward(None))
+
+            approved_start_raw = self._call(
+                {
+                    "kind": "service",
+                    "action": "start",
+                    "appdata": str(reader_appdata),
+                    "spawnMarker": str(approved_spawn_marker),
+                },
+                on_tick=on_approved_tick,
+                timeout=10.0,
+            )
+            self.assertEqual(approved_start_raw["code"], 0, approved_start_raw)
+            start_res = json.loads(approved_start_raw["stdout"])
+            sessions_dir = Path(start_res["result"]["sessionsDirectory"])
+            discovery_files = list(sessions_dir.glob("*.json"))
+            self.assertEqual(len(discovery_files), 1)
+
+            stop_code, stop_res = self._service_for_appdata(reader_appdata, "stop")
+            self.assertEqual(stop_code, 0)
+            self.assertTrue(stop_res["result"]["quitRequested"])
+            self.assertEqual(list(sessions_dir.glob("*.json")), [])
+            approved_broker.close()
+
+        # Normal GUI session after stopping the approved CLI service keeps tray residency and GUI agent access off,
+        # while preserving headlessServiceApproved across GUI preference saves.
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k: str(reader_appdata)
+            if k == QStandardPaths.StandardLocation.AppDataLocation
+            else self._orig_writable(k),
+        ), patch.object(python_runtime, "discover", return_value=[]), patch.object(
+            QuietStudio, "_restore_update", lambda _self: None
+        ):
+            gui_after = Session(False)
+            try:
+                self.assertIs(gui_after.settings["keepInBackground"], False)
+                self.assertIs(gui_after.settings["agentAccessEnabled"], False)
+                self.assertIs(gui_after.settings["headlessServiceApproved"], True)
+                gui_studio = QuietStudio(False, gui_after)
+                try:
+                    gui_after.settings["headlessServiceApproved"] = False
+                    gui_studio.setting("theme", '"light"')
+                    gui_after.settings["headlessServiceApproved"] = False
+                    gui_after.settings["agentAccessEnabled"] = True
+                    gui_after.background = type("_CliBg", (), {"_cli_started_agent_access": True})()
+                    retired_settings_bytes, _, _, _ = gui_after._build_retired_persistence_payloads()
+                    retired_saved = json.loads(retired_settings_bytes.decode("utf-8"))["settings"]
+                    self.assertIs(retired_saved["headlessServiceApproved"], True)
+                    self.assertIs(retired_saved["agentAccessEnabled"], False)
+                    gui_after.background = None
+                    gui_after.settings["agentAccessEnabled"] = False
+                finally:
+                    gui_studio.stop()
+                    gui_studio.pool.shutdown(wait=True, cancel_futures=True)
+            finally:
+                gui_after.writes.shutdown(wait=True)
+        saved_after_gui = json.loads((reader_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_after_gui["settings"]["theme"], "light")
+        self.assertIs(saved_after_gui["settings"]["headlessServiceApproved"], True)
+        self.assertIs(saved_after_gui["settings"]["keepInBackground"], False)
+
+        # 4. Legitimate configured unattended setups (`keepInBackground: True` or `agentAccessEnabled: True`
+        #    in `settings.json`) start unattended without requiring a separate `service approve` step.
+        for setting_key in ("keepInBackground", "agentAccessEnabled"):
+            configured_appdata = (self.temp_appdata / f"Configured Unattended — {setting_key}").resolve()
+            (configured_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+            atomic_json(
+                configured_appdata / "qt-studio" / "settings.json",
+                {
+                    "settings": {
+                        "keepInBackground": setting_key == "keepInBackground",
+                        "agentAccessEnabled": setting_key == "agentAccessEnabled",
+                    },
+                    "recent": [],
+                    "pinned": [],
+                },
+            )
+            cfg_marker = configured_appdata / "configured-spawn.json"
+            with patch.object(
+                QStandardPaths,
+                "writableLocation",
+                side_effect=lambda k, p=configured_appdata: str(p)
+                if k == QStandardPaths.StandardLocation.AppDataLocation
+                else self._orig_writable(k),
+            ):
+                cfg_broker = InstanceBroker(self.qt_app, service_handler=self.session.background.handle_service_request)
+                self.addCleanup(cfg_broker.close)
+
+                def on_cfg_tick(marker_path=cfg_marker, broker_obj=cfg_broker):
+                    if marker_path.is_file() and not broker_obj.server.isListening():
+                        self.session.settings["agentAccessEnabled"] = True
+                        self.session.agent_bridge.start()
+                        self.session.background.set_forced(True)
+                        self.assertTrue(broker_obj.claim_or_forward(None))
+
+                cfg_res = self._call(
+                    {
+                        "kind": "service",
+                        "action": "start",
+                        "appdata": str(configured_appdata),
+                        "spawnMarker": str(cfg_marker),
+                    },
+                    on_tick=on_cfg_tick,
+                    timeout=10.0,
+                )
+                self.assertEqual(cfg_res["code"], 0, f"{setting_key}: {cfg_res}")
+                self.assertTrue(json.loads(cfg_res["stdout"])["result"]["running"], setting_key)
+                cfg_broker.close()
+
+        # 5. Pre-#41 legacy profile migration coverage: legacy markers (`cloudAgentEnabled`, `background`,
+        #    `backgroundEnabled`, `agent-cloud.json`, `agent-sessions/`, and pre-existing `background-service.log`
+        #    without `fresh_service_log=True`) continue starting and migrating `keepInBackground: True` cleanly,
+        #    while fresh service logs do not falsely migrate and failed approval leaves legacy settings unchanged.
+        for legacy_key in ("cloudAgentEnabled", "background", "backgroundEnabled"):
+            legacy_key_appdata = (self.temp_appdata / f"Legacy Marker — {legacy_key}").resolve()
+            (legacy_key_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+            atomic_json(
+                legacy_key_appdata / "qt-studio" / "settings.json",
+                {
+                    "settings": {"font": "IBM Plex Serif", legacy_key: True},
+                    "recent": ["legacy-note.smd"],
+                    "pinned": ["legacy-note.smd"],
+                },
+            )
+            self.assertTrue(is_headless_startup_approved(legacy_key_appdata, fresh_service_log=False), legacy_key)
+            legacy_before_bytes = (legacy_key_appdata / "qt-studio" / "settings.json").read_bytes()
+            linked_legacy = self.temp_appdata / f"Linked Legacy — {legacy_key}"
+            self.assertTrue(_try_create_link(linked_legacy, legacy_key_appdata, target_is_directory=True))
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(linked_legacy)
+            self.assertEqual((legacy_key_appdata / "qt-studio" / "settings.json").read_bytes(), legacy_before_bytes)
+
+            leg_code, leg_res = self._service_for_appdata(legacy_key_appdata, "approve")
+            self.assertEqual(leg_code, 0, leg_res)
+            migrated_legacy = json.loads((legacy_key_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
+            self.assertIs(migrated_legacy["settings"]["keepInBackground"], True)
+            self.assertIs(migrated_legacy["settings"]["headlessServiceApproved"], True)
+            self.assertEqual(migrated_legacy["settings"]["font"], "IBM Plex Serif")
+            self.assertEqual(migrated_legacy["pinned"], ["legacy-note.smd"])
+
+        legacy_log_only = (self.temp_appdata / "Legacy Log Only Profile").resolve()
+        legacy_log_only.mkdir(parents=True, exist_ok=True)
+        (legacy_log_only / "background-service.log").write_text("pre-#41 daemon log\n", encoding="utf-8")
+        self.assertTrue(is_headless_startup_approved(legacy_log_only, fresh_service_log=False))
+        self.assertFalse(is_headless_startup_approved(legacy_log_only, fresh_service_log=True))
+        approve_headless_startup(legacy_log_only)
+        migrated_log_only = json.loads((legacy_log_only / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
+        self.assertIs(migrated_log_only["settings"]["keepInBackground"], True)
+        self.assertIs(migrated_log_only["settings"]["headlessServiceApproved"], True)
 
 
 if __name__ == "__main__":

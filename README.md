@@ -311,9 +311,10 @@ super-md agent --root ./course preview notes.smd preview.png --width 1200 --heig
 
 `preview` uses the real offline Super MD reader, supports `--heading "Section title"` and `--dark`, and creates a new PNG. It never changes the note, executes Python, or fetches remote images.
 
-Start the background service and use the same tools as MCP:
+Start the background service and use the same tools as MCP (on an unconfigured profile without Settings opt-in, approve headless startup once first):
 
 ```sh
+super-md agent service approve
 super-md agent service start
 super-md agent service status
 super-md agent --root ./course call document_read --arguments-json '{"path":"notes.smd","limit":3000}'
