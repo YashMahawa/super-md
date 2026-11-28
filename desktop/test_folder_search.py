@@ -1107,8 +1107,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertIsNotNone(window, str(component.errors()))
         self.studio.host_window = window
         try:
-            window.show()
-            window.requestActivate()
+            window.show(); window.requestActivate()
             QTest.qWaitForWindowExposed(window, 300)
             QTest.qWait(15)
             dialog = window.findChild(QObject, "folderSearchDialog")
@@ -1154,8 +1153,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertEqual(dialog.property("debounceInterval"), 120)
             self.studio.openFolderSearch()
             self.assertTrue(_wait_until(lambda: bool(dialog.property("opened"))))
-            window.requestActivate()
-            search_input.forceActiveFocus()
+            window.requestActivate(); search_input.forceActiveFocus()
             self.assertTrue(_wait_until(lambda: bool(search_input.property("activeFocus"))))
 
             # 1. Rapid keystroke burst coalesces into a single workspace scan for the settled query.
@@ -1205,10 +1203,8 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 self.assertTrue(prev_cancel.is_set(), "Previous cancel_event must be set immediately on edit")
                 self.assertGreater(self.studio._folder_search_generation, prev_generation)
                 self.assertTrue(bool(debounce_timer.property("running")) and self.studio.folderSearchState["pending"])
-                self.assertEqual(
-                    (self.studio.folderSearchState["matches"], self.studio.folderSearchState["scannedFiles"], self.studio.folderSearchState["truncated"]),
-                    ([], 0, False),
-                )
+                state = self.studio.folderSearchState
+                self.assertEqual((state["matches"], state["scannedFiles"], state["truncated"]), ([], 0, False))
                 self.assertTrue(cancel_observed.wait(timeout=1.0))
 
                 # Late batch signal from the superseded generation on the GUI thread is dropped.
@@ -1244,13 +1240,10 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                     self.studio.post("sync-ack", "document_flushed", json.dumps({
                         "operation": self.studio.flush_operation, "id": active_tab["id"], "content": active_tab["content"],
                     }))
-                window.requestActivate()
-                search_input.forceActiveFocus()
+                window.requestActivate(); search_input.forceActiveFocus()
                 self.assertTrue(_wait_until(lambda: bool(search_input.property("activeFocus"))))
 
             open_and_ack_sync()
-
-            # Settle initial query "AlphaHit" -> matches first.md.
             self._type_keys(window, "AlphaHit")
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
             self.assertEqual(self.studio.folderSearchState["matches"][0]["name"], "first.md")
@@ -1271,9 +1264,17 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertTrue(bool(dialog.property("visible")) and self.studio.folderSearchState["open"])
             self.assertIsNone(self.studio.flush_operation, "Enter while pending must not open stale match")
 
+            # External updateFolderSearch while pending stops debounce and syncs controls without stale timer overwrite.
+            self.studio.updateFolderSearch("AlphaHit", False, False)
+            self.app.processEvents()
+            self.assertFalse(bool(debounce_timer.property("running")) or bool(dialog.property("queryPending")))
+            self.assertEqual(search_input.property("text"), "AlphaHit")
+            self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
+
             # Clear input while pending: stops debounce immediately, launches no scan, resets state cleanly.
             dialog.setProperty("debounceInterval", 160)
             with patch("studio.stream_text_search", wraps=stream_text_search) as spy_clear_pending:
+                QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
                 self._type_keys(window, "z")
                 self.app.processEvents()
                 self.assertTrue(bool(debounce_timer.property("running")))
@@ -1311,8 +1312,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 self.app.processEvents()
                 self.assertTrue(bool(debounce_timer.property("running")))
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, diag_pt)
-                self.assertTrue(bool(search_input.property("activeFocus")))
-                self.assertFalse(bool(debounce_timer.property("running")))
+                self.assertTrue(bool(search_input.property("activeFocus")) and not bool(debounce_timer.property("running")))
                 self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
                 QTest.qWait(240)
                 self.assertEqual(toggle_queries, [("diagramhit", False, True)])
@@ -1363,15 +1363,8 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "second.md"))
             open_and_ack_sync()
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
-            self.assertTrue(
-                _wait_until(
-                    lambda: (r := self._find_named_item(window, "folderSearchRow_0")) is not None
-                    and r.width() > 0
-                    and r.height() > 0
-                )
-            )
+            self.assertTrue(_wait_until(lambda: (r := self._find_named_item(window, "folderSearchRow_0")) is not None and r.width() > 0 and r.height() > 0))
             row0 = self._find_named_item(window, "folderSearchRow_0")
-            self.assertIsNotNone(row0)
             center = row0.mapToScene(QPointF(row0.width() / 2.0, row0.height() / 2.0)).toPoint()
             QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, center)
             self.assertTrue(_wait_until(lambda: not bool(dialog.property("visible"))))

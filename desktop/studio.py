@@ -2121,24 +2121,27 @@ class Studio(QObject):
                 self.flush_timer.stop()
         return self._folder_search_generation
 
-    def _reset_folder_search_query(
+    def _apply_folder_search_query(
         self,
-        query: object = None,
+        query: str,
         case_sensitive: bool = False,
         include_diagrams: bool = False,
         *,
-        update_options: bool = False,
         pending: bool = False,
-    ) -> int:
-        if update_options:
-            self._folder_search_query = query if isinstance(query, str) else ""
-            self._folder_search_case_sensitive = bool(case_sensitive)
-            self._folder_search_include_diagrams = bool(include_diagrams)
-            if not self._folder_search_open:
-                self._folder_search_open = True
-        generation = self._cancel_folder_search(close=False)
-        self._folder_search_pending = bool(pending and self._folder_search_query.strip())
-        return generation
+    ) -> None:
+        if self.retired:
+            return
+        self._folder_search_query = query if isinstance(query, str) else ""
+        self._folder_search_case_sensitive = bool(case_sensitive)
+        self._folder_search_include_diagrams = bool(include_diagrams)
+        if not self._folder_search_open:
+            self._folder_search_open = True
+        if pending and self._folder_search_query.strip():
+            self._cancel_folder_search(close=False)
+            self._folder_search_pending = True
+            self.workspaceSearchChanged.emit()
+            return
+        self._start_folder_search()
 
     @Slot()
     def openFolderSearch(self):
@@ -2157,30 +2160,16 @@ class Studio(QObject):
 
     @Slot(str, bool, bool)
     def prepareFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
-        if self.retired:
-            return
-        self._reset_folder_search_query(query, case_sensitive, include_diagrams, update_options=True, pending=True)
-        self.workspaceSearchChanged.emit()
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=True)
 
     @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
-        if self.retired:
-            return
-        self._start_folder_search(query, case_sensitive, include_diagrams, update_options=True)
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=False)
 
-    def _start_folder_search(
-        self,
-        query: object = None,
-        case_sensitive: bool = False,
-        include_diagrams: bool = False,
-        *,
-        update_options: bool = False,
-    ):
-        generation = self._reset_folder_search_query(
-            query, case_sensitive, include_diagrams, update_options=update_options, pending=False
-        )
-        active_query = self._folder_search_query
-        if not active_query or not active_query.strip():
+    def _start_folder_search(self):
+        generation = self._cancel_folder_search(close=False)
+        query = self._folder_search_query
+        if not query or not query.strip():
             self.workspaceSearchChanged.emit()
             return
         cancel_event = threading.Event()
@@ -2190,7 +2179,7 @@ class Studio(QObject):
         self.workspaceSearchChanged.emit()
 
         tabs_snap, recent_snap, folder_path, active_id = self._search_snapshots()
-        match_case = self._folder_search_case_sensitive
+        case_sensitive = self._folder_search_case_sensitive
         exclude_diagrams = not self._folder_search_include_diagrams
 
         def emit_batch(batch: list[dict], scanned: int, truncated: bool, done: bool):
@@ -2200,12 +2189,12 @@ class Studio(QObject):
 
         def worker():
             stream_text_search(
-                active_query,
+                query,
                 tabs_snap,
                 recent_snap,
                 folder_path,
                 active_id=active_id,
-                case_sensitive=match_case,
+                case_sensitive=case_sensitive,
                 exclude_diagrams=exclude_diagrams,
                 cancel_event=cancel_event,
                 on_batch=emit_batch,

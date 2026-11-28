@@ -100,12 +100,13 @@ AppDialog {
     }
 
     onStateDataChanged: {
-        if (!syncingControls && !searchDebounce.running && !(stateData && stateData.pending)) {
+        if (!syncingControls && !(stateData && stateData.pending)) {
             const backendQuery = (stateData && stateData.query) || ""
             const backendCs = !!(stateData && stateData.caseSensitive)
             const backendDiag = !!(stateData && stateData.includeDiagrams)
             if (searchField.text !== backendQuery || matchCaseButton.checked !== backendCs || includeDiagramsButton.checked !== backendDiag) {
                 syncingControls = true
+                searchDebounce.stop()
                 if (searchField.text !== backendQuery) searchField.text = backendQuery
                 matchCaseButton.checked = backendCs
                 includeDiagramsButton.checked = backendDiag
