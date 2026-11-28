@@ -7,6 +7,7 @@ import { loadReadingLocation, saveReadingLocation, type ReadingLocation } from "
 import { exportRenderedViews } from "./renderedOutputs";
 import { markScrollInput, scrollInputVersion } from "./scrollAnchor";
 import { applySharedAnchor, captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, hasExternalAnchorScroll, isProgrammaticAnchorScroll, primeEditorAnchor, revealEditorOffset, snapshotAnchorScroll, type AnchorScrollSnapshot, type AnchorViewMode, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
+import type { SplitScrollSyncController } from "./splitScrollSync";
 
 export interface NoteView { editor?: PortableEditorSession; history?: NoteHistory; top?: number; anchor?: SharedSourceAnchor; rendered?: ReturnType<typeof exportRenderedViews> }
 export interface PendingHeadingNavigation { heading: string; token: string }
@@ -46,6 +47,7 @@ export interface SharedSourceAnchorRefs {
   restoringSplit: RefObject<boolean>;
   restoringSplitSeq: RefObject<number>;
   splitScrollTops: RefObject<{ editor: number | null; preview: number | null }>;
+  splitSync?: RefObject<SplitScrollSyncController | null>;
   consumedHeadingToken: RefObject<string | null>;
   layoutNavigatedHeadingToken: RefObject<string | null>;
   suppressedRestoreToken: RefObject<string | null>;
@@ -229,7 +231,20 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
     splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed,
   } = refs;
 
+  const splitSync = refs.splitSync;
+
   useEffect(() => {
+    const controller = splitSync?.current;
+    if (controller) {
+      const inputEvents = ["wheel", "pointerdown", "touchstart", "keydown", "focusin"] as const;
+      inputEvents.forEach(name => document.addEventListener(name, controller.handleInput, { capture: true, passive: true }));
+      document.addEventListener("scroll", controller.handleScroll, { capture: true, passive: true });
+      return () => {
+        inputEvents.forEach(name => document.removeEventListener(name, controller.handleInput, true));
+        document.removeEventListener("scroll", controller.handleScroll, true);
+        controller.dispose();
+      };
+    }
     const trackInput = (event: Event) => {
       if (reference.current?.mode !== "split") return;
       const pane = detectSplitPaneFromTarget(event.target);
@@ -303,9 +318,11 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
           editor: document.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
           preview: snapshot?.top ?? null,
         };
+        splitSync?.current?.primeScrollTops(splitScrollTops.current);
         requestAnimationFrame(() => { if (restoringSplitSeq.current === seq) restoringSplit.current = false; });
       } else {
         splitScrollTops.current = { editor: null, preview: null };
+        splitSync?.current?.primeScrollTops(splitScrollTops.current);
         execute();
       }
     };
@@ -324,6 +341,7 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
             restoringSplit.current = false;
             splitScrollTops.current.preview = target.scrollTop;
             splitPane.current = "preview";
+            splitSync?.current?.notePaneInteraction("preview");
           }
         },
         runApplyPass: runGuarded,
@@ -353,6 +371,8 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
       primeEditorAnchor(state.id, null);
       const host = document.querySelector<HTMLElement>(".android-reading");
       if (host) host.scrollTop = 0;
+      splitScrollTops.current = state.mode === "split" ? { editor: 0, preview: 0 } : { editor: null, preview: null };
+      splitSync?.current?.primeScrollTops(splitScrollTops.current);
       return;
     }
     if (state.mode === "editor" || state.mode === "split") {

@@ -626,8 +626,8 @@ export default function Editor({ sessionId = "default", documentPath = null, val
     describeSelection(mountedView.state);
     const pending = consumePendingEditorAnchor(sessionId);
     if (pending) applyAnchorToEditorView(mountedView, pending);
-    else if (incoming) mountedView.scrollDOM.scrollTop = Math.max(0, incoming.top);
-    else if (cached) mountedView.scrollDOM.scrollTop = cached.top;
+    else if (incoming) { markProgrammaticAnchorScroll(mountedView.scrollDOM); mountedView.scrollDOM.scrollTop = Math.max(0, incoming.top); }
+    else if (cached) { markProgrammaticAnchorScroll(mountedView.scrollDOM); mountedView.scrollDOM.scrollTop = cached.top; }
     if (!pending && !cached && !incoming && initialTypewriter) mountedView.dispatch({ effects: centerCursorEffect(mountedView.state) });
     if (mountedView.state.doc.length > PROOFREADING_MAX_CHARS) setProofRange(sourceProofreadingRange(mountedView));
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;

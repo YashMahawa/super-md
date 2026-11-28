@@ -61,6 +61,7 @@ import ExportProgressIndicator from './components/ExportProgressIndicator';
 import {DocumentAppearance} from './documentAppearance';
 import {applyCustomStyle,type CustomStyle} from './customTheme';
 import {isTypewriterShortcutEvent,setTypewriterScroll} from './typewriterScroll';
+import {createSplitScrollSyncController,resolveSplitRootPaneScroller,type SplitScrollSyncController} from './splitScrollSync';
 const DocumentPreview = memo(MarkdownPreview);
 const LiveDocument = memo(LiveEditor);
 const SourceEditor = memo(Editor);
@@ -244,6 +245,15 @@ export function Reader() {
   const restoringSplit=useRef(false);
   const restoringSplitSeq=useRef(0);
   const splitScrollTops=useRef<{editor:number|null;preview:number|null}>({editor:null,preview:null});
+  const splitSyncRef=useRef<SplitScrollSyncController|null>(null);
+  if(!splitSyncRef.current){
+    splitSyncRef.current=createSplitScrollSyncController({
+      getState:()=>reference.current?{id:reference.current.id,mode:reference.current.mode}:null,
+      isRestoring:()=>restoringSplit.current,
+      isZooming:()=>zoomFrame.current!==0||Date.now()-zoomGestureAt.current<320,
+      onPaneSelected:pane=>{splitPane.current=pane;},
+    });
+  }
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
@@ -251,7 +261,7 @@ export function Reader() {
     const nativeScroll=new FrameScrollQueue((scroller,dx,dy)=>{
       applyChainedNativeScroll(scroller,dx,dy,{
         centerLock:Boolean(reference.current?.centerLock),
-        onReadingScroll:(reading,attemptedDy)=>{cancelHeadingNavigation(reading);rememberWindowedScrollSource(reading,attemptedDy);if(Math.abs(attemptedDy)>2)requestChrome('hide');},
+        onReadingScroll:(reading,attemptedDy)=>{if(reference.current?.mode==='split')splitSyncRef.current?.notePaneInteraction('preview');cancelHeadingNavigation(reading);rememberWindowedScrollSource(reading,attemptedDy);if(Math.abs(attemptedDy)>2)requestChrome('hide');},
       });
     });
     window.supermdSavePosition=()=>savePosition.current();
@@ -302,7 +312,7 @@ export function Reader() {
         const trimmed=rawPending.trim();
         next.pendingHeading=trimmed?{heading:trimmed,token:`legacy:${next.id}:${++legacyHeadingSeq.current}:${trimmed}`}:null;
       }
-      if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen)){nativeScroll.clear();gapSelection.current?.end();}
+      if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen)){nativeScroll.clear();gapSelection.current?.end();splitSyncRef.current?.cancelPending();}
       const draft=edits.current!.unacknowledged(next.id);
       if(draft!==undefined&&next.content!==draft&&!contentUnchanged){
         next.content=draft;
@@ -479,11 +489,8 @@ export function Reader() {
       markScrollInput();
       const noteSplitWheelTarget=(node:Element)=>{
         if(reference.current?.mode!=="split")return;
-        const pane=detectSplitPaneFromTarget(node);
-        if(pane){
-          clearProgrammaticAnchorScroll(pane==="editor"?document.querySelector(".cm-scroller"):document.querySelector(".android-reading"));
-          splitPane.current=pane;
-        }
+        const rootPane=resolveSplitRootPaneScroller(node);
+        if(rootPane)splitSyncRef.current?.notePaneInteraction(rootPane.pane);
       };
       const target=document.elementFromPoint(point.x,point.y),canvas=target?.closest(".interactive-chart svg,.image-viewer-canvas");
       if(target?.closest(NON_VIEWER_OVERLAY_SELECTOR)){if(!held){const origin=resolveNativeWheelScrollOrigin(target);if(origin)nativeScroll.scroll(origin,dx,dy);}return;}
@@ -713,7 +720,7 @@ export function Reader() {
     state,
     reference,
     zoomReference,
-    refs: { noteViews, savePosition, modeAnchor, splitPane, restoringSplit, restoringSplitSeq, splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed },
+    refs: { noteViews, savePosition, modeAnchor, splitPane, restoringSplit, restoringSplitSeq, splitScrollTops, splitSync: splitSyncRef, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed },
   });
   useLayoutEffect(() => {
     const find=(event:KeyboardEvent)=>{
