@@ -167,8 +167,7 @@ class AgentAccessState(context: Context) {
                 .take(16).joinToString("") { "%02x".format(it) }
         }
 
-        private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
-            .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+        private fun sha256(value: String): String = agentContentRevision(value)
 
         private fun randomToken(): String {
             val bytes = ByteArray(32).also(SecureRandom()::nextBytes)
