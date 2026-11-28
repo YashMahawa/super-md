@@ -1,5 +1,5 @@
 """Exercise the real offline reader through the headless CLI, not an HTML clone."""
-import hashlib,json,os,subprocess,sys,tempfile,unittest
+import json,os,subprocess,sys,tempfile,unittest
 from pathlib import Path
 class PreviewTests(unittest.TestCase):
     def test_real_reader_preview_preserves_source_and_renders_vector_pixels(self):
@@ -31,3 +31,29 @@ class PreviewTests(unittest.TestCase):
             from PySide6.QtGui import QImage
             image=QImage(str(output))
             self.assertEqual((image.width(),image.height()),(800,600))
+
+    def test_offline_view_wrappers_preserve_real_png_artifacts_and_structured_errors(self):
+        root=Path(__file__).resolve().parent.parent
+        if not (root/'dist/qt-reader.html').is_file():self.skipTest('Build the offline reader first')
+        sys.path.insert(0,str(root/'desktop'))
+        from agent_documents import DocumentStore
+        import offline_view
+        from PySide6.QtGui import QImage
+        previous=os.environ.get('QTWEBENGINE_DISABLE_SANDBOX')
+        os.environ['QTWEBENGINE_DISABLE_SANDBOX']='1'
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                folder=Path(directory);note=folder/'offline.md'
+                note.write_text('# Real offline wrapper\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 150"><rect x="10" y="10" width="280" height="130" fill="#1688dd"/></svg>\n```\n',encoding='utf-8')
+                store=DocumentStore([directory])
+                png=offline_view.render_offline(store,str(note),width=720)
+                image=QImage.fromData(png,'PNG')
+                self.assertEqual(image.width(),720)
+                live_png=offline_view.render_live_snapshot('# Live snapshot\n\nParagraph text.\n',{},str(note),width=640)
+                live_image=QImage.fromData(live_png,'PNG')
+                self.assertEqual(live_image.width(),640)
+                with self.assertRaisesRegex(ValueError,'Background preview failed: .*Missing heading'):
+                    offline_view.render_live_snapshot('# Live snapshot\n',{},str(note),width=640,heading='Missing heading')
+        finally:
+            if previous is None:os.environ.pop('QTWEBENGINE_DISABLE_SANDBOX',None)
+            else:os.environ['QTWEBENGINE_DISABLE_SANDBOX']=previous

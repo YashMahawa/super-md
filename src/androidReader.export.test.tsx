@@ -107,7 +107,10 @@ vi.mock("./components/MediaTools", () => ({ default: () => null }));
 vi.mock("./components/ImageViewer", () => ({ default: () => null }));
 vi.mock("./components/MathRepairPanel", () => ({ default: () => null }));
 vi.mock("./components/ThemeGuideDialog", () => ({ default: () => null }));
-vi.mock("./components/ReadingSearch", () => ({ default: () => null }));
+vi.mock("./components/ReadingSearch", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./components/ReadingSearch")>();
+  return { ...actual, default: () => null };
+});
 
 import { computeAgentDocumentRequest } from "./androidReader";
 
@@ -659,6 +662,100 @@ it("reports export_failed when the active tab switches during a pre-export editP
   }
 });
 
+it("forwards localAssets with mergeLocalAssets in supermdPortable and aborts on target mismatch or mid-prepare edits", async () => {
+  await mountReader();
+  native.mockImplementation(async (command: string) => {
+    if (command === "document_sync") return { accepted: true, revision: 0 };
+    return null;
+  });
+
+  await act(async () => {
+    window.supermdLoad!({
+      id: "portable-tab",
+      content: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](diagrams/new.png)\n",
+      path: "content://vault/Lecture.smd",
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      localAssets: ["assets/fig-1.png"],
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  // 1. Target note mismatch (e.g. Save As initiated on another tab) fails immediately before prepareFmd.
+  native.mockClear();
+  prepareFmdMock.mockReset();
+  await act(async () => {
+    await (window.supermdPortable!(false, { id: "other-tab", localAssets: ["assets/fig-1.png"], omitLocalAssets: true }) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).not.toHaveBeenCalled();
+  expect(native).toHaveBeenCalledWith("export_failed", { error: "Error: The export note changed" });
+  expect(native).not.toHaveBeenCalledWith("export_fmd_native", expect.anything());
+
+  // 2. Mixed save forwards localAssets + omitLocalAssets + consent hooks and sets mergeLocalAssets: true.
+  native.mockClear();
+  prepareFmdMock.mockReset().mockResolvedValue({
+    content: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](<assets/image-added.png>)\n",
+    assets: { "assets/image-added.png": "data:image/png;base64,aGVsbG8=" },
+  });
+  await act(async () => {
+    await (window.supermdPortable!(true, {
+      id: "portable-tab",
+      localAssets: ["assets/fig-1.png"],
+      omitLocalAssets: true,
+    }) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).toHaveBeenCalledWith(
+    "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](diagrams/new.png)\n",
+    "content://vault/Lecture.smd",
+    {
+      noteId: "portable-tab",
+      trustedImageHosts: [],
+      approvedImageUrls: [],
+      localAssets: ["assets/fig-1.png"],
+      omitLocalAssets: true,
+    },
+  );
+  expect(native).toHaveBeenCalledWith("export_fmd_native", {
+    id: "portable-tab",
+    content: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](<assets/image-added.png>)\n",
+    assets: { "assets/image-added.png": "data:image/png;base64,aGVsbG8=" },
+    originalContent: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](diagrams/new.png)\n",
+    save: true,
+    mergeLocalAssets: true,
+  });
+
+  // 3. Mid-prepare content change aborts before export_fmd_native.
+  native.mockClear();
+  let finishPrepare!: (value: { content: string; assets: Record<string, string> }) => void;
+  prepareFmdMock.mockReset().mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishPrepare = resolve;
+      }),
+  );
+  const inFlight = window.supermdPortable!(true, {
+    id: "portable-tab",
+    localAssets: ["assets/fig-1.png"],
+    omitLocalAssets: true,
+  }) as unknown as Promise<void>;
+  await vi.waitFor(() => expect(prepareFmdMock).toHaveBeenCalledTimes(1));
+
+  await act(async () => {
+    editorBridge.onChange!("# Lecture\n\nConcurrent edit while preparing\n");
+  });
+  await act(async () => {
+    finishPrepare({ content: "# Stale prepared\n", assets: {} });
+    await inFlight;
+  });
+  expect(native).toHaveBeenCalledWith("export_failed", { error: "Error: The export note changed" });
+  expect(native).not.toHaveBeenCalledWith("export_fmd_native", expect.anything());
+});
+
 it("routes undo and redo through note history even when a reused task checkbox keeps focus", async () => {
   const host = await mountReader();
 
@@ -1077,3 +1174,182 @@ it("forwards portable flag to prepareFmd when saving or exporting an opaque port
     expect.objectContaining({ noteId: "opaque-portable-tab", portable: true }),
   );
 });
+
+it("keeps localAssets fast-path state note-scoped across tab switches, contentUnchanged seededFind handoffs, and bundle resets", async () => {
+  await mountReader();
+  native.mockImplementation(async (command: string) => {
+    if (command === "document_sync") return { accepted: true, revision: 0 };
+    return null;
+  });
+  prepareFmdMock.mockImplementation(async (markdown: string) => ({
+    content: markdown,
+    assets: {},
+  }));
+
+  const tabAMd = "# Algebra\n\n![Chart](assets/chart.png)\n\nAlgebra theorem occurrence.\n";
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-fast-a",
+      content: tabAMd,
+      path: "content://vault/Algebra.smd",
+      portable: true,
+      localAssets: ["assets/chart.png"],
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  // 1. contentUnchanged + #96 occurrence-level seededFind without localAssets keeps note-scoped fast-path state intact.
+  const matchStart = tabAMd.lastIndexOf("Algebra");
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-fast-a",
+      contentUnchanged: true,
+      path: "content://vault/Algebra.smd",
+      portable: true,
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+      seededFind: {
+        query: "Algebra",
+        caseSensitive: true,
+        sourceStart: matchStart,
+        sourceEnd: matchStart + "Algebra".length,
+        matchText: "Algebra",
+        nonce: 7,
+      },
+    });
+  });
+
+  prepareFmdMock.mockClear();
+  native.mockClear();
+  await act(async () => {
+    await (window.supermdPortable!(false) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).toHaveBeenCalledWith(
+    tabAMd,
+    "content://vault/Algebra.smd",
+    expect.objectContaining({
+      noteId: "tab-fast-a",
+      portable: true,
+      localAssets: ["assets/chart.png"],
+      omitLocalAssets: true,
+    }),
+  );
+  expect(native).toHaveBeenCalledWith(
+    "export_fmd_native",
+    expect.objectContaining({
+      id: "tab-fast-a",
+      save: false,
+      mergeLocalAssets: true,
+    }),
+  );
+
+  // 2. Switching to another tab does not leak tab-fast-a's localAssets.
+  const tabBMd = "# Topology\n\n![Chart](assets/chart.png)\n";
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-fast-b",
+      content: tabBMd,
+      path: "content://vault/Topology.md",
+      portable: false,
+      localAssets: [],
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  prepareFmdMock.mockClear();
+  native.mockClear();
+  await act(async () => {
+    await (window.supermdPortable!(false) as unknown as Promise<void>);
+  });
+  const [, , tabBOptions] = prepareFmdMock.mock.calls[0];
+  expect(tabBOptions).not.toHaveProperty("localAssets");
+  expect(tabBOptions).not.toHaveProperty("omitLocalAssets");
+  expect(native).toHaveBeenCalledWith(
+    "export_fmd_native",
+    expect.not.objectContaining({ mergeLocalAssets: true }),
+  );
+
+  // 3. Returning to tab-fast-a preserves its note-scoped localAssets until explicitly cleared with [].
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-fast-a",
+      content: tabAMd,
+      path: "content://vault/Algebra.smd",
+      portable: true,
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  prepareFmdMock.mockClear();
+  await act(async () => {
+    await (window.supermdPortable!(true) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).toHaveBeenCalledWith(
+    tabAMd,
+    "content://vault/Algebra.smd",
+    expect.objectContaining({
+      noteId: "tab-fast-a",
+      localAssets: ["assets/chart.png"],
+      omitLocalAssets: true,
+    }),
+  );
+
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-fast-a",
+      contentUnchanged: true,
+      path: "content://vault/Algebra.smd",
+      portable: true,
+      localAssets: [],
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  prepareFmdMock.mockClear();
+  native.mockClear();
+  await act(async () => {
+    await (window.supermdPortable!(true) as unknown as Promise<void>);
+  });
+  const [, , clearedOptions] = prepareFmdMock.mock.calls[0];
+  expect(clearedOptions).not.toHaveProperty("localAssets");
+  expect(clearedOptions).not.toHaveProperty("omitLocalAssets");
+  expect(native).toHaveBeenCalledWith(
+    "export_fmd_native",
+    expect.not.objectContaining({ mergeLocalAssets: true }),
+  );
+});
+

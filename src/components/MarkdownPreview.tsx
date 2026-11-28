@@ -19,8 +19,8 @@ import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import DocumentProperties from "./DocumentProperties";
 import {DocumentAppearance} from '../documentAppearance';
-import {svgDataBackdrop,svgImage} from '../svgImage';
-import {adaptSvgData,decodeSvgDataUri} from '../svgTheme';
+import {parseValidatedSvg,svgSizingStyle} from '../svgImage';
+import {adaptValidatedSvg,decodeSvgDataUri} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
 import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
@@ -67,6 +67,7 @@ export function remarkCallouts() {
     const match = first.value.match(/^\[!([\w-]+)\]([+-]?)[ \t]*/i);
     if (!match) return;
     const type = match[1].toLowerCase();
+    const fold = match[2];
     first.value = first.value.slice(match[0].length);
     // A title is a line of inline Markdown, not just the first text node.
     // Keep emphasis, links and math in their original AST form and split only
@@ -89,14 +90,15 @@ export function remarkCallouts() {
     const parts=split(paragraph.children);
     paragraph.children=parts.body;
     if(!paragraph.children.length)node.children.shift();
-    const title=parts.title.some((child:any)=>child.type!=='text'||child.value.trim())?parts.title:[{type:'text',value:type[0].toUpperCase()+type.slice(1)}];
-    const collapsible = Boolean(match[2]) || type === "answer" || type === "solution";
+    const hasCustomTitle=parts.title.some((child:any)=>child.type!=='text'||child.value.trim());
+    const title=hasCustomTitle?parts.title:[{type:'text',value:type[0].toUpperCase()+type.slice(1)}];
+    const collapsible = Boolean(fold) || type === "answer" || type === "solution";
     node.children.unshift({
       type: "paragraph",
       data: { hName: collapsible ? "summary" : "p", hProperties: { className: "callout-title" } },
       children: title
     });
-    node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:match[2] === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type } };
+    node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:fold === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type, ...(fold ? {"data-callout-fold": fold} : {}), ...(!hasCustomTitle ? {"data-callout-default-title": "true"} : {}) } };
   });
 }
 
@@ -139,19 +141,25 @@ function AssetImage({ noteId, src = "", alt = "", documentPath, trustedImageHost
     return()=>window.removeEventListener('supermd-asset-access-restored',restored);
   },[documentPath,embedded,error,isRemote,src]);
   const isSvgData=/^data:image\/svg\+xml(?:[;,]|$)/i.test(resolved);
-  const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
+  const validatedSvg=useMemo(()=>{
+    if(!resolved||!isSvgData)return null;
+    try{return {svg:parseValidatedSvg(decodeSvgDataUri(resolved)),error:''};}
+    catch(reason){return {svg:null,error:reason instanceof Error?reason.message:String(reason)};}
+  },[resolved,isSvgData]);
+  const svgBacking=validatedSvg?.svg?.backing;
+  const svgSizing=useMemo(()=>svgSizingStyle(validatedSvg?.svg?.dimensions),[validatedSvg]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
   const adapted=useMemo(()=>{
     if(!resolved||!isSvgData)return {src:resolved,error:''};
+    if(!validatedSvg?.svg)return {src:'',error:validatedSvg?.error??'This SVG is not valid XML.'};
+    if(!adaptsSvg)return {src:resolved,error:''};
     try{
-      if(adaptsSvg&&svgBacking)return {src:adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'),error:''};
-      svgImage(decodeSvgDataUri(resolved));
-      return {src:resolved,error:''};
+      return {src:'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(adaptValidatedSvg(validatedSvg.svg,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome')),error:''};
     }catch(reason){
       return {src:'',error:reason instanceof Error?reason.message:String(reason)};
     }
-  },[resolved,isSvgData,svgBacking,appearance,adaptsSvg]);
+  },[resolved,isSvgData,validatedSvg,appearance,adaptsSvg]);
   const adaptedSource=adapted.src;
   const displayError=error||adapted.error;
   // A one-time approval belongs to the exact note and URL the user approved.
@@ -200,7 +208,8 @@ function AssetImage({ noteId, src = "", alt = "", documentPath, trustedImageHost
   if (displayError) return <span ref={mediaElement} className="image-error" data-note-id={noteIdAttr} data-note-image-source={src} data-note-image-readonly={readonlyAttr} role={editable ? "group" : "img"} aria-label={alt || "Image unavailable"}><span>Image unavailable: {alt || src}<small>{displayError}</small></span>{editable && <span className="image-error-actions"><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}</span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" data-note-id={noteIdAttr} role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
-  return <span ref={mediaElement} className={`note-image ${isSvgData?'note-image--diagram':''} ${sizing?'image-loading':''}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-id={noteIdAttr} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
+  const wrapperStyle=sizing?{width:'100%',maxWidth:'100%',boxSizing:'border-box'}:isSvgData?svgSizing:undefined;
+  return <span ref={mediaElement} className={`note-image ${isSvgData?'note-image--diagram':''} ${sizing?'image-loading':''}`} data-svg-sized={!sizing&&isSvgData&&svgSizing?'true':undefined} style={wrapperStyle as React.CSSProperties|undefined} data-note-id={noteIdAttr} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
     {sizing&&<span role="status">Loading image…</span>}
     <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={isSvgData?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
   </span>;

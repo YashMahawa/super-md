@@ -1,11 +1,6 @@
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
-import { maskFrontmatter } from "./frontmatter";
-import { remarkObsidianMath } from "./obsidianMath";
+import { parseMaskedMarkdown } from "./markdownExportParser";
 import {
   isRemoteImageApproved,
   isRemoteOrExplicitScheme,
@@ -29,9 +24,9 @@ export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&"
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
 export function imageRanges(markdown: string): ImageRange[] {
-  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
+  const { tree } = parseMaskedMarkdown(markdown);
   const definitions = new Map<string, string>(); const result: ImageRange[] = [];
-  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
+  visit(tree, "definition", (node: any) => { if (!definitions.has(node.identifier)) definitions.set(node.identifier, node.url); });
   visit(tree, (node: any) => {
     const source = node.type === "image" ? node.url : node.type === "imageReference" ? definitions.get(node.identifier) : undefined;
     if (source && node.position) result.push({ source, from: node.position.start.offset, to: node.position.end.offset });
@@ -97,9 +92,106 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
   const images = await Promise.all(files.map(async (file) => ({ name: file.name, data: await readImage(file) })));
   return invoke<ImportedImage[]>("import_images", { images });
 }
+const isValidLocalPortableAssetKey = (source: string) => {
+  if (!source.startsWith("assets/")) return false;
+  const name = source.slice(7);
+  if (!name || name.length > 159 || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name)) return false;
+  return /\.(?:png|jpe?g|svg|gif|webp|avif)$/i.test(name);
+};
+interface HtmlImgSrcSpan {
+  source: string;
+  valueStart: number;
+  valueEnd: number;
+  quoted: boolean;
+}
+function decodeBasicHtmlEntities(raw: string): string {
+  return raw.replace(/&(?:amp|lt|gt|quot|apos|#39|#x27);/gi, (entity) => {
+    switch (entity.toLowerCase()) {
+      case "&amp;": return "&";
+      case "&lt;": return "<";
+      case "&gt;": return ">";
+      case "&quot;": return '"';
+      case "&apos;":
+      case "&#39;":
+      case "&#x27;": return "'";
+      default: return entity;
+    }
+  });
+}
+function scanHtmlImgSrcSpans(raw: string, baseOffset: number): HtmlImgSrcSpan[] {
+  const spans: HtmlImgSrcSpan[] = [];
+  let pos = 0;
+  while (pos < raw.length) {
+    if (raw.startsWith("<!--", pos)) {
+      const endComment = raw.indexOf("-->", pos + 4);
+      if (endComment < 0) break;
+      pos = endComment + 3;
+      continue;
+    }
+    const lt = raw.indexOf("<", pos);
+    if (lt < 0) break;
+    let cursor = lt + 1;
+    if (!/^img(?=[\s/>])/i.test(raw.slice(cursor))) {
+      pos = lt + 1;
+      continue;
+    }
+    cursor += 3;
+    while (cursor < raw.length) {
+      while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++;
+      if (cursor >= raw.length) break;
+      if (raw[cursor] === ">") { cursor++; break; }
+      if (raw[cursor] === "/" && raw[cursor + 1] === ">") { cursor += 2; break; }
+      const attrStart = cursor;
+      while (cursor < raw.length && !/[\s"'=<>`/]/.test(raw[cursor])) cursor++;
+      if (cursor === attrStart) { cursor++; continue; }
+      const attrName = raw.slice(attrStart, cursor).toLowerCase();
+      while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++;
+      if (raw[cursor] !== "=") continue;
+      cursor++;
+      while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++;
+      if (cursor >= raw.length) break;
+      let rawVal = "";
+      let valueStart = cursor;
+      let valueEnd = cursor;
+      let quoted = false;
+      const ch = raw[cursor];
+      if (ch === '"' || ch === "'") {
+        const closeQuote = raw.indexOf(ch, cursor + 1);
+        if (closeQuote < 0) { cursor = raw.length; break; }
+        quoted = true;
+        valueStart = cursor + 1;
+        valueEnd = closeQuote;
+        rawVal = raw.slice(valueStart, valueEnd);
+        cursor = closeQuote + 1;
+      } else {
+        valueStart = cursor;
+        while (cursor < raw.length && !/[\s"'=<>`]/.test(raw[cursor]) && !(raw[cursor] === "/" && raw[cursor + 1] === ">")) cursor++;
+        valueEnd = cursor;
+        rawVal = raw.slice(valueStart, valueEnd);
+      }
+      if (attrName === "src") {
+        const cleaned = decodeBasicHtmlEntities(rawVal).replace(/[\t\r\n]+/g, "").trim();
+        if (cleaned) {
+          spans.push({
+            source: cleaned,
+            valueStart: baseOffset + valueStart,
+            valueEnd: baseOffset + valueEnd,
+            quoted,
+          });
+        }
+      }
+    }
+    pos = cursor;
+  }
+  return spans;
+}
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
-export type PrepareFmdOptions = RemoteImageConsentPolicy & { portable?: boolean };
+export type PrepareFmdOptions = RemoteImageConsentPolicy & {
+  portable?: boolean;
+  localAssets?: Iterable<string>;
+  omitLocalAssets?: boolean;
+};
 
 interface NormalizedFmdConsent {
   noteId?: string;
@@ -113,17 +205,21 @@ async function prepareFmdInternal(
   documentPath: string | null,
   portableDoc: boolean,
   consent: NormalizedFmdConsent,
+  localAssetSet: ReadonlySet<string>,
+  omitLocalAssets: boolean,
   shared: Map<string, Promise<string | null>>,
   assets: Record<string, string>,
 ): Promise<string> {
-  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
-  const tree = processor.parse(maskFrontmatter(markdown));
+  const { tree } = parseMaskedMarkdown(markdown);
   const work: Promise<void>[] = [];
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const definitions = new Map<string, any>(); const usedDefinitions = new Set<string>();
-  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
+  visit(tree, "definition", (node: any) => { if (!definitions.has(node.identifier)) definitions.set(node.identifier, node); });
   const collect = (source: string, replace: (name: string) => void) => {
     if (!shared.has(source)) shared.set(source, (async (): Promise<string | null> => {
+      if (omitLocalAssets && localAssetSet.has(source)) {
+        return source;
+      }
       let data: string;
       if (/^data:/i.test(source)) {
         if (!/^data:image\//i.test(source)) throw new Error(`Unsupported image ${source}`);
@@ -149,23 +245,63 @@ async function prepareFmdInternal(
       const type = data.match(/^data:image\/([^;]+);base64,/i)?.[1]?.toLowerCase();
       if (!type) throw new Error(`Unsupported image ${source}`);
       const ext = type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type;
-      const name = attachmentSource(source) || (portableDoc && compatPortableAssetSource(source, ext)) ? source : `assets/image-${crypto.randomUUID()}.${ext}`;
+      const name = attachmentSource(source) || ((portableDoc || localAssetSet.has(source)) && compatPortableAssetSource(source, ext)) ? source : `assets/image-${crypto.randomUUID()}.${ext}`;
       assets[name] = data;
       return name;
     })());
     work.push(shared.get(source)!.then((name) => { if (name !== null) replace(name); }));
   };
   visit(tree, (node: any) => {
-    if (node.type === "image") collect(node.url, (name) => { edits.push({ start: node.position.start.offset, end: node.position.end.offset, value: `![${markdownLabel(node.alt || "")}](<${name}>${node.title ? ` "${node.title.replace(/["\\]/g, "\\$&")}"` : ""})` }); });
+    if (node.type === "image") collect(node.url, (name) => {
+      if (omitLocalAssets && localAssetSet.has(node.url) && name === node.url) return;
+      edits.push({ start: node.position.start.offset, end: node.position.end.offset, value: `![${markdownLabel(node.alt || "")}](<${name}>${node.title ? ` "${node.title.replace(/["\\]/g, "\\$&")}"` : ""})` });
+    });
     if (node.type === "imageReference" && !usedDefinitions.has(node.identifier)) {
       const definition = definitions.get(node.identifier); if (!definition) return;
       usedDefinitions.add(node.identifier);
-      collect(definition.url, (name) => { edits.push({ start: definition.position.start.offset, end: definition.position.end.offset, value: `[${definition.label || definition.identifier}]: <${name}>${definition.title ? ` "${definition.title.replace(/["\\]/g, "\\$&")}"` : ""}` }); });
+      collect(definition.url, (name) => {
+        if (omitLocalAssets && localAssetSet.has(definition.url) && name === definition.url) return;
+        edits.push({ start: definition.position.start.offset, end: definition.position.end.offset, value: `[${definition.label || definition.identifier}]: <${name}>${definition.title ? ` "${definition.title.replace(/["\\]/g, "\\$&")}"` : ""}` });
+      });
     }
-    // Wiki-image compatibility only in actual prose, never inside fenced code.
-    if (node.type === "text" && node.position) {
+    if (node.type === "html" && node.position && typeof node.value === "string" && /<img(?=[\s/>])/i.test(node.value)) {
       const raw = markdown.slice(node.position.start.offset, node.position.end.offset);
-      for (const match of raw.matchAll(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)) collect(encodeURI(match[1]), (name) => { edits.push({ start: node.position.start.offset + match.index!, end: node.position.start.offset + match.index! + match[0].length, value: imageMarkdown({ source: name, alt: match[2] || match[1] }) }); });
+      for (const span of scanHtmlImgSrcSpans(raw, node.position.start.offset)) {
+        collect(span.source, (name) => {
+          if (omitLocalAssets && localAssetSet.has(span.source) && name === span.source) return;
+          edits.push({ start: span.valueStart, end: span.valueEnd, value: span.quoted ? name : `"${name}"` });
+        });
+      }
+    }
+    // Wiki-image compatibility only in actual prose, never inside fenced or inline code.
+    if ((node.type === "paragraph" || node.type === "heading" || node.type === "tableCell") && node.position) {
+      const blockStart = node.position.start.offset;
+      const blockEnd = node.position.end.offset;
+      const chars = markdown.slice(blockStart, blockEnd).split("");
+      visit(node, (child: any) => {
+        if (
+          (child.type === "inlineCode" ||
+            child.type === "inlineMath" ||
+            child.type === "math" ||
+            child.type === "code" ||
+            child.type === "image" ||
+            child.type === "imageReference" ||
+            child.type === "html") &&
+          child.position
+        ) {
+          const from = Math.max(0, child.position.start.offset - blockStart);
+          const to = Math.min(chars.length, child.position.end.offset - blockStart);
+          for (let i = from; i < to; i++) chars[i] = " ";
+        }
+      });
+      const masked = chars.join("");
+      for (const match of masked.matchAll(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)) {
+        const rawTarget = match[1].trim();
+        const encodedTarget = /^[a-z][a-z\d+.-]*:/i.test(rawTarget) || rawTarget.startsWith("//") ? rawTarget : encodeURI(rawTarget);
+        collect(encodedTarget, (name) => {
+          edits.push({ start: blockStart + match.index!, end: blockStart + match.index! + match[0].length, value: imageMarkdown({ source: name, alt: match[2] || match[1] }) });
+        });
+      }
     }
   });
   // Fenced smd-steps JSON is deliberately opaque to the Markdown AST. Collect
@@ -189,7 +325,7 @@ async function prepareFmdInternal(
     for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
     for(const step of deck.steps) if(typeof step.markdown==='string') {
       const originalMarkdown = step.markdown;
-      work.push(prepareFmdInternal(originalMarkdown, documentPath, portableDoc, consent, shared, assets).then(prepared => {
+      work.push(prepareFmdInternal(originalMarkdown, documentPath, portableDoc, consent, localAssetSet, omitLocalAssets, shared, assets).then(prepared => {
         if (prepared !== originalMarkdown) {
           step.markdown = prepared;
           markdownChanged = true;
@@ -202,8 +338,11 @@ async function prepareFmdInternal(
       let imageChanged = false;
       for (const step of deck.steps!) {
         if (typeof step.image === "string" && rewritten.has(step.image)) {
-          step.image = rewritten.get(step.image);
-          imageChanged = true;
+          const nextImage = rewritten.get(step.image)!;
+          if (nextImage !== step.image) {
+            step.image = nextImage;
+            imageChanged = true;
+          }
         }
       }
       if (imageChanged || markdownChanged) {
@@ -221,12 +360,14 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
   const portableDoc = options.portable ?? /\.(?:smd|fmd)$/i.test(documentPath || "");
   const assets: Record<string, string> = {};
   const shared = new Map<string, Promise<string | null>>();
+  const localAssetSet = new Set(Array.from(options.localAssets ?? []).filter(isValidLocalPortableAssetKey));
+  const omitLocalAssets = Boolean(options.omitLocalAssets);
   const consent: NormalizedFmdConsent = {
     noteId: options.noteId,
     trustedHosts: normalizeTrustedImageHosts(options.trustedImageHosts),
     approvedUrls: normalizeApprovedImageUrls(options.approvedImageUrls),
     loadedImageData: options.loadedImageData,
   };
-  const content = await prepareFmdInternal(markdown, documentPath, portableDoc, consent, shared, assets);
+  const content = await prepareFmdInternal(markdown, documentPath, portableDoc, consent, localAssetSet, omitLocalAssets, shared, assets);
   return { content, assets };
 }
