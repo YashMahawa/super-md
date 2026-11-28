@@ -1,5 +1,5 @@
 """Exercise the real offline reader through the headless CLI, not an HTML clone."""
-import hashlib,json,os,subprocess,sys,tempfile,unittest
+import json,os,subprocess,sys,tempfile,unittest
 from pathlib import Path
 class PreviewTests(unittest.TestCase):
     def test_real_reader_preview_preserves_source_and_renders_vector_pixels(self):
