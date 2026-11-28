@@ -81,7 +81,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
@@ -584,37 +583,28 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         findReplace = false
         focusManager.clearFocus(force = true)
         reader.requestFocus(View.FOCUS_DOWN)
-        suspendCancellableCoroutine<Unit> { cont ->
-            reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
-                if (cont.isActive) cont.resume(Unit)
-            }
-        }
-        if (reader !== web) return@LaunchedEffect
-        withTimeoutOrNull(350) {
-            while (!reader.hasFocus() || !reader.onCheckIsTextEditor() || !model.state.value.readerOverlay) {
-                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
-                delay(16)
-            }
-        }
-        withFrameNanos { }
-        if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
-        val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
-        val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
-        val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-        if (!hasHardwareKeyboard || showImeWithHardware) {
-            inputMethod?.showSoftInput(reader, 0)
-            delay(200)
-            val rootInsets = reader.rootWindowInsets
-            val imeShown = rootInsets != null && WindowInsetsCompat.toWindowInsetsCompat(rootInsets).isVisible(WindowInsetsCompat.Type.ime())
-            if (!imeShown && reader === web && model.state.value.readerOverlay) {
-                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+        fun syncFindInput(attempt: Int) {
+            if (reader !== web || reader.getTag(R.id.reader_destroyed_tag) == true) return
+            focusManager.clearFocus(force = true)
+            if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+            val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
+            val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
+            val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            if (!hasHardwareKeyboard || showImeWithHardware) {
                 inputMethod?.showSoftInput(reader, 0)
+                if (reader.hasFocus() && reader.onCheckIsTextEditor() && model.state.value.readerOverlay) {
+                    WindowCompat.getInsetsController(activity.window, reader).show(WindowInsetsCompat.Type.ime())
+                }
+                val rootInsets = reader.rootWindowInsets
+                val imeShown = rootInsets != null && WindowInsetsCompat.toWindowInsetsCompat(rootInsets).isVisible(WindowInsetsCompat.Type.ime())
+                if (!imeShown && attempt < 12) reader.postDelayed({ syncFindInput(attempt + 1) }, 50L)
+            } else {
+                if (attempt == 0) inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
+                if (!model.state.value.readerOverlay && attempt < 6) reader.postDelayed({ syncFindInput(attempt + 1) }, 25L)
             }
-        } else {
-            // WebView.focus() can itself open the software keyboard
-            // after an input receives focus. Honor the hardware-keyboard
-            // preference even when DOM focus was restored natively.
-            inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
+        }
+        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
+            reader.post { syncFindInput(0) }
         }
     }
     var readerReady by remember { mutableStateOf(false) }
@@ -1618,39 +1608,22 @@ internal fun buildHighlightedSnippet(
                     },
                     modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
                 )
-                Row(
+                FlowRow(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    FilterChip(
-                        selected = !isFilesMode,
-                        onClick = { if (isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.TEXT) },
-                        label = { Text("Text") },
-                    )
-                    FilterChip(
-                        selected = isFilesMode,
-                        onClick = { if (!isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.FILES) },
-                        label = { Text("Files") },
-                    )
-                    FilterChip(
-                        selected = state.caseSensitive,
-                        onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams, state.mode) },
-                        label = { Text("Match case") },
-                    )
-                    FilterChip(
-                        selected = state.includeDiagrams,
-                        enabled = !isFilesMode,
-                        onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams, state.mode) },
-                        label = { Text("Diagrams") },
-                    )
-                    Spacer(Modifier.weight(1f))
+                    FilterChip(selected = !isFilesMode, onClick = { if (isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.TEXT) }, label = { Text("Text") })
+                    FilterChip(selected = isFilesMode, onClick = { if (!isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.FILES) }, label = { Text("Files") })
+                    FilterChip(selected = state.caseSensitive, onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams, state.mode) }, label = { Text("Match case") })
+                    FilterChip(selected = state.includeDiagrams, enabled = !isFilesMode, onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams, state.mode) }, label = { Text("Diagrams") })
                     if (state.query.isNotEmpty()) {
                         Text(
                             if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
                             else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.align(Alignment.CenterVertically),
                         )
                     }
                 }

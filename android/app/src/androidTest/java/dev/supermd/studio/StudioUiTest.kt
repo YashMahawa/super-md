@@ -829,6 +829,7 @@ class StudioUiTest {
         setShowImeWithHardware(false)
         val instrumentation=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
         val reader = requireNotNull(web(compose.activity.window.decorView))
+        compose.runOnIdle { reader.requestFocus(android.view.View.FOCUS_DOWN) }
         // Control: compare Android's native key injection on a plain input in
         // this same WebView/activity before exercising the React search field.
         javascriptUntil("(()=>{const i=document.createElement('input');i.id='native-key-probe';i.type='text';i.style.cssText='position:fixed;top:2px;left:2px;z-index:999999';document.body.append(i);i.focus();return document.activeElement===i})()") { it == "true" }
