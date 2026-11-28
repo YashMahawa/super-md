@@ -47,22 +47,24 @@ export function commitWindowedLayout(
   update:(flush?:(work:()=>void)=>void)=>void,
 ):void {
   const host=root instanceof HTMLElement?root:null;
+  const beforeTop=host?.scrollTop;
   const restore=host?captureWindowedScrollAnchor(host):undefined;
   if(update.length>0)update(work=>flushSync(work));
   else flushSync(()=>update());
   if(host)refreshDocumentExtent(host);
   restore?.();
+  if(host&&beforeTop!==undefined&&Math.abs(host.scrollTop-beforeTop)>.5)(host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=host.scrollTop;
 }
 /** Synchronous layout transaction only; never retain this across input frames. */
 export function captureWindowedScrollAnchor(root:HTMLElement,changing?:HTMLElement):()=>void {
   const source=!root.dataset.navigating?currentScrollSource(root):undefined;
   if(source){
     const top=source.range.getBoundingClientRect().top;
-    return()=>{if(root.isConnected&&!root.dataset.navigating&&scrollSourceAlive(root,source))root.scrollTop+=source.range.getBoundingClientRect().top-top;};
+    return()=>{if(root.isConnected&&!root.dataset.navigating&&scrollSourceAlive(root,source)){root.scrollTop+=source.range.getBoundingClientRect().top-top;(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;}};
   }
   const anchor=!root.dataset.navigating?windowedViewportAnchor(root,changing):undefined;
   const top=anchor?.getBoundingClientRect().top;
-  return()=>{if(root.isConnected&&!root.dataset.navigating&&anchor?.isConnected&&root.contains(anchor)&&top!==undefined)root.scrollTop+=anchor.getBoundingClientRect().top-top;};
+  return()=>{if(root.isConnected&&!root.dataset.navigating&&anchor?.isConnected&&root.contains(anchor)&&top!==undefined){root.scrollTop+=anchor.getBoundingClientRect().top-top;(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;}};
 }
 function windowedViewportAnchor(root:HTMLElement,changing?:HTMLElement):HTMLElement|undefined {
   if(root.scrollTop<1)return;
@@ -110,7 +112,7 @@ export function preserveWindowedScroll(element:HTMLElement):void {
   const rect=root.getBoundingClientRect(),x=rect.left+rect.width*.5,y=rect.top+Math.min(160,rect.height*.35);
   const anchor=document.elementFromPoint(x,y)?.closest<HTMLElement>('[data-windowed-block]');if(!anchor)return;
   const top=anchor.getBoundingClientRect().top,scroll=root.scrollTop;pendingAnchors.add(root);
-  requestAnimationFrame(()=>{pendingAnchors.delete(root);if(root.isConnected&&anchor.isConnected&&Math.abs(root.scrollTop-scroll)<1)root.scrollTop+=anchor.getBoundingClientRect().top-top;});
+  requestAnimationFrame(()=>{pendingAnchors.delete(root);if(root.isConnected&&anchor.isConnected&&Math.abs(root.scrollTop-scroll)<1){root.scrollTop+=anchor.getBoundingClientRect().top-top;(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;}});
 }
 export function registerWindowedText(element:HTMLElement,text:string):()=>void {
   blocks.set(element,text);return()=>{blocks.delete(element);};

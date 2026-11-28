@@ -126,6 +126,7 @@ test('changing tabs or reading modes retires the previous heading alignment',asy
 
 test('keyboard scrolling immediately cancels heading-lock settling on large windowed notes',async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
   await page.evaluate(content=>window.supermdLoad?.({id:'keyboard-heading-cancel',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:100}),note);
   await expect(page.locator('[data-windowed-mounted="true"]')).not.toHaveCount(0);
 

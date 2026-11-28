@@ -1,6 +1,6 @@
 """Actual Qt/loopback verification of the local and cloud desktop bridge."""
 from __future__ import annotations
-import asyncio, base64, hashlib, json, os, queue, shutil, socket, subprocess, sys, threading, time, unittest, urllib.request
+import asyncio, base64, hashlib, json, os, shutil, socket, subprocess, threading, time, unittest, urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 

@@ -44,7 +44,7 @@ class PaletteStub(QObject):
 
 class FullscreenStatusBannerTest(unittest.TestCase):
     def test_studio_snapshot_increments_message_revision_even_for_repeated_messages(self):
-        app = QGuiApplication.instance() or QGuiApplication(["studio message revision"])
+        _app = QGuiApplication.instance() or QGuiApplication(["studio message revision"])
         from studio import Studio
 
         with tempfile.TemporaryDirectory() as home:

@@ -76,17 +76,17 @@ export function observeSharedIntersection(
       created.frame = requestAnimationFrame(() => {
         created.frame = 0;
         const start = nowMs();
-        drainPending(false);
+        drainPending();
         const end = nowMs();
         created.lastRafDrainMs = Math.max(0, end - start);
         created.lastRafDrainEnd = end;
       });
     };
-    const drainPending = (direct: boolean) => {
+    const drainPending = (freshEntries?: ReadonlySet<IntersectionObserverEntry>) => {
       if (!commit || pending.size === 0) return;
       let viewport: DOMRectReadOnly | null = null;
-      if (direct) {
-        for (const entry of pending.values()) {
+      if (freshEntries) {
+        for (const entry of freshEntries) {
           if (entry.rootBounds && entry.rootBounds.height > 0) {
             viewport = entry.rootBounds;
             break;
@@ -97,42 +97,49 @@ export function observeSharedIntersection(
       const hasViewport = Boolean(viewport && viewport.height > 0);
       const verticalMargin = hasViewport && viewport ? parseVerticalMarginPx(options.rootMargin, viewport.height) : 0;
       const visibleMounts: IntersectionObserverEntry[] = [];
-      const releases: IntersectionObserverEntry[] = [];
-      const marginCandidates: Array<{ entry: IntersectionObserverEntry; distance: number }> = [];
+      const actionableReleases: IntersectionObserverEntry[] = [];
+      const noopReleases: IntersectionObserverEntry[] = [];
+      const aboveCandidates: Array<{ entry: IntersectionObserverEntry; distance: number }> = [];
+      const belowCandidates: Array<{ entry: IntersectionObserverEntry; distance: number }> = [];
       for (const [element, entry] of pending) {
         if (!callbacks.has(element)) {
           pending.delete(element);
           continue;
         }
         if (!entry.isIntersecting) {
-          releases.push(entry);
+          if (element instanceof HTMLElement && element.dataset.windowedMounted === "false") {
+            noopReleases.push(entry);
+          } else {
+            actionableReleases.push(entry);
+          }
           continue;
         }
-        const rect = direct && entry.boundingClientRect ? entry.boundingClientRect : element.getBoundingClientRect();
-        if (!direct && viewport && viewport.height > 0 && (rect.height > 0 || rect.top !== 0 || rect.bottom !== 0)) {
+        const isFresh = Boolean(freshEntries?.has(entry));
+        const rect = isFresh && entry.boundingClientRect ? entry.boundingClientRect : element.getBoundingClientRect();
+        if (!isFresh && viewport && viewport.height > 0 && (rect.height > 0 || rect.top !== 0 || rect.bottom !== 0)) {
           if (rect.bottom < viewport.top - verticalMargin || rect.top > viewport.bottom + verticalMargin) {
             pending.delete(element);
             continue;
           }
         }
         const distance = viewportDistancePx(rect, viewport);
-        if (distance <= 0) visibleMounts.push(entry);
-        else marginCandidates.push({ entry, distance });
-      }
-      if (!visibleMounts.length && !releases.length && !marginCandidates.length) return;
-
-      if (!visibleMounts.length && !marginCandidates.length) {
-        const anyMountedRelease = releases.some(
-          (item) => !(item.target instanceof HTMLElement) || item.target.dataset.windowedMounted !== "false",
-        );
-        if (!anyMountedRelease) {
-          for (const item of releases) {
-            if (pending.get(item.target) !== item) continue;
-            pending.delete(item.target);
-            callbacks.get(item.target)?.(item);
-          }
-          return;
+        if (distance <= 0) {
+          visibleMounts.push(entry);
+        } else if (viewport && rect.bottom < viewport.top) {
+          aboveCandidates.push({ entry, distance });
+        } else {
+          belowCandidates.push({ entry, distance });
         }
+      }
+
+      for (const item of noopReleases) {
+        if (pending.get(item.target) !== item) continue;
+        pending.delete(item.target);
+        callbacks.get(item.target)?.(item);
+      }
+
+      if (!visibleMounts.length && !actionableReleases.length && !aboveCandidates.length && !belowCandidates.length) {
+        return;
       }
 
       if (!hasViewport) {
@@ -142,7 +149,7 @@ export function observeSharedIntersection(
             pending.delete(item.target);
             callbacks.get(item.target)?.(item);
           }
-          for (const item of releases) {
+          for (const item of actionableReleases) {
             if (pending.get(item.target) !== item) continue;
             pending.delete(item.target);
             callbacks.get(item.target)?.(item);
@@ -151,15 +158,91 @@ export function observeSharedIntersection(
         return;
       }
 
-      if (marginCandidates.length > 1) {
-        marginCandidates.sort((left, right) => left.distance - right.distance);
+      if (aboveCandidates.length > 1) {
+        aboveCandidates.sort((left, right) =>
+          left.distance - right.distance ||
+          (left.entry.target.compareDocumentPosition(right.entry.target) & Node.DOCUMENT_POSITION_FOLLOWING ? 1 : -1),
+        );
       }
-      const marginMounts = marginCandidates.map((candidate) => candidate.entry);
+      if (belowCandidates.length > 1) {
+        belowCandidates.sort((left, right) =>
+          left.distance - right.distance ||
+          (left.entry.target.compareDocumentPosition(right.entry.target) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1),
+        );
+      }
+
+      const releasingTargets = new Set<Element>(actionableReleases.map((item) => item.target));
+      const isStayingMounted = (el: Element | null): boolean =>
+        el instanceof HTMLElement && el.dataset.windowedMounted === "true" && !releasingTargets.has(el);
+
+      let bridgeAboveEnd = -1;
+      for (let i = 0; i < aboveCandidates.length; i++) {
+        if (isStayingMounted(aboveCandidates[i].entry.target.previousElementSibling)) {
+          bridgeAboveEnd = i;
+        }
+      }
+      const bridgedAbove = bridgeAboveEnd >= 0 ? aboveCandidates.splice(0, bridgeAboveEnd + 1).map((c) => c.entry) : [];
+
+      let bridgeBelowEnd = -1;
+      for (let i = 0; i < belowCandidates.length; i++) {
+        if (isStayingMounted(belowCandidates[i].entry.target.nextElementSibling)) {
+          bridgeBelowEnd = i;
+        }
+      }
+      const bridgedBelow = bridgeBelowEnd >= 0 ? belowCandidates.splice(0, bridgeBelowEnd + 1).map((c) => c.entry) : [];
+
+      const mandatoryEntries = [...visibleMounts, ...bridgedAbove, ...bridgedBelow, ...actionableReleases];
+      const mandatoryTargetSet = new Set<Element>(mandatoryEntries.map((item) => item.target));
+
+      const eligibleAbove: Array<{ entry: IntersectionObserverEntry; distance: number }> = [];
+      for (let i = 0; i < aboveCandidates.length; i++) {
+        const inward = aboveCandidates[i].entry.target.nextElementSibling;
+        const previousTarget = i > 0 ? aboveCandidates[i - 1].entry.target : null;
+        if (
+          inward instanceof HTMLElement &&
+          inward.dataset.windowedMounted === "false" &&
+          !mandatoryTargetSet.has(inward) &&
+          inward !== previousTarget
+        ) {
+          break;
+        }
+        eligibleAbove.push(aboveCandidates[i]);
+      }
+
+      const eligibleBelow: Array<{ entry: IntersectionObserverEntry; distance: number }> = [];
+      for (let i = 0; i < belowCandidates.length; i++) {
+        const inward = belowCandidates[i].entry.target.previousElementSibling;
+        const previousTarget = i > 0 ? belowCandidates[i - 1].entry.target : null;
+        if (
+          inward instanceof HTMLElement &&
+          inward.dataset.windowedMounted === "false" &&
+          !mandatoryTargetSet.has(inward) &&
+          inward !== previousTarget
+        ) {
+          break;
+        }
+        eligibleBelow.push(belowCandidates[i]);
+      }
+
+      const marginMounts: IntersectionObserverEntry[] = [];
+      for (let ia = 0, ib = 0; ia < eligibleAbove.length || ib < eligibleBelow.length; ) {
+        if (ib >= eligibleBelow.length || (ia < eligibleAbove.length && eligibleAbove[ia].distance <= eligibleBelow[ib].distance)) {
+          marginMounts.push(eligibleAbove[ia++].entry);
+        } else {
+          marginMounts.push(eligibleBelow[ib++].entry);
+        }
+      }
+
+      if (!mandatoryEntries.length && !marginMounts.length) {
+        if (pending.size > 0) scheduleDrain();
+        return;
+      }
 
       commit(root, (flush) => {
         const sliceStart = nowMs();
         const budget = observerWorkBudgetMs;
-        const sameFrameRafSpent = direct && sliceStart - created.lastRafDrainEnd < 12 ? created.lastRafDrainMs : 0;
+        const isDirect = Boolean(freshEntries);
+        const sameFrameRafSpent = isDirect && sliceStart - created.lastRafDrainEnd < 12 ? created.lastRafDrainMs : 0;
         const marginBudget = Math.max(0, budget - sameFrameRafSpent);
         let statefulCount = 0;
         let stepSize = 1;
@@ -182,29 +265,10 @@ export function observeSharedIntersection(
           return changedInStep > 0 ? (nowMs() - stepStart) / changedInStep : 0;
         };
 
-        for (let index = 0; index < visibleMounts.length; ) {
-          if (statefulCount > 0 && nowMs() - sliceStart >= budget) break;
-          const batch = visibleMounts.slice(index, index + stepSize);
-          index += batch.length;
-          const perItemMs = runStep(batch);
+        if (mandatoryEntries.length > 0) {
+          const perItemMs = runStep(mandatoryEntries);
           if (perItemMs > 0) {
             stepSize = perItemMs < 1 ? 4 : perItemMs < 2 ? 2 : 1;
-          }
-        }
-
-        if (releases.length > 0) {
-          const actionableReleases: IntersectionObserverEntry[] = [];
-          for (const item of releases) {
-            if (pending.get(item.target) !== item) continue;
-            if (item.target instanceof HTMLElement && item.target.dataset.windowedMounted === "false") {
-              pending.delete(item.target);
-              callbacks.get(item.target)?.(item);
-            } else {
-              actionableReleases.push(item);
-            }
-          }
-          if (actionableReleases.length > 0) {
-            runStep(actionableReleases);
           }
         }
 
@@ -227,10 +291,14 @@ export function observeSharedIntersection(
         for (const entry of entries) callbacks.get(entry.target)?.(entry);
         return;
       }
+      const fresh = new Set<IntersectionObserverEntry>();
       for (const entry of entries) {
-        if (callbacks.has(entry.target)) pending.set(entry.target, entry);
+        if (callbacks.has(entry.target)) {
+          pending.set(entry.target, entry);
+          fresh.add(entry);
+        }
       }
-      drainPending(true);
+      drainPending(fresh);
     }, options);
     created = { observer, callbacks, pending, frame: 0, lastRafDrainEnd: -Infinity, lastRafDrainMs: 0 };
     record = created;

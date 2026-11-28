@@ -248,6 +248,8 @@ Pane {
                 Label { text: "New note location"; font.weight: Font.DemiBold }
                 ActionButton { Layout.fillWidth: true; text: viewState.settings.newNoteLocation || "Downloads"; glyph: "FolderOpen"; tonal: true; onClicked: studio.chooseNoteLocation(); ToolTip.text: viewState.settings.newNoteLocation || "Downloads" }
                 Label { text: "New notes stay recoverable until you choose a file. Empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Switch { objectName: "writingHideNonNoteFolders"; text: "Hide folders without notes"; checked: viewState.settings.hideNonNoteFolders !== false; onToggled: page.save("hideNonNoteFolders", checked) }
+                Label { text: "Ignores subfolders that contain only files other than .md, .smd or .txt, or no files at all."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Writing assistance"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }
                 Switch { text: "Grammar check"; checked: viewState.settings.grammarCheck; onToggled: page.save("grammarCheck", checked) }

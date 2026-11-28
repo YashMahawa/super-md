@@ -168,10 +168,10 @@ describe("shared intersection observers", () => {
       observer as unknown as IntersectionObserver,
     );
 
-    // Visible blocks run first until the 5 ms budget is reached (2 * 3 ms = 6 ms >= 5 ms).
+    // Visible blocks commit atomically in one flushSync and consume the 5 ms budget (2 * 3 ms = 6 ms >= 5 ms).
     expect(commit).toHaveBeenCalledTimes(1);
     expect(order).toEqual(["visibleA", "visibleB"]);
-    expect(commits[0]).toEqual(["flush", "flush"]);
+    expect(commits[0]).toEqual(["flush"]);
     expect(frames).toHaveLength(1);
 
     // Next animation frame drains margin mounts ordered by viewport proximity (100px -> 200px), stopping at budget.
@@ -187,6 +187,108 @@ describe("shared intersection observers", () => {
     expect(commit).toHaveBeenCalledTimes(3);
     expect(order).toEqual(["visibleA", "visibleB", "marginNear", "marginMid", "marginFar"]);
     expect(frames).toHaveLength(0);
+
+    stops.forEach((stop) => stop());
+  });
+
+  it("re-measures carried-over pending entries on subsequent scroll deliveries and bridges mounted holes", () => {
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    let clock = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    setObserverWorkBudgetMs(4);
+
+    const root = document.createElement("main");
+    vi.spyOn(root, "getBoundingClientRect").mockReturnValue(makeRect(0, 800));
+
+    // Simulate contiguous DOM siblings [b0, b1, b2, b3, b4]
+    const blocks = Array.from({ length: 5 }, () => {
+      const el = document.createElement("section");
+      el.dataset.windowedMounted = "false";
+      root.appendChild(el);
+      return el;
+    });
+    const [b0, b1, b2, b3, b4] = blocks;
+    let rects = [
+      makeRect(-700, 150),
+      makeRect(-550, 150),
+      makeRect(-400, 150), // initially in upper rootMargin
+      makeRect(50, 150),   // initially visible
+      makeRect(250, 150),  // initially visible
+    ];
+    blocks.forEach((el, idx) => {
+      vi.spyOn(el, "getBoundingClientRect").mockImplementation(() => rects[idx]);
+    });
+
+    const mountedOrder: string[] = [];
+    const commit = vi.fn((_host: Element | Document | null, update: (flush?: IntersectionStepFlush) => void) => {
+      update((work) => work());
+    });
+
+    const stops = blocks.map((el, idx) =>
+      observeSharedIntersection(
+        el,
+        () => {
+          el.dataset.windowedMounted = "true";
+          mountedOrder.push(`b${idx}`);
+          clock += 3;
+          return true;
+        },
+        { root, rootMargin: "900px 0px" },
+        commit,
+      ),
+    );
+
+    const observer = FakeIntersectionObserver.instances[0];
+    // Frame 1: b2 (upper margin), b3 (visible), b4 (visible) enter observer.
+    // b3 + b4 commit atomically (6 ms >= 4 ms budget), leaving b2 in pending with stale rect (-400).
+    observer.callback(
+      [b2, b3, b4].map((target) => ({
+        target,
+        isIntersecting: true,
+        intersectionRatio: 1,
+        time: clock,
+        boundingClientRect: target.getBoundingClientRect(),
+        intersectionRect: target.getBoundingClientRect(),
+        rootBounds: makeRect(0, 800),
+      })),
+      observer as unknown as IntersectionObserver,
+    );
+    expect(mountedOrder).toEqual(["b3", "b4"]);
+
+    // Frame 2 (before rAF): fast upward scroll brings b2 into the viewport while b1 is in upper margin
+    // right below already-mounted b0 (contiguity bridge must mount b1 immediately alongside b2!).
+    b0.dataset.windowedMounted = "true";
+    rects = [
+      makeRect(-350, 150), // b0 already mounted in upper margin
+      makeRect(-200, 150), // b1 in upper margin between mounted b0 and visible b2 -> bridged!
+      makeRect(20, 150),   // b2 now visible (carried over in pending with stale -400 entry!)
+      makeRect(170, 150),
+      makeRect(320, 150),
+    ];
+    observer.callback(
+      [b1].map((target) => ({
+        target,
+        isIntersecting: true,
+        intersectionRatio: 1,
+        time: clock,
+        boundingClientRect: target.getBoundingClientRect(),
+        intersectionRect: target.getBoundingClientRect(),
+        rootBounds: makeRect(0, 800),
+      })),
+      observer as unknown as IntersectionObserver,
+    );
+
+    // Carried-over visible b2 AND bridged offscreen b1 both mount immediately (no unmounted hole between b0 and b2!).
+    expect(mountedOrder).toEqual(["b3", "b4", "b2", "b1"]);
+    expect(b1.dataset.windowedMounted).toBe("true");
+    expect(b2.dataset.windowedMounted).toBe("true");
 
     stops.forEach((stop) => stop());
   });
