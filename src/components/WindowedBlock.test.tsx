@@ -26,8 +26,10 @@ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 let root: Root | null = null;
 afterEach(() => {
   if (root) { act(() => root?.unmount()); root = null; }
+  window.getSelection()?.removeAllRanges();
   document.body.innerHTML = "";
   FakeIntersectionObserver.instances = [];
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -118,5 +120,46 @@ describe("windowed block focus reveal", () => {
     expect(document.activeElement).toBe(heading);
     expect(heading?.getAttribute("aria-hidden")).toBeNull();
     cancelHeadingNavigation(reading);
+  });
+
+  it("short-circuits redundant observer deliveries and supports .reading-scroll containers", async () => {
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    const selectionSpy = vi.spyOn(window, "getSelection");
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => root?.render(
+      <div className="reading-scroll">
+        <WindowedBlock enabled estimate={96} text="studio windowed paragraph">
+          <p>Mounted inside studio reading-scroll</p>
+        </WindowedBlock>
+      </div>,
+    ));
+
+    const scroller = host.querySelector<HTMLElement>(".reading-scroll")!;
+    const block = scroller.querySelector<HTMLElement>("[data-windowed-block]")!;
+    const observer = FakeIntersectionObserver.instances[0];
+    let windowChanges = 0;
+    scroller.addEventListener("supermd-window-change", () => { windowChanges += 1; });
+
+    selectionSpy.mockClear();
+    // Initial offscreen observer delivery on an already-unmounted block skips DOM/selection checks.
+    await act(async () => { observer.emit(block, false); });
+    expect(selectionSpy).not.toHaveBeenCalled();
+    expect(block.dataset.windowedMounted).toBe("false");
+
+    await act(async () => { observer.emit(block, true); });
+    expect(block.dataset.windowedMounted).toBe("true");
+    expect(block.querySelector("p")?.textContent).toBe("Mounted inside studio reading-scroll");
+    expect(windowChanges).toBe(1);
+
+    // Duplicate intersecting delivery is a no-op without re-dispatching window change.
+    await act(async () => { observer.emit(block, true); });
+    expect(windowChanges).toBe(1);
+
+    await act(async () => { observer.emit(block, false); });
+    expect(block.dataset.windowedMounted).toBe("false");
+    expect(selectionSpy).toHaveBeenCalledTimes(1);
   });
 });
