@@ -1002,6 +1002,92 @@ class AgentStagingAndGraceTest {
             model.recoverySnapshotWriter = NoteRecovery::write
         }
     }
+
+    @Test
+    fun dirtyDraftCoauthoringPersistsAcrossRecoveryRestoreAndManualSaveUpdatesDiskAndClearsUnreviewed() {
+        val (workspaceKey, model) = newModel()
+
+        model.open(inactiveUri)
+        await { model.state.value.tabs.any { it.uri == inactiveUri.toString() } }
+        model.open(activeUri)
+        await {
+            model.state.value.active.uri == activeUri.toString() &&
+                model.state.value.tabs.count { it.uri != null } == 2
+        }
+
+        val activeId = model.state.value.tabs.single { it.uri == activeUri.toString() }.id
+        val inactiveId = model.state.value.tabs.single { it.uri == inactiveUri.toString() }.id
+        val originalActiveDisk = "# Active\n\nFocused body.\n"
+        val originalInactiveDisk = "# Inactive\n\nOriginal background body.\n"
+
+        // Create dirty drafts on both notes before any autosave writes to disk.
+        val dirtyActive = "# Active\n\nFocused body.\n\nDirty user active draft.\n"
+        val dirtyInactive = "# Inactive\n\nOriginal background body.\n\nDirty user background draft.\n"
+        model.readerEdit(activeId, dirtyActive)
+        model.readerEdit(inactiveId, dirtyInactive)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // Active-tab coauthoring in current reader + background-tab coauthoring on dirty drafts.
+        val coauthoredActive = "$dirtyActive\nActive AI addition.\n"
+        model.readerEdit(activeId, coauthoredActive)
+        model.markAgentBannerShown(activeId, dirtyActive, coauthoredActive)
+
+        val coauthoredInactive = "$dirtyInactive\nBackground AI addition.\n"
+        runWithMainLooper {
+            model.commitAgentSnapshotPatch(
+                inactiveId,
+                agentContentRevision(dirtyInactive),
+                coauthoredInactive,
+                agentContentRevision(coauthoredInactive),
+            )
+        }
+        runWithMainLooper { assertTrue(model.flushRecoveryAndAwait()) }
+
+        // Disk files still hold original saved text prior to autosave/manual save.
+        assertEquals(originalActiveDisk, provider.readText("folder/Active.md"))
+        assertEquals(originalInactiveDisk, provider.readText("folder/Inactive.md"))
+
+        // Restore into a fresh StudioViewModel for the same workspaceKey.
+        val restoredModel = StudioViewModel(app, workspaceKey)
+        restoredModel.readerFlushRequester = { true }
+        viewModels += ViewModelStore().apply {
+            val put = ViewModelStore::class.java.getDeclaredMethod("put", String::class.java, androidx.lifecycle.ViewModel::class.java)
+            put.isAccessible = true
+            put.invoke(this, "$workspaceKey-restored", restoredModel)
+        }
+        await { restoredModel.state.value.tabs.count { it.uri != null } == 2 }
+        val restoredActive = restoredModel.state.value.tabs.single { it.id == activeId }
+        val restoredInactive = restoredModel.state.value.tabs.single { it.id == inactiveId }
+
+        assertEquals(coauthoredActive, restoredActive.content)
+        assertEquals(originalActiveDisk, restoredActive.saved)
+        assertTrue(restoredActive.dirty)
+        assertTrue(restoredActive.agentUnreviewed)
+        assertEquals(1, restoredActive.agentEdits.size)
+        assertEquals(dirtyActive, restoredActive.agentEdits.single().before)
+        assertEquals(coauthoredActive, restoredActive.agentEdits.single().after)
+
+        assertEquals(coauthoredInactive, restoredInactive.content)
+        assertEquals(originalInactiveDisk, restoredInactive.saved)
+        assertTrue(restoredInactive.dirty)
+        assertTrue(restoredInactive.agentStaged)
+        assertTrue(restoredInactive.agentUnreviewed)
+        assertEquals(dirtyInactive, restoredInactive.agentEdits.single().before)
+
+        // Simulate Undo in the restored reader back to dirtyActive, then manual Save to disk.
+        restoredModel.readerEdit(activeId, dirtyActive)
+        restoredModel.dismissAgentBanner(activeId)
+        restoredModel.saveManual()
+        await {
+            provider.readText("folder/Active.md") == dirtyActive &&
+                !restoredModel.state.value.busy &&
+                !restoredModel.state.value.tabs.single { it.id == activeId }.dirty
+        }
+        val savedActive = restoredModel.state.value.tabs.single { it.id == activeId }
+        assertEquals(dirtyActive, savedActive.saved)
+        assertFalse(savedActive.agentUnreviewed)
+        assertEquals(originalInactiveDisk, provider.readText("folder/Inactive.md"))
+    }
 }
 
 private class FakeRelayTransport(private val config: AgentAccessConfig) {

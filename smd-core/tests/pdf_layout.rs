@@ -748,3 +748,256 @@ fn stacked_inline_fractions_leave_clearance_between_lines() {
         assert!(gap >= 7., "consecutive inline fractions must have clearance, got {gap:.2}pt");
     }
 }
+
+#[test]
+fn repeated_and_forward_footnotes_keep_stable_first_reference_numbering_without_duplicating_entries() {
+    let md = [
+        "[^early]: EARLY_FOOTNOTE_BODY",
+        "",
+        "# smd-footnote-1",
+        "",
+        "Lead CITE_FIRST[^beta], next CITE_SECOND[^Alpha], repeat CITE_BETA_AGAIN[^BETA], early CITE_EARLY[^early], repeat early CITE_EARLY_AGAIN[^EARLY], final CITE_FOURTH[^gamma], literal CITE_MISSING[^missing], and prepared CITE_PREPARED_MISSING\\[\\^missing].",
+        "",
+        "[^unused]: UNUSED_FOOTNOTE_BODY",
+        "",
+        "[^gamma]: **GAMMA_BOLD_BODY**",
+        "",
+        "    GAMMA_SECOND_PARAGRAPH",
+        "",
+        "[^alpha]: ALPHA_FIRST_DEFINITION_WINS",
+        "",
+        "[^alpha]: ALPHA_SHADOWED_DUPLICATE",
+        "",
+        "[^beta]: BETA_FOOTNOTE_BODY with $x^2$.",
+    ].join("\n");
+
+    let generated = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(generated.matches("]<smd.footnote.").count(), 4, "Expected exactly 4 footnote declarations: {generated}");
+    assert_eq!(generated.matches("#footnote(<smd.footnote.1>)").count(), 1, "{generated}");
+    assert_eq!(generated.matches("#footnote(<smd.footnote.3>)").count(), 1, "{generated}");
+    assert!(!generated.contains("UNUSED_FOOTNOTE_BODY"), "Unused footnote definition must not render: {generated}");
+    assert!(!generated.contains("ALPHA_SHADOWED_DUPLICATE"), "Duplicate footnote definition must not overwrite first definition: {generated}");
+
+    let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
+    let path = std::env::temp_dir().join(format!("supermd-footnotes-order-{}.pdf", std::process::id()));
+    std::fs::write(&path, &pdf).unwrap();
+    if let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+        if require_poppler() {
+            assert!(out.status.success(), "pdftotext must succeed on Linux CI");
+        }
+        if out.status.success() {
+            let plain = String::from_utf8_lossy(&out.stdout);
+            let flat = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("CITE_FIRST1,"), "First forward ref [^beta] must be numbered 1: {flat}");
+            assert!(flat.contains("CITE_SECOND2,"), "Second ref [^Alpha] must be numbered 2: {flat}");
+            assert!(flat.contains("CITE_BETA_AGAIN1,"), "Repeated [^BETA] must reuse number 1: {flat}");
+            assert!(flat.contains("CITE_EARLY3,"), "Early-defined [^early] cited third must be numbered 3: {flat}");
+            assert!(flat.contains("CITE_EARLY_AGAIN3,"), "Repeated [^EARLY] must reuse number 3: {flat}");
+            assert!(flat.contains("CITE_FOURTH4,"), "Fourth distinct footnote [^gamma] must be numbered 4 (not shifted to 6): {flat}");
+            assert!(flat.contains("CITE_MISSING[^missing],"), "Undefined [^missing] must remain literal without shifting numbers: {flat}");
+            assert!(flat.contains("CITE_PREPARED_MISSING[^missing]."), "preparePdf-escaped undefined footnote must also render as literal [^missing]: {flat}");
+
+            assert_eq!(plain.matches("BETA_FOOTNOTE_BODY").count(), 1, "Repeated footnote entry must appear once: {plain}");
+            assert_eq!(plain.matches("ALPHA_FIRST_DEFINITION_WINS").count(), 1, "First definition must appear once: {plain}");
+            assert_eq!(plain.matches("EARLY_FOOTNOTE_BODY").count(), 1, "Early footnote entry must appear once: {plain}");
+            assert_eq!(plain.matches("GAMMA_BOLD_BODY").count(), 1, "Fourth footnote entry must appear once: {plain}");
+            assert!(plain.contains("GAMMA_SECOND_PARAGRAPH"), "Multi-paragraph footnote continuation must survive: {plain}");
+            assert!(!plain.contains("UNUSED_FOOTNOTE_BODY"), "Unused footnote must not appear in PDF: {plain}");
+            assert!(!plain.contains("ALPHA_SHADOWED_DUPLICATE"), "Shadowed duplicate definition must not appear in PDF: {plain}");
+
+            let pos_beta = plain.find("BETA_FOOTNOTE_BODY").unwrap();
+            let pos_alpha = plain.find("ALPHA_FIRST_DEFINITION_WINS").unwrap();
+            let pos_early = plain.find("EARLY_FOOTNOTE_BODY").unwrap();
+            let pos_gamma = plain.find("GAMMA_BOLD_BODY").unwrap();
+            assert!(
+                pos_beta < pos_alpha && pos_alpha < pos_early && pos_early < pos_gamma,
+                "Footer entries must follow first-reference order (1: beta, 2: alpha, 3: early, 4: gamma): {plain}"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cross_page_repeated_nested_empty_and_self_referencing_footnotes_typeset_cleanly() {
+    let md = [
+        "Page one cites SHARED_P1[^shared], NESTED_OUTER[^outer], EMPTY_NOTE[^empty], and SELF_NOTE[^self].",
+        "",
+        "\\newpage",
+        "",
+        "Page two repeats SHARED_P2[^shared] and cites PAGE_TWO_NEW[^p2new] plus NESTED_INNER_AGAIN[^inner].",
+        "",
+        "[^shared]: SHARED_ENTRY_TEXT",
+        "[^outer]: OUTER_ENTRY_TEXT citing forward[^inner].",
+        "[^inner]: INNER_ENTRY_TEXT",
+        "[^empty]:",
+        "[^self]: SELF_ENTRY_TEXT[^self].",
+        "[^p2new]: PAGE_TWO_ENTRY_TEXT",
+    ].join("\n");
+
+    let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 2);
+    let path = std::env::temp_dir().join(format!("supermd-footnotes-multipage-{}.pdf", std::process::id()));
+    std::fs::write(&path, &pdf).unwrap();
+    if let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+        if require_poppler() {
+            assert!(out.status.success(), "pdftotext must succeed on Linux CI");
+        }
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
+            assert_eq!(pages.len(), 2, "Expected 2 pages: {pages:?}");
+            let flat_p1 = pages[0].split_whitespace().collect::<Vec<_>>().join(" ");
+            let flat_p2 = pages[1].split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat_p1.contains("SHARED_P11,"), "Page 1 first footnote must be 1: {flat_p1}");
+            assert!(flat_p2.contains("SHARED_P21"), "Page 2 repeat of [^shared] must still be numbered 1: {flat_p2}");
+            assert_eq!(text.matches("SHARED_ENTRY_TEXT").count(), 1, "Shared footnote entry must appear once on page 1: {text}");
+            assert!(pages[1].contains("PAGE_TWO_ENTRY_TEXT"), "New page-2 footnote entry must render on page 2: {}", pages[1]);
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn footnote_equation_and_heading_targets_follow_emitted_first_reference_definitions() {
+    let md = [
+        "[^early]: Early footnote referencing \\eqref{eq:body-wins} with its own equation:",
+        "",
+        "    $$",
+        "    a + b = c \\tag{EarlyDup}\\label{eq:body-wins}",
+        "    $$",
+        "",
+        "    $$",
+        "    u = v \\tag{F.1}\\label{eq:in-footnote}",
+        "    $$",
+        "",
+        "# Main Notes",
+        "",
+        "$$",
+        "E = mc^2 \\tag{B.1}\\label{eq:body-wins}",
+        "$$",
+        "",
+        "![Diagram](diagram.svg) cites CITE_EARLY_EQ[^early], repeats CITE_EARLY_EQ_AGAIN[^EARLY], resolves \\eqref{eq:body-wins} and \\eqref{eq:in-footnote}, and ignores omitted \\eqref{eq:unused} / \\eqref{eq:shadowed} / [unused heading](#omitted-heading).",
+        "",
+        "[^early]: Shadowed duplicate definition:",
+        "",
+        "    $$",
+        "    s = 0 \\tag{Shadow}\\label{eq:shadowed}",
+        "    $$",
+        "",
+        "[^unused]:",
+        "    ## Omitted Heading",
+        "",
+        "    $$",
+        "    z = 0 \\tag{Unused}\\label{eq:unused}",
+        "    $$",
+    ].join("\n");
+
+    let mut assets = HashMap::new();
+    assets.insert(
+        "diagram.svg".to_string(),
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"><rect width=\"40\" height=\"20\" fill=\"#cccccc\"/></svg>".to_vec(),
+    );
+
+    let generated = source(&md, &PdfOptions::default(), &assets).unwrap();
+    assert_eq!(generated.matches("]<smd.footnote.1>").count(), 1, "Expected single footnote declaration: {generated}");
+    assert_eq!(generated.matches("#footnote(<smd.footnote.1>)").count(), 1, "Expected repeated footnote label reuse: {generated}");
+    assert!(generated.contains("#link(label(\"smd-eq-eq_3a_body-wins\"))[#text(\"(B.1)\")]"), "Body equation before first footnote citation must win duplicate label: {generated}");
+    assert!(generated.contains("#link(label(\"smd-eq-eq_3a_in-footnote\"))[#text(\"(F.1)\")]"), "Equation defined in cited footnote must resolve: {generated}");
+    assert!(!generated.contains("smd-eq-eq_3a_unused"), "Unused footnote equation must not emit dangling label links: {generated}");
+    assert!(!generated.contains("smd-eq-eq_3a_shadowed"), "Shadowed duplicate footnote equation must not emit dangling label links: {generated}");
+    assert!(!generated.contains("smd-omitted-heading"), "Unused footnote heading must not emit dangling label links: {generated}");
+
+    let pdf = export(&md, &PdfOptions::default(), &assets).unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
+    if require_poppler() {
+        let path = std::env::temp_dir().join(format!("supermd-footnotes-equations-{}.pdf", std::process::id()));
+        std::fs::write(&path, &pdf).unwrap();
+        let out = std::process::Command::new("pdftotext").arg(&path).arg("-").output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(out.status.success(), "pdftotext must succeed on Linux CI");
+        let flat = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("CITE_EARLY_EQ1, repeats CITE_EARLY_EQ_AGAIN1,"), "Repeated footnote citations must both render as 1: {flat}");
+        assert!(flat.contains("resolves (B.1) and (F.1),"), "Body and cited-footnote equation tags must resolve: {flat}");
+        assert!(flat.contains("ignores omitted (??) / (??) / unused heading."), "Omitted footnote targets must stay unresolved without breaking export: {flat}");
+    }
+}
+
+#[test]
+fn nested_footnote_chains_bound_depth_without_stack_overflow_and_preserve_numbering() {
+    let mut valid_chain = Vec::new();
+    for idx in (1..=8).rev() {
+        if idx < 8 {
+            valid_chain.push(format!("[^chain{idx}]: CHAIN_NOTE_{idx:02} citing[^chain{}].", idx + 1));
+        } else {
+            valid_chain.push("[^chain8]: CHAIN_NOTE_08_LEAF cycling[^chain1] and literal[^missing].".to_string());
+        }
+    }
+    valid_chain.push(String::new());
+    valid_chain.push("Lead CHAIN_START[^chain1], repeat CHAIN_MID_REPEAT[^CHAIN4], repeat CHAIN_LEAF_REPEAT[^chain8], and AFTER_CHAIN[^after].".to_string());
+    valid_chain.push(String::new());
+    valid_chain.push("[^after]: AFTER_CHAIN_BODY".to_string());
+    let valid_md = valid_chain.join("\n");
+
+    let valid_src = source(&valid_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(valid_src.matches("]<smd.footnote.").count(), 9, "Expected 9 distinct footnotes: {valid_src}");
+    let valid_pdf = export(&valid_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(valid_pdf.starts_with(b"%PDF-"));
+    if let Ok(out) = {
+        let path = std::env::temp_dir().join(format!("supermd-footnote-chain-valid-{}.pdf", std::process::id()));
+        std::fs::write(&path, &valid_pdf).unwrap();
+        let res = std::process::Command::new("pdftotext").arg(&path).arg("-").output();
+        let _ = std::fs::remove_file(&path);
+        res
+    } {
+        if require_poppler() {
+            assert!(out.status.success(), "pdftotext must succeed on Linux CI");
+        }
+        if out.status.success() {
+            let flat = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("CHAIN_START1, repeat CHAIN_MID_REPEAT4, repeat CHAIN_LEAF_REPEAT8, and AFTER_CHAIN9."), "Expected stable chain numbering: {flat}");
+            assert!(flat.contains("CHAIN_NOTE_08_LEAF cycling1 and literal[^missing]."), "Cycle and undefined reference at max depth must still render: {flat}");
+        }
+    }
+
+    let mut sequential = vec![
+        (1..=48).map(|idx| format!("SEQ_{idx:02}[^seq{idx}]")).collect::<Vec<_>>().join(" "),
+        String::new(),
+    ];
+    for idx in (1..=48).rev() {
+        sequential.push(format!("[^seq{idx}]: SEQ_BODY_{idx:02}"));
+    }
+    let sequential_pdf = export(&sequential.join("\n"), &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(sequential_pdf.starts_with(b"%PDF-"));
+
+    std::thread::Builder::new()
+        .name("pdf-footnote-long-chain".into())
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let chain_len = 2048usize;
+            let mut deep_md = String::from("Lead[^deep0].\n\n");
+            for idx in 0..chain_len {
+                if idx + 1 < chain_len {
+                    deep_md.push_str(&format!("[^deep{idx}]: Step {idx}[^deep{}].\n", idx + 1));
+                } else {
+                    deep_md.push_str(&format!("[^deep{idx}]: Leaf {idx}.\n"));
+                }
+            }
+            let src_err = source(&deep_md, &PdfOptions::default(), &HashMap::new())
+                .expect_err("long nested footnote chain must fail gracefully in source()");
+            assert!(
+                src_err.to_string().contains("Footnote nesting exceeds maximum depth"),
+                "unexpected source() error: {src_err}"
+            );
+            let export_err = export(&deep_md, &PdfOptions::default(), &HashMap::new())
+                .expect_err("long nested footnote chain must fail gracefully in export()");
+            assert!(
+                export_err.to_string().contains("Footnote nesting exceeds maximum depth"),
+                "unexpected export() error: {export_err}"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

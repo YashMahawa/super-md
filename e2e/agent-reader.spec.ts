@@ -787,6 +787,128 @@ test('active-tab agent edit displays dismissible banner and one-tap undo restore
   await expect.poll(()=>page.evaluate(()=>(window as any).__agentNative.content)).toContain('First AI update.');
 });
 
+test('dirty draft coauthoring in current reader survives session restore, undoes back to dirty draft, and saves cleanly',async({page})=>{
+  const diskInitial='# Field Notes\n\nCommitted disk paragraph.\n';
+  await page.addInitScript(seed=>{
+    const key='__supermdDirtyDraftHost';
+    const persisted=window.sessionStorage.getItem(key);
+    const host=persisted?JSON.parse(persisted):{
+      diskContent:seed,
+      saved:seed,
+      content:seed,
+      revision:0,
+      seq:0,
+      agentUnreviewed:false,
+      agentEdits:[] as Array<{seq:number;before:string;after:string}>,
+    };
+    const persist=()=>window.sessionStorage.setItem(key,JSON.stringify(host));
+    persist();
+    (window as any).__dirtyHost=host;
+    (window as any).__saveDirtyHost=()=>{
+      host.diskContent=host.content;
+      host.saved=host.content;
+      host.agentUnreviewed=false;
+      persist();
+    };
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);let result:any=true;
+      if(command==='document_sync'){
+        result={accepted:args.content===host.content,revision:host.revision};
+      }else if(command==='document_patch'){
+        if(args.baseRevision!==host.revision)result={accepted:false,revision:host.revision};
+        else{
+          for(const change of [...args.changes].reverse())host.content=host.content.slice(0,change.from)+change.insert+host.content.slice(change.to);
+          host.revision=args.revision;persist();result={accepted:true,revision:host.revision};
+        }
+      }else if(command==='document_resync'){
+        host.content=args.content;host.revision=0;persist();result={accepted:true,revision:0};
+      }else if(command==='agent_banner_shown'){
+        host.agentUnreviewed=true;
+        if(typeof args.before==='string'&&typeof args.after==='string'&&args.before!==args.after){
+          host.seq+=1;
+          host.agentEdits.push({seq:host.seq,before:args.before,after:args.after});
+        }
+        persist();
+      }else if(command==='agent_banner_dismissed'){
+        host.agentUnreviewed=false;persist();
+      }
+      window.setTimeout(()=>window.supermdReply?.(id,result,null),0);
+    }};
+  },diskInitial);
+
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const baseState={id:'dirty-draft-note',path:'/tmp/FieldNotes.md',mode:'live' as const,dark:false,
+    fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,editProtocol:1,restorePosition:false};
+  await page.evaluate(state=>window.supermdLoad?.({...state,content:(window as any).__dirtyHost.content}),baseState);
+
+  // User edits a Live block to create an unsaved dirty draft while diskContent stays untouched.
+  await page.getByText('Committed disk paragraph.').dblclick();
+  const blockEditor=page.getByRole('textbox',{name:'Edit Markdown block'});
+  await expect(blockEditor).toBeFocused();
+  await blockEditor.press('End');
+  await blockEditor.type(' Unsaved user observation.');
+  await blockEditor.press('Escape');
+  await expect(blockEditor).toBeHidden();
+
+  const expectedDirty='# Field Notes\n\nCommitted disk paragraph. Unsaved user observation.\n';
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.content)).toBe(expectedDirty);
+  expect(await page.evaluate(()=>(window as any).__dirtyHost.diskContent)).toBe(diskInitial);
+
+  // AI coauthors on top of the active dirty draft; native echoes loadReader with pendingAgentEdits.
+  const ctx:any=await agent(page,{action:'get_context',tabId:'dirty-draft-note'});
+  const expectedCoauthored=expectedDirty+'\n## AI Appendix\n\nSynthesized takeaway.\n';
+  await agent(page,{action:'patch_tab',tabId:'dirty-draft-note',expectedRevision:ctx.revision,
+    operations:[{type:'replace',old:'Unsaved user observation.\n',new:'Unsaved user observation.\n\n## AI Appendix\n\nSynthesized takeaway.\n'}]});
+  await expect(page.getByTestId('agent-edit-banner')).toBeVisible();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.agentEdits.length)).toBe(1);
+  await page.evaluate(state=>{
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,content:host.content,contentUnchanged:true,agentUnreviewed:host.agentUnreviewed,pendingAgentEdits:host.agentEdits});
+  },baseState);
+
+  // Cold reload / restore into a brand-new current reader instance before saving to disk.
+  await page.reload();
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(state=>{
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,content:host.content,agentUnreviewed:host.agentUnreviewed,pendingAgentEdits:host.agentEdits});
+  },baseState);
+
+  const restoredBanner=page.getByTestId('agent-edit-banner');
+  await expect(restoredBanner).toBeVisible();
+  await expect(page.getByRole('heading',{name:'AI Appendix',exact:true})).toBeVisible();
+  expect(await page.evaluate(()=>(window as any).__dirtyHost.diskContent)).toBe(diskInitial);
+
+  // One-tap Undo on the restored banner reverts to the user's dirty draft without losing unsaved text!
+  await page.getByTestId('agent-banner-undo').click();
+  await expect(restoredBanner).toBeHidden();
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.content)).toBe(expectedDirty);
+  expect(await page.evaluate(()=>(window as any).__dirtyHost.diskContent)).toBe(diskInitial);
+
+  // Switch to Source mode, Redo back to the coauthored draft, then Save to disk and verify reader stays clean.
+  await page.evaluate(state=>{
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,mode:'editor',content:host.content,contentUnchanged:true,agentUnreviewed:host.agentUnreviewed});
+  },baseState);
+  await expect(page.locator('.cm-content')).toBeVisible();
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect.poll(()=>page.evaluate(()=>(window as any).__dirtyHost.content)).toBe(expectedCoauthored);
+
+  await page.evaluate(state=>{
+    (window as any).__saveDirtyHost();
+    const host=(window as any).__dirtyHost;
+    window.supermdLoad?.({...state,mode:'live',content:host.content,contentUnchanged:true,agentUnreviewed:false});
+  },baseState);
+  await expect(page.locator('.reader-edit-error')).toHaveCount(0);
+  await expect(page.getByRole('heading',{name:'AI Appendix',exact:true})).toBeVisible();
+  expect(await page.evaluate(()=>({
+    disk:(window as any).__dirtyHost.diskContent,
+    saved:(window as any).__dirtyHost.saved,
+    content:(window as any).__dirtyHost.content,
+  }))).toEqual({disk:expectedCoauthored,saved:expectedCoauthored,content:expectedCoauthored});
+});
+
 test('get_context includes displayed frontmatter title, author, and tags while preserving canonical source offsets across scroll positions',async({page})=>{
   const paragraphs=Array.from({length:45},(_,i)=>`Paragraph ${i}: body prose with Unicode 🧭 and canonical offset tracking.`).join('\n\n');
   const content=[

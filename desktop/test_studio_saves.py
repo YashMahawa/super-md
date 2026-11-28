@@ -309,17 +309,28 @@ class StudioSavesTests(unittest.TestCase):
                 self.studio.settings["newNoteLocation"] = str(custom)
 
         refreshes: list[tuple] = []
-        with patch.object(self.studio, "_refresh_open_folder_trees", side_effect=lambda *c: refreshes.append(c)):
-            # In-place save does not refresh folder tree; Save As to new path does across all 3 pipelines.
+        invalidations: list[str] = []
+        with (
+            patch.object(self.studio, "_refresh_open_folder_trees", side_effect=lambda *c: refreshes.append(c)),
+            patch.object(self.studio, "_invalidate_folder_index", side_effect=lambda p=None: invalidations.append(str(p))),
+        ):
+            # In-place save invalidates index on explicit save (not autosave) and skips tree refresh; Save As refreshes across all 3 pipelines.
             target_md = workspace / "First.md"
             self.studio.saveAs(str(target_md))
             self._wait_until(lambda: not self.studio.saving and tab["path"] == str(target_md))
             self.assertEqual(len(refreshes), 1)
+            self.assertIn(str(target_md), invalidations)
 
+            invalidations.clear()
+            tab["content"] = "# Autosaved\n"
+            self.studio._save_text(tab, target_md, automatic=True)
+            self._wait_until(lambda: not self.studio.saving)
+            self.assertEqual(invalidations, [])
             tab["content"] = "# In place\n"
             self.studio._save_text(tab, target_md, automatic=False)
             self._wait_until(lambda: not self.studio.saving)
             self.assertEqual(len(refreshes), 1)
+            self.assertEqual(invalidations, [str(target_md)])
 
             self.studio.settings["newNoteLocation"] = str(workspace)
             self.studio._agent_document_action({
@@ -336,6 +347,13 @@ class StudioSavesTests(unittest.TestCase):
             }))
             self._wait_until(lambda: tab["path"] == str(target_smd) and not self.studio.saving)
             self.assertEqual(len(refreshes), 3)
+
+            self.studio.saveAs(str(target_smd))
+            self.studio.post("ps-same", "export_fmd_native", json.dumps({
+                "id": tab["id"], "save": False, "content": "# Overwritten\n", "originalContent": "# In place\n", "assets": {},
+            }))
+            self._wait_until(lambda: tab["saved"] == "# Overwritten\n" and not self.studio.saving)
+            self.assertEqual(len(refreshes), 4)
 
     def test_preserve_unchanged_assets_3arg_write_portable_and_simplenamespace_unbound_calls(self):
         shared_str = str(SVG_A)

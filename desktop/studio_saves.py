@@ -47,19 +47,26 @@ def _check_dirty(studio_obj, tab: dict, is_dirty_fn=None) -> bool:
     return bool(tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}))
 
 def _refresh_trees(studio_obj, *candidates, refresh_open_folder_trees_fn=None) -> None:
-    if callable(fn := refresh_open_folder_trees_fn or getattr(studio_obj, "_refresh_open_folder_trees", None)):
-        fn(*candidates)
-        return
-    session = getattr(studio_obj, "session", None)
-    for win in (tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (studio_obj,)):
-        folder = getattr(win, "folder", "")
-        if getattr(win, "retired", False) or not folder or not callable(load_tree := getattr(win, "_load_tree", None)): continue
-        for candidate in candidates:
-            try:
-                if candidate and folder_ops.matches_path_prefix(str(candidate), folder, is_directory=True):
-                    load_tree()
-                    break
-            except (OSError, ValueError): pass
+    if callable(fn := refresh_open_folder_trees_fn or getattr(studio_obj, "_refresh_open_folder_trees", None)): fn(*candidates)
+    else:
+        session = getattr(studio_obj, "session", None)
+        for win in (tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (studio_obj,)):
+            folder = getattr(win, "folder", "")
+            if getattr(win, "retired", False) or not folder or not callable(load_tree := getattr(win, "_load_tree", None)): continue
+            for candidate in candidates:
+                try:
+                    if candidate and folder_ops.matches_path_prefix(str(candidate), folder, is_directory=True): load_tree(); break
+                except (OSError, ValueError): pass
+
+def _invalidate_index(studio_obj, target_path, invalidate_folder_index_fn=None) -> None:
+    if callable(fn := invalidate_folder_index_fn or getattr(studio_obj, "_invalidate_folder_index", None)): fn(target_path)
+    elif (session := getattr(studio_obj, "session", None)) is not None:
+        if hasattr(session, "invalidate_workspace_caches"): session.invalidate_workspace_caches(target_path)
+        else:
+            if (idx := getattr(session, "folder_note_index", None)) is not None: idx.invalidate(target_path)
+            if (links := getattr(session, "workspace_links", None)) is not None: links.invalidate(target_path)
+            for win in list(getattr(session, "windows", {}).values()):
+                if not getattr(win, "retired", False) and getattr(win, "_quick_switcher_open", False): win._refresh_quick_switcher_candidates()
 
 def preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
     """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
@@ -93,11 +100,12 @@ def _commit_saved_tab_state(
     studio_obj, target: dict | None, *, path: Path | None, saved_content: str, saved_assets: dict[str, str],
     portable: bool, stamp: tuple[int, int] | None = None, raw_path_str: str = "", updated_content: str | None = None,
     updated_assets: dict[str, str] | None = None, clear_staging: bool = True, add_open_path_when_missing_tab: bool = False,
-    path_changed: bool = False, old_path: str = "", update_recent: bool = False, rearm_autosave: bool = False,
-    message: str | None = None, finish_pending_close: bool = False, clear_agent_staging_fn=None, is_dirty_fn=None,
-    refresh_open_folder_trees_fn=None,
+    path_changed: bool = False, old_path: str = "", invalidate_index: bool = False, refresh_trees: bool | None = None,
+    update_recent: bool = False, rearm_autosave: bool = False, message: str | None = None, finish_pending_close: bool = False,
+    clear_agent_staging_fn=None, is_dirty_fn=None, invalidate_folder_index_fn=None, refresh_open_folder_trees_fn=None,
 ) -> bool:
     path_str = raw_path_str or (str(path) if path is not None else "")
+    path_target = path if not raw_path_str and path is not None else path_str
     if stamp and path_str and (stamps := getattr(studio_obj, "note_file_stamps", None)) is not None: stamps[path_str] = stamp
     is_dirty = False
     if target is not None:
@@ -121,11 +129,12 @@ def _commit_saved_tab_state(
         try: open_paths.add(str(path.resolve()))
         except OSError: pass
     if message is not None: studio_obj.message = message
-    studio_obj._recover()
-    studio_obj._emit()
-    if path_changed and path_str:
-        candidates = (path if not raw_path_str and path is not None else path_str, old_path) if old_path else (path_str,)
-        _refresh_trees(studio_obj, *candidates, refresh_open_folder_trees_fn=refresh_open_folder_trees_fn)
+    studio_obj._recover(); studio_obj._emit()
+    if invalidate_index and path_target and (target is not None or add_open_path_when_missing_tab):
+        _invalidate_index(studio_obj, path_target, invalidate_folder_index_fn)
+        if old_path and path_changed: _invalidate_index(studio_obj, old_path, invalidate_folder_index_fn)
+    if (path_changed if refresh_trees is None else refresh_trees) and path_str:
+        _refresh_trees(studio_obj, *((path_target, old_path) if old_path else (path_str,)), refresh_open_folder_trees_fn=refresh_open_folder_trees_fn)
     if finish_pending_close and getattr(studio_obj, "pending_close", ""): studio_obj._finish_close()
     return is_dirty
 
@@ -317,7 +326,7 @@ def reload_current_from_disk(studio_obj, *, open_note_fn=open_note, snapshot_tab
 def save_text(studio_obj, tab: dict, path: Path, automatic: bool = False, force_overwrite: bool = False,
               force_portable: bool = False, *, open_note_fn=open_note, write_portable_fn=write_portable,
               materialize_assets_fn=materialize_assets, atomic_write_fn=atomic_write, clear_agent_staging_fn=None,
-              is_dirty_fn=None, refresh_open_folder_trees_fn=None) -> None:
+              is_dirty_fn=None, invalidate_folder_index_fn=None, refresh_open_folder_trees_fn=None) -> None:
     tab_id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
     expected, original_path, expected_assets = tab["saved"], tab["path"], dict(tab.get("saved_assets", {}))
     try: same_path = bool(original_path) and Path(path).resolve() == Path(original_path).resolve()
@@ -339,10 +348,11 @@ def save_text(studio_obj, tab: dict, path: Path, automatic: bool = False, force_
         _commit_saved_tab_state(
             studio_obj, target, path=path, saved_content=content, saved_assets=assets, portable=portable,
             stamp=outcome.get("stamp") if isinstance(outcome, dict) else None, clear_staging=not automatic,
-            path_changed=path_changed, old_path=original_path, update_recent=path_changed and target is not None,
-            rearm_autosave=automatic, message="Autosaved" if automatic else "Saved", finish_pending_close=True,
+            path_changed=path_changed, old_path=original_path, invalidate_index=not automatic or path_changed,
+            update_recent=path_changed and target is not None, rearm_autosave=automatic,
+            message="Autosaved" if automatic else "Saved", finish_pending_close=True,
             clear_agent_staging_fn=clear_agent_staging_fn, is_dirty_fn=is_dirty_fn,
-            refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
+            invalidate_folder_index_fn=invalidate_folder_index_fn, refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
         )
     def write():
         if (automatic or (not force_overwrite and same_path)) and _has_disk_conflict(
@@ -410,14 +420,10 @@ def _directory_qurl(studio_obj, attr: str, fallback, name: str | None = None, *,
     target = base if name is None else base / (folder_ops._pure_path(str(name or "")).name or "Untitled.md")
     return QUrl.fromLocalFile(str(target))
 
-def default_save_folder(studio_obj, *, writable_location_fn=_default_writable_location):
-    return _directory_qurl(studio_obj, "_note_save_directory", note_save_directory, writable_location_fn=writable_location_fn)
-def default_save_location(studio_obj, name: str, *, writable_location_fn=_default_writable_location):
-    return _directory_qurl(studio_obj, "_note_save_directory", note_save_directory, name, writable_location_fn=writable_location_fn)
-def default_save_as_folder(studio_obj, *, writable_location_fn=_default_writable_location):
-    return _directory_qurl(studio_obj, "_save_as_directory", save_as_directory, writable_location_fn=writable_location_fn)
-def default_save_as_location(studio_obj, name: str, *, writable_location_fn=_default_writable_location):
-    return _directory_qurl(studio_obj, "_save_as_directory", save_as_directory, name, writable_location_fn=writable_location_fn)
+def default_save_folder(studio_obj, *, writable_location_fn=_default_writable_location): return _directory_qurl(studio_obj, "_note_save_directory", note_save_directory, writable_location_fn=writable_location_fn)
+def default_save_location(studio_obj, name: str, *, writable_location_fn=_default_writable_location): return _directory_qurl(studio_obj, "_note_save_directory", note_save_directory, name, writable_location_fn=writable_location_fn)
+def default_save_as_folder(studio_obj, *, writable_location_fn=_default_writable_location): return _directory_qurl(studio_obj, "_save_as_directory", save_as_directory, writable_location_fn=writable_location_fn)
+def default_save_as_location(studio_obj, name: str, *, writable_location_fn=_default_writable_location): return _directory_qurl(studio_obj, "_save_as_directory", save_as_directory, name, writable_location_fn=writable_location_fn)
 
 def run_prepared_write_sync(studio_obj, prepared):
     tab_id, work, finalize, _abort = prepared
@@ -425,8 +431,7 @@ def run_prepared_write_sync(studio_obj, prepared):
     try: value = work()
     except Exception as error:
         if saving is not None: saving.discard(tab_id)
-        finalize(None, str(error))
-        raise
+        finalize(None, str(error)); raise
     if saving is not None: saving.discard(tab_id)
     return finalize(value, None)
 
@@ -434,8 +439,7 @@ def agent_document_action_async(studio_obj, args: dict, on_complete, *, register
                                 prepare_save_document_fn=None, prepare_replace_tab_asset_fn=None, prepare_attach_tab_asset_fn=None) -> None:
     action = args.get("action")
     if action == "patch_tab":
-        studio_obj._stage_inactive_patch_tab_async(args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled)
-        return
+        studio_obj._stage_inactive_patch_tab_async(args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled); return
     if action == "save_document":
         prepared = (prepare_save_document_fn or prepare_save_document)(studio_obj, args)
     elif action == "replace_tab_asset":
@@ -443,12 +447,10 @@ def agent_document_action_async(studio_obj, args: dict, on_complete, *, register
     elif action == "asset_action" and args.get("assetAction") == "attach":
         prepared = prepare_attach_tab_asset_fn(studio_obj, args) if prepare_attach_tab_asset_fn else studio_obj._prepare_attach_tab_asset(args)
     else:
-        on_complete(studio_obj._agent_document_action(args), None)
-        return
+        on_complete(studio_obj._agent_document_action(args), None); return
     tab_id, work, finalize, abort = prepared
     if studio_obj.retired or getattr(studio_obj.writes, "_shutdown", False):
-        abort()
-        raise ValueError("The target desktop window was closed")
+        abort(); raise ValueError("The target desktop window was closed")
     studio_obj.saving.add(tab_id)
     def handle_done(value, error):
         studio_obj.saving.discard(tab_id)
@@ -458,13 +460,12 @@ def agent_document_action_async(studio_obj, args: dict, on_complete, *, register
         except Exception as failure: on_complete(None, str(failure))
     def handle_retired():
         studio_obj.saving.discard(tab_id)
-        finalize(None, "The target desktop window was closed")
-        on_complete(None, "The target desktop window was closed")
+        finalize(None, "The target desktop window was closed"); on_complete(None, "The target desktop window was closed")
     if not studio_obj._submit_write(work, handle_done, on_retired=handle_retired): abort()
 
 def prepare_save_document(studio_obj, args: dict, *, open_note_fn=open_note, write_portable_fn=write_portable,
-                          materialize_assets_fn=materialize_assets, atomic_write_fn=atomic_write,
-                          clear_agent_staging_fn=None, is_dirty_fn=None, refresh_open_folder_trees_fn=None):
+                          materialize_assets_fn=materialize_assets, atomic_write_fn=atomic_write, clear_agent_staging_fn=None,
+                          is_dirty_fn=None, invalidate_folder_index_fn=None, refresh_open_folder_trees_fn=None):
     tab_id = args.get("tabId")
     if not (tab := next((item for item in studio_obj.tabs if item["id"] == tab_id), None)):
         raise ValueError("Save requires a target tab that is still open")
@@ -503,8 +504,7 @@ def prepare_save_document(studio_obj, args: dict, *, open_note_fn=open_note, wri
         if created_new_path:
             try:
                 cur = resolved_path.stat(follow_symlinks=False)
-                if reservation_identity == (cur.st_dev, cur.st_ino) and cur.st_size == 0 and not resolved_path.is_symlink():
-                    resolved_path.unlink()
+                if reservation_identity == (cur.st_dev, cur.st_ino) and cur.st_size == 0 and not resolved_path.is_symlink(): resolved_path.unlink()
             except OSError: pass
     def abort():
         unlink_reserved()
@@ -519,21 +519,18 @@ def prepare_save_document(studio_obj, args: dict, *, open_note_fn=open_note, wri
             return _write_note_and_stat(resolved_path, content_snapshot, assets_snapshot, portable=fmt == "smd",
                                         write_portable_fn=write_portable_fn, materialize_assets_fn=materialize_assets_fn, atomic_write_fn=atomic_write_fn)
         except Exception:
-            unlink_reserved()
-            raise
+            unlink_reserved(); raise
     def finalize(stamp, error):
-        if error is not None:
-            abort()
-            return None
+        if error is not None: abort(); return None
         path_changed = not old_canonical_path or str(resolved_path) != old_canonical_path
         target = next((item for item in studio_obj.tabs if item["id"] == tab_id), None)
         is_dirty = _commit_saved_tab_state(
             studio_obj, target, path=resolved_path, saved_content=content_snapshot, saved_assets=assets_snapshot,
             portable=fmt == "smd", stamp=stamp, clear_staging=True, add_open_path_when_missing_tab=True,
-            path_changed=path_changed, old_path=old_canonical_path or old_path,
+            path_changed=path_changed, old_path=old_canonical_path or old_path, invalidate_index=path_changed,
             rearm_autosave=bool(getattr(studio_obj, "settings", {}).get("autosave")),
             clear_agent_staging_fn=clear_agent_staging_fn, is_dirty_fn=is_dirty_fn,
-            refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
+            invalidate_folder_index_fn=invalidate_folder_index_fn, refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
         )
         return {"tabId": tab_id, "windowId": studio_obj.window_id, "path": str(resolved_path), "filename": resolved_path.name,
                 "revision": revision, "format": fmt, "isDirty": is_dirty, "pathChanged": path_changed,
@@ -563,7 +560,7 @@ def handle_portable_save_conflict(studio_obj, request_id: str, captured: dict) -
 
 def finalize_portable_tab_save(studio_obj, args: dict, captured: dict, target: dict | None, *, save_as: str, save_as_tab: str,
                                preserve_unchanged_assets_fn=preserve_unchanged_assets, clear_agent_staging_fn=None,
-                               is_dirty_fn=None, refresh_open_folder_trees_fn=None) -> None:
+                               is_dirty_fn=None, invalidate_folder_index_fn=None, refresh_open_folder_trees_fn=None) -> None:
     if args.get("save") and target:
         old_assets = target.get("assets", {})
         if old_assets != args["assets"]: studio_obj.session.reader_assets.revoke_tab(studio_obj.window_id, target["id"])
@@ -574,12 +571,12 @@ def finalize_portable_tab_save(studio_obj, args: dict, captured: dict, target: d
             updated_content=args["content"] if matched else None, updated_assets=merged_assets,
             clear_staging=True, message="Saved", finish_pending_close=True,
             clear_agent_staging_fn=clear_agent_staging_fn, is_dirty_fn=is_dirty_fn,
-            refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
+            invalidate_folder_index_fn=invalidate_folder_index_fn, refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
         )
     elif save_as:
         if save_target := next((t for t in studio_obj.tabs if t["id"] == (save_as_tab or captured["id"])), target):
             old_assets, old_path = save_target.get("assets", {}), save_target.get("path", "")
-            path_changed = old_path != save_as
+            path_changed = not old_path or not folder_ops.same_path(old_path, save_as)
             if old_assets != args["assets"] or path_changed:
                 studio_obj.session.reader_assets.revoke_tab(studio_obj.window_id, save_target["id"])
             merged_assets = args["assets"] if path_changed else preserve_unchanged_assets_fn(old_assets, args["assets"])
@@ -587,8 +584,9 @@ def finalize_portable_tab_save(studio_obj, args: dict, captured: dict, target: d
             _commit_saved_tab_state(
                 studio_obj, save_target, path=Path(save_as), raw_path_str=save_as, saved_content=args["content"],
                 saved_assets=merged_assets, portable=True, updated_content=new_content, updated_assets=merged_assets,
-                clear_staging=True, path_changed=path_changed, old_path=old_path, update_recent=True,
-                message="Saved", finish_pending_close=True, clear_agent_staging_fn=clear_agent_staging_fn,
-                is_dirty_fn=is_dirty_fn, refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
+                clear_staging=True, path_changed=path_changed, old_path=old_path, invalidate_index=True,
+                refresh_trees=True, update_recent=True, message="Saved", finish_pending_close=True,
+                clear_agent_staging_fn=clear_agent_staging_fn, is_dirty_fn=is_dirty_fn,
+                invalidate_folder_index_fn=invalidate_folder_index_fn, refresh_open_folder_trees_fn=refresh_open_folder_trees_fn,
             )
         studio_obj.pending_save_as = studio_obj.pending_save_as_tab = ""
