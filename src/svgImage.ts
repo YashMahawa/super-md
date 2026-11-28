@@ -10,6 +10,7 @@ export type ValidatedSvg = {
   readonly root: Element;
   readonly nodes: Element[];
   readonly backing: SvgBackdrop;
+  readonly dimensions: SvgDimensions | null;
   readonly checkSerializedLength: boolean;
   serialized?: string;
 };
@@ -137,10 +138,12 @@ export function parseValidatedSvg(source: string): ValidatedSvg {
   if (Array.from(root.querySelectorAll("style")).some(style => DISALLOWED_SVG_URL.test(style.textContent || "") || /@import/i.test(style.textContent || ""))) throw new Error("External SVG styles are not allowed.");
   if (!root.hasAttribute("xmlns")) root.setAttribute("xmlns", SVG_NAMESPACE);
   const serialized = markup.length > 950_000 || markup.includes("<!ENTITY") ? serializeSvgRoot(root) : undefined;
+  const oversized = source.length > 1_000_000 || (serialized !== undefined && serialized.length > 1_000_000);
   return {
     root,
     nodes,
     backing: serialized && serialized.length > 1_000_000 ? "#fdfdfc" : contrastBackdropForRoot(root, nodes),
+    dimensions: oversized ? null : svgDimensionsFromRoot(root),
     checkSerializedLength: markup.length > 160_000 || serialized !== undefined,
     serialized,
   };
@@ -209,4 +212,90 @@ export function presentValidatedSvg(validated: ValidatedSvg, ink: string, option
 
 export function presentSvg(source: string, ink: string): SvgPresentation {
   return presentValidatedSvg(parseValidatedSvg(source), ink, { clone: false });
+}
+
+export type SvgDimensions = {
+  readonly width: number;
+  readonly height: number;
+  readonly engine?: "pele" | "mermaid";
+};
+
+const SVG_LENGTH_UNITS: Record<string, number> = {
+  "": 1,
+  px: 1,
+  pt: 96 / 72,
+  pc: 16,
+  in: 96,
+  cm: 96 / 2.54,
+  mm: 96 / 25.4,
+  q: 96 / 101.6,
+};
+
+function parseSvgCssPixels(raw: string | null | undefined): number | null {
+  if (!raw || raw.length > 64) return null;
+  const match = raw.trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*(px|pt|pc|mm|cm|in|q)?$/i);
+  if (!match) return null;
+  const value = Number(match[1]) * SVG_LENGTH_UNITS[(match[2] || "").toLowerCase()];
+  return Number.isFinite(value) && value > 0 && value <= 100_000 ? value : null;
+}
+
+function parseInlineStyleLength(style: string | null, property: "width" | "height"): number | null {
+  if (!style || style.length > 10_000) return null;
+  let found: number | null = null;
+  for (const decl of style.split(";")) {
+    const colon = decl.indexOf(":");
+    if (colon < 0 || decl.slice(0, colon).trim().toLowerCase() !== property) continue;
+    found = parseSvgCssPixels(decl.slice(colon + 1).replace(/!important\s*$/i, "").trim());
+  }
+  return found;
+}
+
+/** Extract intrinsic CSS-pixel dimensions from a parsed <svg> root element. */
+export function svgDimensionsFromRoot(root: Element): SvgDimensions | null {
+  if (root.localName !== "svg") return null;
+  const style = root.getAttribute("style");
+  const attrWidth = parseSvgCssPixels(root.getAttribute("width")) ?? parseInlineStyleLength(style, "width");
+  const attrHeight = parseSvgCssPixels(root.getAttribute("height")) ?? parseInlineStyleLength(style, "height");
+  const rawBox = root.getAttribute("viewBox")?.trim();
+  const boxParts = rawBox && rawBox.length <= 256 ? rawBox.split(/[\s,]+/).map(Number) : null;
+  const validBox = boxParts && boxParts.length === 4 && boxParts.every(Number.isFinite) && boxParts[2] > 0 && boxParts[3] > 0
+    ? { width: boxParts[2], height: boxParts[3] }
+    : null;
+
+  let width: number | null = null;
+  let height: number | null = null;
+  if (attrWidth !== null && attrHeight !== null) {
+    width = attrWidth;
+    height = attrHeight;
+  } else if (attrWidth !== null && validBox) {
+    width = attrWidth;
+    height = (attrWidth * validBox.height) / validBox.width;
+  } else if (attrHeight !== null && validBox) {
+    width = (attrHeight * validBox.width) / validBox.height;
+    height = attrHeight;
+  } else if (validBox) {
+    const major = Math.max(validBox.width, validBox.height);
+    const scale = major < 64 ? 240 / major : 1;
+    width = validBox.width * scale;
+    height = validBox.height * scale;
+  }
+  if (width === null || height === null || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+  const rawEngine = root.getAttribute("data-diagram-engine");
+  const engine = rawEngine === "pele" || rawEngine === "mermaid" ? rawEngine : undefined;
+  return engine ? { width, height, engine } : { width, height };
+}
+
+export function svgSizingStyle(dimensions: SvgDimensions | null | undefined): Record<string, string> | undefined {
+  if (!dimensions) return undefined;
+  const maxWidth = Math.round(dimensions.width * 100) / 100;
+  const aspect = dimensions.width / dimensions.height;
+  const panFloor = dimensions.engine || aspect >= 2
+    ? Math.max(0, Math.round(Math.min(dimensions.width * 0.8, dimensions.width - 200, dimensions.engine ? Infinity : aspect * 360)))
+    : 0;
+  return {
+    "--svg-width": `${maxWidth}px`,
+    "--svg-min-width": `${panFloor}px`,
+  };
 }
