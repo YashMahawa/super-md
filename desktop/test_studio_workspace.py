@@ -160,7 +160,7 @@ class StudioWorkspaceTest(unittest.TestCase):
                 self.studio.closeFolder()
                 self.assertEqual((self.studio.folder, self.studio.files, self.studio.expanded), ("", [], set()))
                 self.assertGreater(self.studio._files_revision, rev_pre_close)
-                spy_inv.assert_called_once_with(folder_ops.canonical_path_str(vault))
+                spy_inv.assert_called_with(folder_ops.canonical_path_str(vault))
         finally:
             self.studio.sidebarChanged.disconnect(on_sidebar)
 

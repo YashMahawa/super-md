@@ -25,13 +25,17 @@ if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--tls-probe
         "verifyRequired": context.verify_mode == ssl.CERT_REQUIRED,
     }), encoding="utf-8")
     sys.exit(0)
+ENGINE_COMMANDS = (
+    "read", "inspect", "assets", "extract", "unpack", "pack",
+    "export", "export-json", "doctor", "validate-theme",
+)
+
 if __name__ == "__main__":
     from graphics_runtime import configure, probe
     if len(sys.argv) > 1 and sys.argv[1] == "--graphics-probe":
         sys.exit(probe(Path(sys.argv[2]) if len(sys.argv) > 2 else None))
     # CLI/identity queries never need a display or a graphics probe.
-    commands = {"read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme",
-                "--version", "--help", "-h"}
+    commands = {*ENGINE_COMMANDS, "--version", "--help", "-h"}
     if len(sys.argv) == 1 or sys.argv[1] not in commands:
         configure(safe="--safe-graphics" in sys.argv)
 from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal, QPointF
@@ -67,7 +71,7 @@ class StudioApplication(QApplication):
         return super().event(event)
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme"):
+    if len(sys.argv) > 1 and sys.argv[1] in ENGINE_COMMANDS:
         executable = "smd-engine.exe" if sys.platform == "win32" else "smd-engine"
         candidates = (ROOT / "desktop" / executable, ROOT / "smd-core/target/release" / executable,
                       ROOT / "smd-core/target/debug" / executable)
