@@ -11,15 +11,16 @@ export function useWindowing():boolean {
 export interface WindowHeading {id:string;key:string}
 export default function WindowedBlock({enabled,estimate=120,text="",headings=[],blockRef,children,...props}:{enabled:boolean;estimate?:number;text?:string;headings?:WindowHeading[];blockRef?:RefObject<HTMLElement|null>;children:ReactNode}&HTMLAttributes<HTMLElement>) {
   const supported=useWindowing(),active=enabled&&supported;
-  const [shown,setShown]=useState(!active),[reserved,setReserved]=useState(false),height=useRef(estimate),measuredBefore=useRef(false),element=useRef<HTMLElement>(null);
+  const [shown,setShown]=useState(!active),[reserved,setReserved]=useState(false),height=useRef(estimate),measuredBefore=useRef(false),element=useRef<HTMLElement>(null),mountedRef=useRef(!active);
+  mountedRef.current=shown;
   const setNodeRef=(node:HTMLElement|null)=>{element.current=node;if(blockRef)blockRef.current=node;};
   useEffect(()=>{
     const node=element.current;if(!node||!active)return;
     const unregister=registerWindowedText(node,text);
-    const show=()=>{if(node.dataset.windowedMounted!=='true')setReserved(measuredBefore.current);setShown(true);};
+    const show=()=>{if(mountedRef.current&&node.dataset.windowedMounted==='true')return false;if(node.dataset.windowedMounted!=='true')setReserved(measuredBefore.current);mountedRef.current=true;setShown(true);return true;};
     const reveal=()=>{preserveWindowedScroll(node);show();};node.addEventListener('supermd-reveal-window',reveal);node.addEventListener('focusin',reveal);
     let near=false;
-    const release=(preserve=true)=>{if(!near&&!node.contains(document.activeElement)&&!window.getSelection()?.containsNode(node,true)&&!node.querySelector('[data-output-pinned="true"]')){
+    const release=(preserve=true)=>{if(!mountedRef.current)return false;if(!near&&!node.contains(document.activeElement)&&!window.getSelection()?.containsNode(node,true)&&!node.querySelector('[data-output-pinned="true"]')){
       // ResizeObserver may not have delivered the last expanded size yet.
       // Cache layout units before removing children, including at CSS zoom.
       if(node.dataset.windowedMounted==='true'){
@@ -27,17 +28,17 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
         const measured=node.getBoundingClientRect().height/scale;
         if(measured>0){height.current=measured;measuredBefore.current=true;}
       }
-      if(preserve)preserveWindowedScroll(node);setShown(false);
-    }};
+      if(preserve)preserveWindowedScroll(node);mountedRef.current=false;setShown(false);return true;
+    }return false;};
     let focusReleaseTimer=0;
-    const focusout=(event:FocusEvent)=>{if(event.relatedTarget instanceof Node&&node.contains(event.relatedTarget))return;window.clearTimeout(focusReleaseTimer);focusReleaseTimer=window.setTimeout(release,0);};
+    const focusout=(event:FocusEvent)=>{if(event.relatedTarget instanceof Node&&node.contains(event.relatedTarget))return;window.clearTimeout(focusReleaseTimer);focusReleaseTimer=window.setTimeout(()=>{release();},0);};
     node.addEventListener('focusout',focusout);
-    const outputStored=()=>release();node.addEventListener('supermd-output-stored',outputStored);
+    const outputStored=()=>{release();};node.addEventListener('supermd-output-stored',outputStored);
     const unobserve=observeSharedIntersection(node,entry=>{
       near=entry.isIntersecting;
-      if(entry.isIntersecting)show();
-      else release(false);
-    },{root:node.closest('.android-reading'),rootMargin:'900px 0px'},commitWindowedLayout);
+      if(entry.isIntersecting)return show();
+      return release(false);
+    },{root:node.closest('.android-reading,.reading-scroll'),rootMargin:'900px 0px'},commitWindowedLayout);
     return()=>{window.clearTimeout(focusReleaseTimer);unobserve();unregister();node.removeEventListener('supermd-reveal-window',reveal);node.removeEventListener('focusin',reveal);node.removeEventListener('focusout',focusout);node.removeEventListener('supermd-output-stored',outputStored);};
   },[active,text]);
   useLayoutEffect(()=>{
@@ -55,7 +56,7 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
     const observer=new ResizeObserver(entries=>{const measured=entries[0].borderBoxSize?.[0]?.blockSize??entries[0].contentRect.height;if(measured>0)height.current=measured;});observer.observe(node);
     const headingsInBlock=node.querySelectorAll<HTMLElement>('[data-heading-key]');
     headings.forEach((heading,i)=>{if(headingsInBlock[i])headingsInBlock[i].id=heading.id;});
-    node.closest('.android-reading')?.dispatchEvent(new Event('supermd-window-change'));
+    node.closest('.android-reading,.reading-scroll')?.dispatchEvent(new Event('supermd-window-change'));
     return()=>observer.disconnect();
   },[active,shown,headings]);
   if(!active)return <section {...props} ref={setNodeRef}>{children}</section>;

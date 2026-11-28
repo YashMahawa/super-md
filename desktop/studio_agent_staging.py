@@ -15,6 +15,7 @@ else:
 
 MAX_AGENT_EDIT_STEPS = 60
 MAX_AGENT_EDIT_BYTES = 2_000_000
+MAX_SINGLE_AGENT_EDIT_BYTES = 4_000_000
 MAX_PATCH_OPERATIONS = 100
 MAX_PATCH_PAYLOAD_BYTES = 64_000
 
@@ -177,9 +178,11 @@ def _evaluate_stage_attempt_outcome(
 
 def bound_agent_edits(edits: list[dict]) -> list[dict]:
     bounded = list(edits[-MAX_AGENT_EDIT_STEPS:])
-    while len(bounded) > 1 and sum(len(it["before"].encode("utf-8")) + len(it["after"].encode("utf-8")) for it in bounded) > MAX_AGENT_EDIT_BYTES:
+    def _total_bytes(items: list[dict]) -> int:
+        return sum(len(it["before"].encode("utf-8")) + len(it["after"].encode("utf-8")) for it in items)
+    while len(bounded) > 1 and _total_bytes(bounded) > MAX_AGENT_EDIT_BYTES:
         bounded.pop(0)
-    return bounded
+    return bounded if _total_bytes(bounded) <= MAX_SINGLE_AGENT_EDIT_BYTES else []
 
 def append_agent_edit(studio_obj, tab: dict, before: str, after: str, *, bound_agent_edits_fn=None) -> None:
     edits = list(tab.get("agent_edits") or [])
@@ -188,7 +191,7 @@ def append_agent_edit(studio_obj, tab: dict, before: str, after: str, *, bound_a
     tab["agent_edits"] = (getattr(studio_obj, "_bound_agent_edits", None) or bound_agent_edits_fn or bound_agent_edits)(edits)
 
 def activate_tab_state(studio_obj, tab: dict | None) -> None:
-    if tab is None:
+    if not tab:
         return
     if getattr(studio_obj, "_agent_jump_tab_id", "") == tab["id"]:
         studio_obj._agent_jump_tab_id = ""
@@ -198,7 +201,7 @@ def activate_tab_state(studio_obj, tab: dict | None) -> None:
             studio_obj.autosave_timer.start(900)
 
 def clear_agent_staging(studio_obj, tab: dict | None) -> None:
-    if tab is None:
+    if not tab:
         return
     tab["agent_staged"] = False
     tab["agent_unreviewed"] = False

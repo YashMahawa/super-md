@@ -111,6 +111,7 @@ class StudioAgentStagingUnitTests(unittest.TestCase):
         oversized = [{"seq": 1, "before": chunk, "after": chunk}, {"seq": 2, "before": chunk, "after": chunk}, {"seq": 3, "before": "s", "after": "t"}]
         self.assertEqual([item["seq"] for item in Studio._bound_agent_edits(oversized)], [2, 3])
         self.assertEqual(len(Studio._bound_agent_edits([{"seq": 9, "before": chunk * 2, "after": chunk * 2}])), 1)
+        self.assertEqual(Studio._bound_agent_edits([{"seq": 10, "before": chunk * 4, "after": chunk * 4}]), [])
 
         proxy = SimpleNamespace(_agent_edit_seq=2)
         tab = {"agent_edits": [{"seq": 10, "before": "v0", "after": "v1"}]}
@@ -138,7 +139,9 @@ class StudioAgentStagingUnitTests(unittest.TestCase):
         staged_tab = {"id": "tab-bg", "agent_staged": True, "agent_unreviewed": True}
         Studio._clear_agent_staging(clear_proxy, staged_tab)
         self.assertEqual((staged_tab["agent_staged"], staged_tab["agent_unreviewed"], clear_proxy._agent_jump_tab_id), (False, False, ""))
+        Studio._activate_tab_state(proxy, {})
         Studio._clear_agent_staging(clear_proxy, None)
+        Studio._clear_agent_staging(clear_proxy, {})
 
     def test_agent_connection_and_jump_snapshots_and_dismiss_agent_jump(self):
         emits: list[bool] = []
