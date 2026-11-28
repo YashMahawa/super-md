@@ -957,9 +957,13 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         onDispose { model.requestSaveAs = null }
     }
     DisposableEffect(web, readerReady, model) {
-        model.requestPortableWrite = if (readerReady && web != null) { saveInPlace ->
+        model.requestPortableWrite = if (readerReady && web != null) { request ->
             model.busy(true)
-            web?.evaluateJavascript("window.supermdPortable?.($saveInPlace)", null)
+            val options = JSONObject()
+                .put("id", request.noteId)
+                .put("localAssets", org.json.JSONArray(request.localAssets))
+                .put("omitLocalAssets", true)
+            web?.evaluateJavascript("window.supermdPortable?.(${request.save},$options)", null)
             true
         } else null
         onDispose { model.requestPortableWrite = null }
@@ -1025,6 +1029,13 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
                 }
                 payload.put("readingLocation",model.readingLocation(note.uri))
+                payload.put(
+                    "localAssets",
+                    org.json.JSONArray(
+                        if (note.portable && note.assetDirectory != null) model.bundlePortableAssetKeys(note.assetDirectory)
+                        else emptyList<String>(),
+                    ),
+                )
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 if (matchingSeed != null) {
                     val seededJson = JSONObject()
