@@ -1605,194 +1605,38 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } finally {if(locked)closedNoteMutex.unlock()}
     }
     fun requestClose(id: String) {
-        openRequests.invalidate()
-        viewModelScope.launch { executeClose(id, confirmIfRequired = true) }
+        tabCloseCoordinator.requestClose(id)
     }
-    fun dismissCloseConfirmation() {
-        closeAfterSaveNoteId = null
-        mutable.value = mutable.value.copy(pendingCloseNoteId = null)
-    }
-    fun resolveCloseConfirmation(choice: String) {
-        val id = mutable.value.pendingCloseNoteId ?: return
-        mutable.value = mutable.value.copy(pendingCloseNoteId = null)
-        when (choice) {
-            "discard" -> {
-                closeAfterSaveNoteId = null
-                close(id, discardChanges = true)
+    private lateinit var tabCloseCoordinatorCache: TabCloseCoordinator
+    private val tabCloseCoordinator: TabCloseCoordinator
+        get() = if (::tabCloseCoordinatorCache.isInitialized) tabCloseCoordinatorCache else synchronized(this) {
+            if (!::tabCloseCoordinatorCache.isInitialized) {
+                tabCloseCoordinatorCache = TabCloseCoordinator(
+                    scope = viewModelScope, media = media, openRequests = openRequests,
+                    closedNoteMutex = closedNoteMutex, documentWrites = documentWrites,
+                    closedNoteStore = closedNoteStore, closingNoteIds = closingNoteIds,
+                    readClosedNoteRefs = { closedNoteRefs }, writeClosedNoteRefs = { closedNoteRefs = it },
+                    setCloseAfterSaveNoteId = { closeAfterSaveNoteId = it },
+                    saveClosedNoteIndex = ::saveClosedNoteIndex,
+                    readState = { mutable.value }, writeState = { mutable.value = it }, change = ::change,
+                    performCurrentReaderBarrier = ::performCurrentReaderBarrier,
+                    readerBarrierFailed = ::readerBarrierFailed,
+                    awaitReaderSnapshot = { awaitReaderSnapshot(it) },
+                    saveManual = { saveManual(noteId = it) },
+                    removeReaderEcho = { readerEcho.remove(it) },
+                    clearReaderEditProtocol = ::clearReaderEditProtocol,
+                    removeAutosavePending = { autosavePending.remove(it) },
+                    removeSavedPortableAssets = { savedPortableAssets.remove(it) },
+                )
             }
-            "save" -> {
-                closeAfterSaveNoteId = id
-                saveManual(noteId = id)
-            }
-            else -> closeAfterSaveNoteId = null
+            tabCloseCoordinatorCache
         }
-    }
-    private fun isDiscardableEmptyTab(note: Note): Boolean =
-        note.uri == null && note.content.isBlank() && (
-            note.assetDirectory == null ||
-                (!note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false))
-        )
-    private fun discardEmptyTab(id: String) {
-        readerEcho.remove(id)
-        clearReaderEditProtocol(id)
-        autosavePending.remove(id)
-        savedPortableAssets.remove(id)
-        change { state ->
-            val remaining = state.tabs.filterNot { it.id == id }
-            val next = remaining.ifEmpty { listOf(Note()) }
-            state.copy(
-                tabs = next,
-                activeId = if (state.active.id == id) next.first().id else state.activeId,
-                conflictedTabIds = state.conflictedTabIds - id,
-                pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
-                pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
-                message = "Empty tab discarded",
-            )
-        }
-    }
-    fun close(id: String, expectedRevision: String? = null, refuseDirty: Boolean = false, discardChanges: Boolean = false, onComplete: ((String?) -> Unit)? = null) {
-        openRequests.invalidate()
-        viewModelScope.launch {
-            executeClose(
-                id = id,
-                expectedRevision = expectedRevision,
-                refuseDirty = refuseDirty,
-                discardChanges = discardChanges,
-                confirmIfRequired = false,
-                onComplete = onComplete,
-            )
-        }
-    }
-    private suspend fun executeClose(
-        id: String,
-        expectedRevision: String? = null,
-        refuseDirty: Boolean = false,
-        discardChanges: Boolean = false,
-        confirmIfRequired: Boolean = false,
-        onComplete: ((String?) -> Unit)? = null,
-    ) {
-        var previousActiveId = ""
-        var requestedConfirmation = false
-        var preserve = false
-        var revisionError: String? = null
-        var closeError: String? = null
-        val accepted = performCurrentReaderBarrier { currentActiveId ->
-            previousActiveId = currentActiveId
-            val note = mutable.value.tabs.find { it.id == id } ?: return@performCurrentReaderBarrier
-            if (confirmIfRequired && note.requiresCloseConfirmation) {
-                change { state -> state.copy(activeId = if (state.tabs.any { it.id == id }) id else state.activeId, pendingCloseNoteId = id) }
-                requestedConfirmation = true
-                return@performCurrentReaderBarrier
-            }
-            if (expectedRevision != null && !agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) {
-                revisionError = "Revision conflict: the note changed since the supplied revision; it remains open"
-                return@performCurrentReaderBarrier
-            }
-            if (refuseDirty && note.dirty && !discardChanges) {
-                closeError = "The note has unsaved changes. Set options.discardChanges=true to close it; Android will retain its recovery copy."
-                return@performCurrentReaderBarrier
-            }
-            if (!closingNoteIds.add(id)) return@performCurrentReaderBarrier
-            if (isDiscardableEmptyTab(note)) {
-                discardEmptyTab(id)
-                closingNoteIds.remove(id)
-            } else preserve = true
-        }
-        if (!accepted) {
-            readerBarrierFailed()
-            onComplete?.invoke("The note draft could not be synchronized before closing")
-            return
-        }
-        if (requestedConfirmation) {
-            onComplete?.invoke(null)
-            return
-        }
-        if (revisionError != null) { onComplete?.invoke(revisionError); return }
-        if (closeError != null) { onComplete?.invoke(closeError); return }
-        if (preserve) closeAfterReaderBarrier(id)
-        val afterClose = mutable.value
-        if (afterClose.tabs.any { it.id == id }) {
-            onComplete?.invoke("The note could not be closed; it remains open")
-            return
-        }
-        if (afterClose.active.id != previousActiveId && !awaitReaderSnapshot(afterClose.active.id)) {
-            val message = "The note was closed and preserved, but the active reader is still loading; refresh the tabs before the next action."
-            mutable.value = mutable.value.copy(message = message)
-            onComplete?.invoke(message)
-            return
-        }
-        onComplete?.invoke(null)
-    }
-
-    private suspend fun closeAfterReaderBarrier(id: String) {
-        var locked = false
-        var documentLocked = false
-        try {
-            closedNoteMutex.lock(); locked = true
-            // Serialize the latest acknowledged snapshot with manual/automatic
-            // document writes. The reader barrier completed before this lock.
-            documentWrites.lock(); documentLocked = true
-            val noteToClose = mutable.value.tabs.find { it.id == id } ?: return
-            if (isDiscardableEmptyTab(noteToClose)) {
-                discardEmptyTab(id)
-                return
-            }
-            val reference = withContext(Dispatchers.IO) { closedNoteStore.save(noteToClose) }
-            if (mutable.value.tabs.find { it.id == id } != noteToClose) {
-                mutable.value = mutable.value.copy(message = "The note changed while it was closing. It remains open with the latest text.")
-                return
-            }
-            val previousRefs = withContext(Dispatchers.IO) { closedNoteStore.loadIndexStrict() }
-            val nextRefs = (listOf(reference) + previousRefs.filterNot { it.id == id }).take(ClosedNoteStore.LIMIT)
-            try {
-                withContext(Dispatchers.IO) {
-                    saveClosedNoteIndex(nextRefs)
-                    closedNoteRefs = nextRefs
-                }
-            } catch (error: Exception) {
-                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
-                    closedNoteStore.deleteUnindexedSnapshot(reference)
-                }
-                mutable.value = mutable.value.copy(message = "Could not update closed-note recovery: ${error.message}")
-                return
-            }
-            if (mutable.value.tabs.find { it.id == id } != noteToClose) {
-                val rolledBack = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
-                    runCatching { saveClosedNoteIndex(previousRefs) }.isSuccess
-                }
-                if (rolledBack) {
-                    closedNoteRefs = previousRefs
-                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
-                        closedNoteStore.deleteUnindexedSnapshot(reference)
-                    }
-                } else {
-                    closedNoteRefs = nextRefs
-                }
-                mutable.value = mutable.value.copy(message = "The note changed while it was closing. It remains open with the latest text.")
-                return
-            }
-            readerEcho.remove(id)
-            clearReaderEditProtocol(id)
-            autosavePending.remove(id)
-            change { state ->
-                val remaining = state.tabs.filterNot { it.id == id }
-                val next = remaining.ifEmpty { listOf(Note()) }
-                state.copy(tabs = next, closedTabs = (listOf(reference.placeholder()) + state.closedTabs.filterNot { it.id == id }).take(ClosedNoteStore.LIMIT),
-                    activeId = if (state.active.id == id) next.first().id else state.activeId,
-                    conflictedTabIds = state.conflictedTabIds - id,
-                    pendingCloseNoteId = state.pendingCloseNoteId?.takeUnless { it == id },
-                    pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
-                    message = "Tab closed. Reopen from the menu to recover edits.")
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            mutable.value = mutable.value.copy(message = "Could not preserve the closed note: ${error.message}")
-        } finally {
-            closingNoteIds.remove(id)
-            if (documentLocked) documentWrites.unlock()
-            if (locked) closedNoteMutex.unlock()
-        }
+    fun dismissCloseConfirmation() = tabCloseCoordinator.dismissCloseConfirmation()
+    fun resolveCloseConfirmation(choice: String) = tabCloseCoordinator.resolveCloseConfirmation(choice)
+    fun close(id: String, expectedRevision: String? = null, refuseDirty: Boolean = false, discardChanges: Boolean = false, onComplete: ((String?) -> Unit)? = null) =
+        tabCloseCoordinator.close(id, expectedRevision, refuseDirty, discardChanges, onComplete)
+    internal suspend fun closeAfterReaderBarrier(id: String) {
+        tabCloseCoordinator.closeAfterReaderBarrier(id)
     }
     fun reopen() {
         openRequests.invalidate()
