@@ -95,25 +95,11 @@ internal class FolderSearchController(
         val previous = folderSearchMutable.value
         val visible = previous.visible
         val flushBeforeTextScan = visible && previous.mode == FolderSearchMode.FILES && mode == FolderSearchMode.TEXT
-        if (query.isEmpty()) {
-            folderSearchMutable.value = FolderSearchState(
-                visible = visible,
-                mode = mode,
-                query = "",
-                caseSensitive = caseSensitive,
-                includeDiagrams = includeDiagrams,
-                scanning = false,
-            )
+        if (query.isEmpty() || !visible) {
+            folderSearchMutable.value = FolderSearchState(visible = visible, mode = mode, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams, scanning = false)
             return
         }
-        folderSearchMutable.value = FolderSearchState(
-            visible = visible,
-            mode = mode,
-            query = query,
-            caseSensitive = caseSensitive,
-            includeDiagrams = includeDiagrams,
-            scanning = true,
-        )
+        folderSearchMutable.value = FolderSearchState(visible = visible, mode = mode, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams, scanning = true)
         folderSearchJob = scope.launch {
             if (flushBeforeTextScan) flushActiveIfNeeded()
             runFolderSearchScan(query, caseSensitive, includeDiagrams, mode)

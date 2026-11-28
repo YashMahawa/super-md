@@ -2148,6 +2148,9 @@ class Studio(QObject):
         if prev_mode != "text" and self._folder_search_mode == "text" and self.ready and self.tabs and not self.flush_operation:
             self._folder_search_tabs_sig = None
             self._flush("sync_for_search")
+        elif self._folder_search_mode == "files" and self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
+            self.flush_operation = None
+            self.flush_timer.stop()
         if pending and self._folder_search_query.strip():
             self._cancel_folder_search(close=False)
             self._folder_search_pending = True

@@ -55,6 +55,26 @@ def _wait_until(predicate, timeout: float = 5.0) -> bool:
     return bool(predicate())
 
 
+_PROBE_DARWIN_EXIT_ANCHOR: list[object] = []
+
+
+def _teardown_webengine_probe(*, app, session, studio, engine, window, bundle_handler) -> None:
+    studio.stop()
+    studio._search_pool.shutdown(wait=True, cancel_futures=True)
+    studio.pool.shutdown(wait=True, cancel_futures=True)
+    session.writes.shutdown(wait=True)
+    if sys.platform == "darwin":  # Avoid QtWebEngineProcess Mach-port hang on headless macOS exit (see desktop/main.py).
+        _PROBE_DARWIN_EXIT_ANCHOR[:] = [app, session, studio, engine, window, bundle_handler]
+        return
+    from PySide6.QtWebEngineCore import QWebEngineProfile
+    window.setProperty("intentionalShutdown", True)
+    window.setProperty("closingAllowed", True)
+    window.close()
+    engine.deleteLater()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(bundle_handler)
+
+
 def _webengine_e2e_probe() -> int:
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     os.environ["QT_QUICK_BACKEND"] = "software"
@@ -210,11 +230,15 @@ def _webengine_e2e_probe() -> int:
         assert mode_group is not None and diagrams_btn is not None
         mode_group.chosen.emit("files")
         assert _wait_until(lambda: studio.folderSearchState["mode"] == "files" and not bool(diagrams_btn.property("enabled")))
+        window.raise_()
         window.requestActivate()
+        QTest.qWaitForWindowActive(window, 1000)
         search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus for Files mode"
         search_input.setProperty("text", "alpha")
         assert _wait_until(
             lambda: not studio.folderSearchState["scanning"]
+            and not bool(search_dialog.property("queryPending"))
             and [m["name"] for m in studio.folderSearchState["matches"]] == ["alpha.md"],
             timeout=10.0,
         ), f"Expected Files-mode match for alpha.md, got {studio.folderSearchState}"
@@ -223,7 +247,9 @@ def _webengine_e2e_probe() -> int:
             QTest.qWait(80)
             Path(screenshot_path).parent.mkdir(parents=True, exist_ok=True)
             window.grabWindow().save(screenshot_path)
+        window.requestActivate()
         search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput lost focus before Files-mode Return"
         QTest.keyClick(window, Qt.Key.Key_Return)
         assert _wait_until(
             lambda: not bool(search_dialog.property("visible")) and studio._current()["name"] == "alpha.md" and studio.ready,
@@ -231,10 +257,11 @@ def _webengine_e2e_probe() -> int:
         ), f"Return in Files mode did not open alpha.md: current={studio._current()['name']!r}"
         assert _wait_until(
             lambda: eval_reader(
-                "({open: !!document.querySelector('.reading-search'),"
+                "({loaded: (document.body?.textContent || '').includes('Plain markdown paragraph.'),"
+                " open: !!document.querySelector('.reading-search'),"
                 " highlighted: typeof CSS !== 'undefined' && CSS.highlights?.has('smd-search')})"
             ).get("value")
-            == {"open": False, "highlighted": False},
+            == {"loaded": True, "open": False, "highlighted": False},
             timeout=10.0,
         ), "Expected Files-mode match activation to open alpha.md without arming ReadingSearch"
 
@@ -310,14 +337,9 @@ def _webengine_e2e_probe() -> int:
         ), f"Expected hidden URL hit status 'In Markdown source', got {eval_reader('document.querySelector(\".reading-search output\")?.textContent || \"\"')}"
 
         print(json.dumps({"ok": True, "lines": lines}), flush=True)
-        window.setProperty("closingAllowed", True)
-        window.setProperty("intentionalShutdown", True)
-        window.close()
-        del engine
-        studio.stop()
-        studio._search_pool.shutdown(wait=False, cancel_futures=True)
-        studio.pool.shutdown(wait=False, cancel_futures=True)
-        session.writes.shutdown(wait=False)
+        _teardown_webengine_probe(app=app, session=session, studio=studio, engine=engine, window=window, bundle_handler=bundle_handler)
+    sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(0)
 
 
@@ -1171,6 +1193,22 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "quantum-field.smd"))
         self.assertIsNone(self.studio._pending_seeded_find)
         self.assertFalse(any("supermdFind" in c for c in calls))
+
+        # Switching text -> files clears in-flight sync_for_search so files -> text re-issues flush cleanly.
+        self.studio.ready, self.studio._folder_search_mode = True, "text"
+        self.studio.openFolderSearch()
+        self.assertEqual(self.studio.flush_operation["action"], "sync_for_search")
+        self.studio.updateFolderSearch("", False, False, "files")
+        self.assertIsNone(self.studio.flush_operation)
+        self.studio.updateFolderSearch("SecretProseToken", False, False, "text")
+        self.assertEqual(self.studio.flush_operation["action"], "sync_for_search")
+        from unittest.mock import MagicMock
+        fake_win, fake_eng = MagicMock(), MagicMock()
+        with patch.object(sys, "platform", "darwin"):
+            _teardown_webengine_probe(app=MagicMock(), session=MagicMock(), studio=MagicMock(), engine=fake_eng, window=fake_win, bundle_handler=MagicMock())
+            self.assertFalse(fake_win.close.called or fake_eng.deleteLater.called)
+            self.assertEqual(len(_PROBE_DARWIN_EXIT_ANCHOR), 6)
+        _PROBE_DARWIN_EXIT_ANCHOR.clear()
 
     @contextlib.contextmanager
     def _real_folder_search_dialog(self):
