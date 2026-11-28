@@ -8,8 +8,26 @@ AppDialog {
     title: "Search across notes"
     property var stateData: studio.folderSearchState
     property int selectedIndex: 0
+    property int debounceInterval: 120
+    property bool syncingControls: false
+    readonly property bool queryPending: searchDebounce.running
+        || !!(stateData && stateData.pending)
+        || searchField.text !== ((stateData && stateData.query) || "")
+        || matchCaseButton.checked !== !!(stateData && stateData.caseSensitive)
+        || includeDiagramsButton.checked !== !!(stateData && stateData.includeDiagrams)
     width: Math.min(parent ? parent.width - 32 : 700, 720)
     height: Math.min(parent ? parent.height - 48 : 580, 620)
+
+    Timer {
+        id: searchDebounce
+        objectName: "folderSearchDebounce"
+        interval: dialog.debounceInterval
+        repeat: false
+        onTriggered: {
+            if (!dialog.visible || !(dialog.stateData && dialog.stateData.open)) return
+            dialog.triggerSearch()
+        }
+    }
 
     function escapeHtml(value) {
         return String(value || "")
@@ -43,6 +61,7 @@ AppDialog {
     }
 
     function triggerSearch() {
+        searchDebounce.stop()
         selectedIndex = 0
         studio.updateFolderSearch(
             searchField.text,
@@ -51,11 +70,27 @@ AppDialog {
         )
     }
 
+    function scheduleSearch() {
+        selectedIndex = 0
+        if (!searchField.text.trim().length) {
+            triggerSearch()
+            return
+        }
+        searchDebounce.restart()
+        studio.prepareFolderSearch(
+            searchField.text,
+            matchCaseButton.checked,
+            includeDiagramsButton.checked
+        )
+    }
+
     function activateMatch(idx) {
+        if (dialog.queryPending) return
+        const q = stateData && typeof stateData.query === "string" ? stateData.query : ""
+        if (!q.trim().length) return
         const matches = stateData && stateData.matches ? stateData.matches : []
         if (idx < 0 || idx >= matches.length) return
         const hit = matches[idx]
-        const q = stateData.query || searchField.text
         const cs = !!stateData.caseSensitive
         const sourceStart = typeof hit.sourceStart === "number" ? hit.sourceStart : -1
         const sourceEnd = typeof hit.sourceEnd === "number" ? hit.sourceEnd : -1
@@ -64,7 +99,22 @@ AppDialog {
         studio.openFolderSearchMatch(hit.tabId || "", hit.path || "", q, cs, sourceStart, sourceEnd, matchText)
     }
 
-    onStateDataChanged: clampSelection()
+    onStateDataChanged: {
+        if (!syncingControls && !(stateData && stateData.pending)) {
+            const backendQuery = (stateData && stateData.query) || ""
+            const backendCs = !!(stateData && stateData.caseSensitive)
+            const backendDiag = !!(stateData && stateData.includeDiagrams)
+            if (searchField.text !== backendQuery || matchCaseButton.checked !== backendCs || includeDiagramsButton.checked !== backendDiag) {
+                syncingControls = true
+                searchDebounce.stop()
+                if (searchField.text !== backendQuery) searchField.text = backendQuery
+                matchCaseButton.checked = backendCs
+                includeDiagramsButton.checked = backendDiag
+                syncingControls = false
+            }
+        }
+        clampSelection()
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -84,12 +134,13 @@ AppDialog {
                 selectByMouse: true
                 color: dialog.colors.text
                 onTextChanged: {
-                    if (dialog.visible && text !== (dialog.stateData.query || "")) {
-                        dialog.triggerSearch()
+                    if (!dialog.syncingControls && dialog.visible) {
+                        dialog.scheduleSearch()
                     }
                 }
                 Keys.onDownPressed: event => {
                     event.accepted = true
+                    if (dialog.queryPending) return
                     const matches = dialog.stateData.matches || []
                     if (matches.length > 0) {
                         dialog.selectedIndex = (dialog.selectedIndex + 1) % matches.length
@@ -98,6 +149,7 @@ AppDialog {
                 }
                 Keys.onUpPressed: event => {
                     event.accepted = true
+                    if (dialog.queryPending) return
                     const matches = dialog.stateData.matches || []
                     if (matches.length > 0) {
                         dialog.selectedIndex = (dialog.selectedIndex - 1 + matches.length) % matches.length
@@ -124,10 +176,11 @@ AppDialog {
                 text: "Aa"
                 compact: true
                 checkable: true
+                focusPolicy: Qt.TabFocus
                 tonal: !checked
                 highlighted: checked
                 ToolTip.text: "Match case"
-                onToggled: dialog.triggerSearch()
+                onToggled: if (!dialog.syncingControls && dialog.visible) dialog.triggerSearch()
             }
 
             ActionButton {
@@ -136,12 +189,13 @@ AppDialog {
                 text: "Diagrams"
                 compact: true
                 checkable: true
+                focusPolicy: Qt.TabFocus
                 tonal: !checked
                 highlighted: checked
                 ToolTip.text: checked
                     ? "Including inline SVG, Mermaid, and chart blocks"
                     : "Skipping inline SVG, Mermaid, and chart blocks"
-                onToggled: dialog.triggerSearch()
+                onToggled: if (!dialog.syncingControls && dialog.visible) dialog.triggerSearch()
             }
         }
 
@@ -264,17 +318,26 @@ AppDialog {
     }
 
     onAboutToShow: {
-        searchField.text = stateData.query || ""
-        matchCaseButton.checked = !!stateData.caseSensitive
-        includeDiagramsButton.checked = !!stateData.includeDiagrams
+        syncingControls = true
+        searchDebounce.stop()
+        searchField.text = (stateData && stateData.query) || ""
+        matchCaseButton.checked = !!(stateData && stateData.caseSensitive)
+        includeDiagramsButton.checked = !!(stateData && stateData.includeDiagrams)
         selectedIndex = 0
+        syncingControls = false
         Qt.callLater(function() {
             if (!dialog.visible) return
             searchField.forceActiveFocus()
-            if (searchField.text === (dialog.stateData.query || "")) {
+            if (searchField.text === ((dialog.stateData && dialog.stateData.query) || "")) {
                 searchField.selectAll()
             }
         })
+    }
+
+    onVisibleChanged: {
+        if (!visible) {
+            searchDebounce.stop()
+        }
     }
 
     onOpened: {
@@ -284,6 +347,7 @@ AppDialog {
     }
 
     onClosed: {
+        searchDebounce.stop()
         studio.closeFolderSearch()
     }
 }

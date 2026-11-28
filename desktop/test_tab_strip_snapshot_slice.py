@@ -65,12 +65,12 @@ def _build_main_chrome_harness_qml() -> bytes:
     tab_strip_end = qml.index("        Rectangle { width: parent.width; height: 1; color: viewState.colors.outline", tab_strip_start)
     tab_strip_block = textwrap.dedent(qml[tab_strip_start:tab_strip_end]).rstrip()
 
-    sidebar_start = qml.index("        Pane {\n            visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay")
+    sidebar_start = qml.index("        WorkspaceSidebar {")
     sidebar_end = qml.index("        Item {\n            SplitView.fillWidth: true", sidebar_start)
     sidebar_pane = textwrap.dedent(qml[sidebar_start:sidebar_end]).rstrip()
     sidebar_pane = sidebar_pane.replace(
-        "SplitView.preferredWidth: 260\n    SplitView.minimumWidth: 200\n    SplitView.maximumWidth: 500",
-        "Layout.preferredWidth: 260\n    Layout.fillHeight: true",
+        "WorkspaceSidebar {",
+        "WorkspaceSidebar {\n    Layout.preferredWidth: 260\n    Layout.fillHeight: true",
         1,
     )
 

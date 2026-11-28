@@ -65,7 +65,7 @@ def command(studio_obj: Any, action: str) -> None:
         studio_obj.newWindowRequested.emit()
 
 def agent_export_path(studio_obj: Any, filename: str, format: str, tab: dict, *, writable_location_fn: Callable = QStandardPaths.writableLocation) -> Path:
-    extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
+    extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}[format]
     selected = filename or Path(tab["name"]).stem or "Super MD export"
     if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
         raise ValueError("Export filename must be a basename")

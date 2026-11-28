@@ -9,12 +9,10 @@ import io
 import json
 import ipaddress
 import math
-import mimetypes
 import os
 import platform
 import shutil
 import re
-import secrets
 import socket
 import stat
 import subprocess
@@ -39,13 +37,17 @@ from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCur
 from documents import (
     atomic_write, atomic_json, stage_atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, is_valid_asset_filename,
-    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    materialize_assets, open_note, stage_atomic_json, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
 import offline_view
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
+if __package__:
+    from . import studio_agent_setup
+else:
+    import studio_agent_setup
 from python_outputs import PythonOutputs
 try:
     from . import studio_exports
@@ -78,7 +80,7 @@ try:
 except ImportError:
     import studio_chrome
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
+from workspace_links import WorkspaceLinkCache, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 from core.paths import DESKTOP_DIR, resource_root
 
@@ -189,7 +191,7 @@ def _directory_has_visible_note(
 
 
 ROOT = resource_root()
-DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
+DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.5, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25, fullDocumentAccessibility=False)
@@ -252,92 +254,10 @@ def _normalize_mcp_roots(roots) -> list[str]:
 
 
 def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen=None, platform=None, cli_script=None):
-    """Return a directly executable, absolute MCP stdio command for this install."""
-    frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
-    # Resolving a source venv's Python symlink would bypass that environment
-    # and lose its MCP dependencies. Frozen launchers can use canonical paths.
-    executable_path = Path(os.path.abspath(Path(executable or sys.executable).expanduser()))
-    if frozen:
-        executable_path = executable_path.resolve()
-    platform = sys.platform if platform is None else platform
-    if frozen:
-        if platform.startswith("win"):
-            command = str(executable_path.with_name("super-md-cli.exe").resolve())
-        elif platform.startswith("linux"):
-            appimage = os.environ.get("APPIMAGE", "")
-            appimage_path = Path(appimage).expanduser() if appimage else None
-            appdir = os.environ.get("APPDIR", "")
-            from_image = bool(appdir and executable_path.is_relative_to(Path(appdir).resolve()))
-            command = str(appimage_path.resolve()) if from_image and appimage_path and appimage_path.is_file() else str(executable_path)
-        else:
-            command = str(executable_path)
-        args = ["agent", "mcp"]
-    else:
-        if platform.startswith("win") and executable_path.name.casefold() == "pythonw.exe":
-            console_python = executable_path.with_name("python.exe")
-            if console_python.is_file():
-                executable_path = console_python
-        script = Path(cli_script or DESKTOP_DIR / "agent_cli.py").expanduser().resolve()
-        command = str(executable_path)
-        args = [str(script), "mcp"]
-    for root_path in _normalize_mcp_roots(roots):
-        args.extend(["--root", root_path])
-    args.extend(["--live-sessions-dir", str(Path(discovery_dir).expanduser().resolve()), "--transport", "stdio"])
-    return {"command": command, "args": args}
-
-
-_REQUIRED_SKILL_PACKAGE_FILES = (
-    "SKILL.md",
-    "references/study-notes.md",
-    "references/visual-authoring.md",
-    "references/agent-connection.md",
-    "assets/study-visual-example.svg",
-)
-
-
-def _bundle_agent_skill_markdown(skill_dir: Path) -> str:
-    router = (skill_dir / "SKILL.md").read_text(encoding="utf-8").rstrip()
-    router = (router
-              .replace("(references/study-notes.md)", "(#exam-ready-study-notes)")
-              .replace("(references/visual-authoring.md)", "(#diagram-and-interaction-guide)")
-              .replace("(references/agent-connection.md)", "(#agent-connection)"))
-    study_notes = (skill_dir / "references" / "study-notes.md").read_text(encoding="utf-8").strip()
-    visual_authoring = (skill_dir / "references" / "visual-authoring.md").read_text(encoding="utf-8").strip()
-    connection = (skill_dir / "references" / "agent-connection.md").read_text(encoding="utf-8").strip()
-    return (f"{router}\n\n{study_notes}\n\n{visual_authoring}\n\n"
-            f"# Agent connection\n\n{connection}\n")
-
-
-def _build_agent_skill_zip_bytes(root_dir: Path) -> bytes:
-    dist_zip = root_dir / "dist" / "super-md-skill.zip"
-    if dist_zip.is_file():
-        raw = dist_zip.read_bytes()
-        with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
-            names = set(archive.namelist())
-            if any(name.endswith("/local-preferences.md") or name == "local-preferences.md" for name in names):
-                raise ValueError("Skill archive must not contain local-preferences.md")
-            if all(f"super-md/{rel}" in names for rel in _REQUIRED_SKILL_PACKAGE_FILES):
-                return raw
-    if getattr(sys, "frozen", False):
-        raise FileNotFoundError("Bundled super-md-skill.zip is missing from this installation")
-    source_dir = root_dir / "dist" / "super-md-skill"
-    if not source_dir.is_dir():
-        source_dir = root_dir / "docs" / "skills" / "super-md"
-    for rel in _REQUIRED_SKILL_PACKAGE_FILES:
-        if not (source_dir / rel).is_file():
-            raise FileNotFoundError(f"Missing required skill file: {rel}")
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
-        for file_path in sorted(source_dir.rglob("*")):
-            rel_parts = file_path.relative_to(source_dir).parts
-            if any(part.startswith(".") or part == "local-preferences.md" for part in rel_parts):
-                continue
-            if file_path.is_file() and not file_path.is_symlink():
-                info = zipfile.ZipInfo("super-md/" + "/".join(rel_parts))
-                info.date_time = (1980, 1, 1, 0, 0, 0)
-                info.compress_type = zipfile.ZIP_STORED
-                archive.writestr(info, file_path.read_bytes())
-    return buffer.getvalue()
+    return studio_agent_setup.agent_mcp_setup_config(
+        discovery_dir, roots=roots, executable=executable, frozen=frozen,
+        platform=platform, cli_script=cli_script, root=ROOT, normalize_roots_fn=_normalize_mcp_roots,
+    )
 
 
 _SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
@@ -1038,6 +958,7 @@ class Studio(QObject):
         self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
+        self._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
         self.session = session or Session(isolated)
         weak_self = weakref.ref(self)
@@ -1131,6 +1052,7 @@ class Studio(QObject):
         self._folder_search_include_diagrams = False
         self._folder_search_matches: list[dict] = []
         self._folder_search_scanning = False
+        self._folder_search_pending = False
         self._folder_search_scanned_files = 0
         self._folder_search_truncated = False
         self._folder_search_generation = 0
@@ -1319,26 +1241,7 @@ class Studio(QObject):
             QTimer.singleShot(0, self._restore_cloud_connection)
 
     def _restore_cloud_connection(self):
-        if self.retired or not self.settings.get("cloudAgentEnabled") or self._cloud_revocation_pending:
-            return
-        bridge = getattr(self.session, "agent_bridge", None)
-        if bridge is None or bridge.cloudClient.enabled:
-            return
-        try:
-            try:
-                from .agent_cloud import read_cloud_config
-            except ImportError:
-                from agent_cloud import read_cloud_config
-            config = read_cloud_config(self._agent_cloud_config_path)
-            was_enabled = bridge.enabled
-            bridge.start_cloud(config)
-            self._cloud_started_local_bridge = not was_enabled
-            self._agent_cloud_error = ""
-        except Exception as error:
-            # Keep the opt-in on transient errors so the user can retry without
-            # re-pairing. Invalid pairing is surfaced, never silently replaced.
-            self._agent_cloud_error = f"Cloud auto-connect failed: {str(error)[:140]}"
-        self._emit(False)
+        studio_agent_setup._restore_cloud_connection(self)
 
     @property
     def files(self): return getattr(self, "_files", [])
@@ -1972,7 +1875,10 @@ class Studio(QObject):
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
         self._cancel_subfolder_search()
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
+        self._folder_search_pending = False
         self._search_pool.shutdown(wait=False, cancel_futures=True)
+        if self._python_pool is not None:
+            self._python_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
         self._python_jobs.cancel_all(retire=True)
         self._preview_jobs.cancel_all(retire=True)
@@ -2256,7 +2162,8 @@ class Studio(QObject):
             "caseSensitive": self._folder_search_case_sensitive,
             "includeDiagrams": self._folder_search_include_diagrams,
             "matches": self._folder_search_matches,
-            "scanning": self._folder_search_scanning or sync_pending,
+            "pending": self._folder_search_pending,
+            "scanning": self._folder_search_scanning or self._folder_search_pending or sync_pending,
             "scannedFiles": self._folder_search_scanned_files,
             "truncated": self._folder_search_truncated,
             "hasFolder": bool(self.folder),
@@ -2286,27 +2193,52 @@ class Studio(QObject):
         folder_path = Path(self.folder) if self.folder else None
         return tabs_snap, recent_snap, folder_path, self.active
 
-    def _cancel_folder_search(self, close: bool = False):
+    def _cancel_folder_search(self, close: bool = False) -> int:
         if self._folder_search_cancel is not None:
             self._folder_search_cancel.set()
             self._folder_search_cancel = None
         self._folder_search_generation += 1
         self._folder_search_scanning = False
+        self._folder_search_pending = False
+        self._folder_search_matches = []
+        self._folder_search_scanned_files = 0
+        self._folder_search_truncated = False
+        self._folder_search_tabs_sig = None
         if close:
             self._folder_search_open = False
-            self._folder_search_matches = []
-            self._folder_search_scanned_files = 0
-            self._folder_search_truncated = False
-            self._folder_search_tabs_sig = None
             if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
                 self.flush_operation = None
                 self.flush_timer.stop()
+        return self._folder_search_generation
+
+    def _apply_folder_search_query(
+        self,
+        query: str,
+        case_sensitive: bool = False,
+        include_diagrams: bool = False,
+        *,
+        pending: bool = False,
+    ) -> None:
+        if self.retired:
+            return
+        self._folder_search_query = query if isinstance(query, str) else ""
+        self._folder_search_case_sensitive = bool(case_sensitive)
+        self._folder_search_include_diagrams = bool(include_diagrams)
+        if not self._folder_search_open:
+            self._folder_search_open = True
+        if pending and self._folder_search_query.strip():
+            self._cancel_folder_search(close=False)
+            self._folder_search_pending = True
+            self.workspaceSearchChanged.emit()
+            return
+        self._start_folder_search()
 
     @Slot()
     def openFolderSearch(self):
         if self.retired:
             return
         self._folder_search_open = True
+        self._folder_search_pending = False
         self._folder_search_tabs_sig = None
         if self.ready and self.tabs and not self.flush_operation:
             self._flush("sync_for_search")
@@ -2317,29 +2249,17 @@ class Studio(QObject):
                 self._start_folder_search()
 
     @Slot(str, bool, bool)
+    def prepareFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=True)
+
+    @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
-        if self.retired:
-            return
-        self._folder_search_query = query if isinstance(query, str) else ""
-        self._folder_search_case_sensitive = bool(case_sensitive)
-        self._folder_search_include_diagrams = bool(include_diagrams)
-        if not self._folder_search_open:
-            self._folder_search_open = True
-        self._start_folder_search()
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=False)
 
     def _start_folder_search(self):
-        if self._folder_search_cancel is not None:
-            self._folder_search_cancel.set()
-            self._folder_search_cancel = None
-        self._folder_search_generation += 1
-        generation = self._folder_search_generation
-        self._folder_search_matches = []
-        self._folder_search_scanned_files = 0
-        self._folder_search_truncated = False
+        generation = self._cancel_folder_search(close=False)
         query = self._folder_search_query
         if not query or not query.strip():
-            self._folder_search_scanning = False
-            self._folder_search_tabs_sig = None
             self.workspaceSearchChanged.emit()
             return
         cancel_event = threading.Event()
@@ -2389,14 +2309,14 @@ class Studio(QObject):
 
     @Slot()
     def closeFolderSearch(self):
-        if not self._folder_search_open and not self._folder_search_scanning:
+        if not self._folder_search_open and not self._folder_search_scanning and not self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
 
     @Slot()
     def cancelWorkspaceSearch(self):
-        changed = self._folder_search_open or self._folder_search_scanning
+        changed = self._folder_search_open or self._folder_search_scanning or self._folder_search_pending
         self._cancel_folder_search(close=True)
         if changed:
             self.workspaceSearchChanged.emit()
@@ -2414,7 +2334,7 @@ class Studio(QObject):
         source_end: int = -1,
         match_text: str = "",
     ):
-        if self.retired:
+        if self.retired or self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
@@ -2433,17 +2353,11 @@ class Studio(QObject):
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        return bool(bridge and bridge.enabled)
+        return studio_agent_setup.agent_access_enabled(self)
 
     @Property(str, notify=changed)
     def agentAccessStatus(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if self._agent_error:
-            return self._agent_error
-        if not bridge or not bridge.enabled:
-            return "Off · no live tabs are exposed"
-        return "On · loopback only (fresh token each launch)"
+        return studio_agent_setup.agent_access_status(self)
 
     def _agent_mcp_roots(self) -> list[str]:
         windows = [self]
@@ -2467,143 +2381,48 @@ class Studio(QObject):
 
     @Property(str, notify=changed)
     def agentSetupInstructions(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if not bridge or not bridge.enabled:
-            return "Enable live agent access to prepare the local MCP server configuration."
-        return json.dumps(
-            agent_mcp_setup_config(bridge.discovery_dir, roots=self._agent_mcp_roots()),
-            ensure_ascii=False,
-            indent=2,
+        return studio_agent_setup.agent_setup_instructions(
+            self, root=ROOT, normalize_roots_fn=_normalize_mcp_roots,
         )
 
     @Property(str, notify=changed)
     def agentAccessTabsSummary(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if not bridge or not bridge.enabled:
-            return "No tabs are exposed."
-        studios = [window for window in self.session.windows.values() if not window.retired]
-        tabs = sum(len(window.tabs) for window in studios)
-        return f"{tabs} open tabs across {len(studios)} windows are available to the local MCP server."
+        return studio_agent_setup.agent_access_tabs_summary(self)
 
     @Property(bool, notify=changed)
     def cloudAgentConfigured(self):
-        return self._agent_cloud_config_path.is_file()
+        return studio_agent_setup.cloud_agent_configured(self)
 
     @Property(bool, notify=changed)
     def cloudAgentRevocationPending(self):
-        return self._cloud_revocation_pending
+        return studio_agent_setup.cloud_agent_revocation_pending(self)
 
     @Property(bool, notify=changed)
     def cloudAgentEnabled(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        return bool(bridge and bridge.cloudClient.enabled)
+        return studio_agent_setup.cloud_agent_enabled(self)
 
     @Property(str, notify=changed)
     def cloudAgentStatus(self):
-        if self._agent_cloud_error:
-            return self._agent_cloud_error
-        if self._cloud_revocation_pending:
-            return "Disconnecting and revoking this desktop pairing…"
-        bridge = getattr(self.session, "agent_bridge", None)
-        return bridge.cloudClient.status if bridge else "Cloud relay is unavailable."
+        return studio_agent_setup.cloud_agent_status(self)
 
     @Property(str, notify=changed)
     def cloudRelayOrigin(self):
-        if not self.cloudAgentConfigured:
-            return ""
-        try:
-            try:
-                from .agent_cloud import read_cloud_config
-            except ImportError:
-                from agent_cloud import read_cloud_config
-            return read_cloud_config(self._agent_cloud_config_path)["serverOrigin"]
-        except Exception:
-            return ""
+        return studio_agent_setup.cloud_relay_origin(self)
 
     @Property(str, notify=changed)
     def cloudConnectorUrl(self):
-        if not self.cloudAgentConfigured:
-            return ""
-        try:
-            try:
-                from .agent_cloud import connector_url, read_cloud_config
-            except ImportError:
-                from agent_cloud import connector_url, read_cloud_config
-            return connector_url(read_cloud_config(self._agent_cloud_config_path))
-        except Exception:
-            return ""
+        return studio_agent_setup.cloud_connector_url(self)
 
     def _best_effort_revoke_cloud_config(self, config):
-        if not config:
-            return
-        def run():
-            try:
-                try:
-                    from .agent_cloud import revoke
-                except ImportError:
-                    from agent_cloud import revoke
-                revoke(config, timeout=8)
-            except Exception:
-                pass
-        threading.Thread(target=run, name="supermd-agent-cloud-revoke-old", daemon=True).start()
+        studio_agent_setup.best_effort_revoke_cloud_config(config)
 
     @Slot(bool, str)
     def _finish_cloud_revocation(self, confirmed, device_id):
-        erased = False
-        try:
-            try:
-                from .agent_cloud import read_cloud_config
-            except ImportError:
-                from agent_cloud import read_cloud_config
-            current = read_cloud_config(self._agent_cloud_config_path)
-            if current.get("deviceId") == device_id:
-                self._agent_cloud_config_path.unlink(missing_ok=True)
-                erased = not self._agent_cloud_config_path.exists()
-        except FileNotFoundError:
-            erased = True
-        except Exception:
-            confirmed = False
-        self._cloud_revocation_pending = False
-        self.settings["cloudAgentEnabled"] = False
-        self._preferences()
-        if not erased:
-            self._agent_cloud_error = "Relay revoke finished, but the local pairing file could not be erased. Remove it from app data before reconnecting."
-        elif confirmed:
-            self._agent_cloud_error = "Relay revocation confirmed; local pairing credentials were erased."
-        else:
-            self._agent_cloud_error = "Local pairing credentials were erased, but relay revocation could not be confirmed."
-        self._emit(False)
+        studio_agent_setup.finish_cloud_revocation(self, confirmed, device_id)
 
     @Slot()
     def revokeCloudAgent(self):
-        if self._cloud_revocation_pending:
-            return
-        try:
-            try:
-                from .agent_cloud import read_cloud_config, revoke
-            except ImportError:
-                from agent_cloud import read_cloud_config, revoke
-            config = read_cloud_config(self._agent_cloud_config_path)
-            bridge = getattr(self.session, "agent_bridge", None)
-            self.settings["cloudAgentEnabled"] = False
-            self._preferences()
-            self._cloud_revocation_pending = True
-            self._agent_cloud_error = ""
-            device_id = config["deviceId"]
-            def run():
-                confirmed = False
-                try:
-                    if bridge:
-                        bridge.stop_cloud()
-                    revoke(config, timeout=8)
-                    confirmed = True
-                except Exception:
-                    pass
-                self.cloudRevocationFinished.emit(confirmed, device_id)
-            threading.Thread(target=run, name="supermd-agent-cloud-revoke", daemon=True).start()
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-        self._emit(False)
+        studio_agent_setup.revoke_cloud_agent(self)
 
     @Slot(str)
     def _cloud_status_changed(self, _status):
@@ -2613,221 +2432,43 @@ class Studio(QObject):
 
     @Slot(str, result=bool)
     def createAgentPairing(self, server_origin):
-        try:
-            if self._cloud_revocation_pending:
-                raise ValueError("Wait for desktop pairing revocation to finish")
-            old_config = None
-            try:
-                try:
-                    from .agent_cloud import read_cloud_config
-                except ImportError:
-                    from agent_cloud import read_cloud_config
-                old_config = read_cloud_config(self._agent_cloud_config_path)
-            except Exception:
-                pass
-            bridge = getattr(self.session, "agent_bridge", None)
-            if bridge and bridge.cloudClient.enabled:
-                bridge.stop_cloud()
-                self.settings["cloudAgentEnabled"] = False
-                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
-                    bridge.stop()
-                self._cloud_started_local_bridge = False
-            try:
-                from .agent_cloud import device_config, new_pairing, write_cloud_config
-            except ImportError:
-                from agent_cloud import device_config, new_pairing, write_cloud_config
-            write_cloud_config(self._agent_cloud_config_path, device_config(new_pairing(server_origin)))
-            self._best_effort_revoke_cloud_config(old_config)
-            self._agent_cloud_error = ""
-            self._emit(False)
-            return True
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-            self._emit(False)
-            return False
+        return studio_agent_setup.create_agent_pairing(self, server_origin)
 
     @Slot(str, result=bool)
     def importAgentPairing(self, source):
-        try:
-            if self._cloud_revocation_pending:
-                raise ValueError("Wait for desktop pairing revocation to finish")
-            old_config = None
-            try:
-                try:
-                    from .agent_cloud import read_cloud_config
-                except ImportError:
-                    from agent_cloud import read_cloud_config
-                old_config = read_cloud_config(self._agent_cloud_config_path)
-            except Exception:
-                pass
-            bridge = getattr(self.session, "agent_bridge", None)
-            if bridge and bridge.cloudClient.enabled:
-                bridge.stop_cloud()
-                self.settings["cloudAgentEnabled"] = False
-                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
-                    bridge.stop()
-                self._cloud_started_local_bridge = False
-            try:
-                from .agent_cloud import device_config, validate_pairing, write_cloud_config
-            except ImportError:
-                from agent_cloud import device_config, validate_pairing, write_cloud_config
-            path = local_path(source)
-            if path.stat().st_size > 16_000:
-                raise ValueError("Pairing file is too large")
-            pairing = validate_pairing(json.loads(path.read_text(encoding="utf-8")))
-            write_cloud_config(self._agent_cloud_config_path, device_config(pairing))
-            self._best_effort_revoke_cloud_config(old_config)
-            self._agent_cloud_error = ""
-            self._emit(False)
-            return True
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-            self._emit(False)
-            return False
+        return studio_agent_setup.import_agent_pairing(self, source, local_path_fn=local_path)
 
     @Slot(str, result=bool)
     def exportAgentPairing(self, destination):
-        try:
-            try:
-                from .agent_cloud import export_pairing, read_cloud_config
-            except ImportError:
-                from agent_cloud import export_pairing, read_cloud_config
-            path = local_path(destination)
-            export_pairing(path, read_cloud_config(self._agent_cloud_config_path))
-            self.message = f"Pairing file saved to {path}"
-            self._agent_cloud_error = ""
-            self._emit(False)
-            return True
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-            self._emit(False)
-            return False
+        return studio_agent_setup.export_agent_pairing(self, destination, local_path_fn=local_path)
 
     @Slot(bool)
     def setCloudAgentEnabled(self, enabled):
-        bridge = getattr(self.session, "agent_bridge", None)
-        try:
-            if bridge is None:
-                raise ValueError("Cloud agent access is unavailable in this app session")
-            if enabled:
-                try:
-                    from .agent_cloud import read_cloud_config
-                except ImportError:
-                    from agent_cloud import read_cloud_config
-                config = read_cloud_config(self._agent_cloud_config_path)
-                was_enabled = bridge.enabled
-                bridge.start_cloud(config)
-                self._cloud_started_local_bridge = not was_enabled
-            else:
-                bridge.stop_cloud()
-                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
-                    bridge.stop()
-                self._cloud_started_local_bridge = False
-            self.settings["cloudAgentEnabled"] = bool(enabled)
-            self._preferences()
-            self._agent_cloud_error = ""
-        except Exception as error:
-            self.settings["cloudAgentEnabled"] = False
-            self._agent_cloud_error = str(error)[:180]
-        self._emit(False)
+        studio_agent_setup.set_cloud_agent_enabled(self, enabled)
 
     @Slot()
     def copyCloudConnectorUrl(self):
-        url = self.cloudConnectorUrl
-        if not url:
-            self._agent_cloud_error = "Create or import a pairing before copying the connector URL."
-        else:
-            QGuiApplication.clipboard().setText(url)
-            self._agent_cloud_error = "Connector URL copied. Treat it as a secret."
-        self._emit(False)
+        studio_agent_setup.copy_cloud_connector_url(self, gui_app_cls=QGuiApplication)
 
     @Slot(bool)
     def setAgentAccessEnabled(self, enabled):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if bridge is None:
-            self._agent_error = "Live agent access is unavailable in this app session."
-            self._emit(False)
-            return
-        try:
-            if enabled:
-                bridge.start()
-                self._agent_error = ""
-            else:
-                bridge.stop()
-                self.settings["cloudAgentEnabled"] = False
-                self._agent_error = ""
-            background = getattr(self.session, "background", None)
-            if background is not None:
-                background._cli_started_agent_access = False
-            self.settings["agentAccessEnabled"] = bool(enabled)
-            self._preferences()
-            self._emit(False)
-        except Exception as error:
-            self._agent_error = f"Could not enable live agent access ({type(error).__name__})."
-            self.settings["agentAccessEnabled"] = False
-            self._emit(False)
+        studio_agent_setup.set_agent_access_enabled(self, enabled)
 
     @Slot()
     def copyAgentSetupInstructions(self):
-        if not self.agentAccessEnabled:
-            self._agent_error = "Enable live agent access before copying its MCP configuration."
-            self._emit(False)
-            return
-        QGuiApplication.clipboard().setText(self.agentSetupInstructions)
-        self._agent_error = ""
-        self.message = "MCP server configuration copied to clipboard"
-        self._emit(False)
+        studio_agent_setup.copy_agent_setup_instructions(self, gui_app_cls=QGuiApplication)
 
     @Slot(str)
     def saveAgentSetupInstructions(self, destination):
-        if not self.agentAccessEnabled:
-            self._agent_error = "Enable live agent access before saving its setup guide."
-            self._emit(False)
-            return
-        try:
-            path = local_path(destination)
-            if path.suffix.casefold() != ".md":
-                path = path.with_suffix(".md")
-            skill_path = ROOT / "dist" / "super-md-agent-SKILL.md"
-            if skill_path.is_file():
-                skill = skill_path.read_text(encoding="utf-8").rstrip()
-            elif not getattr(sys, "frozen", False):
-                skill = _bundle_agent_skill_markdown(ROOT / "docs" / "skills" / "super-md").rstrip()
-            else:
-                raise FileNotFoundError("Bundled super-md-agent-SKILL.md is missing")
-            guide = (skill + "\n\n# Connection for this installation\n\n"
-                     "This local MCP server can inspect and revise tabs that are open in this Super MD app session. "
-                     "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
-                     "## MCP client configuration\n\n```json\n" + self.agentSetupInstructions + "\n```\n\n"
-                     "Live access is off by default. Enable it in Super MD Settings → AI agents before starting the MCP server. "
-                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n\n"
-                     "## Cloud relay connector\n\n"
-                     "Cloud relay connector URLs are secret bearer credentials and are not included in saved setup guides. "
-                     "To connect a cloud MCP client, open Super MD Settings → AI agents and use Copy MCP connector URL to get your own connector.\n")
-            atomic_write(path, guide.encode("utf-8"))
-            self._agent_error = ""
-            self.message = f"Setup guide saved to {path}"
-            self._emit(False)
-        except (OSError, ValueError, TypeError) as error:
-            self._agent_error = f"Could not save setup guide ({type(error).__name__})."
-            self._emit(False)
+        studio_agent_setup.save_agent_setup_instructions(
+            self, destination, root=ROOT, atomic_write_fn=atomic_write, local_path_fn=local_path,
+        )
 
     @Slot(str, result=bool)
     def exportAgentSkill(self, destination):
-        try:
-            path = local_path(destination)
-            if path.suffix.casefold() != ".zip":
-                path = path.with_suffix(".zip")
-            raw = _build_agent_skill_zip_bytes(ROOT)
-            atomic_write(path, raw)
-            self._agent_error = ""
-            self.message = f"Skill package saved to {path}"
-            self._emit(False)
-            return True
-        except (OSError, ValueError, TypeError, zipfile.BadZipFile) as error:
-            self._agent_error = f"Could not save skill package ({type(error).__name__})."
-            self._emit(False)
-            return False
+        return studio_agent_setup.export_agent_skill(
+            self, destination, root=ROOT, atomic_write_fn=atomic_write, local_path_fn=local_path,
+        )
 
     @Property(bool,notify=changed)
     def readerFullscreen(self):return self.fullscreen
@@ -2991,6 +2632,7 @@ class Studio(QObject):
         if target is self or not self._can_move() or not target._can_move(): return False
         note = next((t for t in self.tabs if t["id"] == tab_id), None)
         if not note: return False
+        self._python_jobs.cancel_tab(tab_id)
         old = self.tabs.index(note)
         self.tabs.remove(note)
         self._preview_jobs.cancel_tab(tab_id)
@@ -3144,6 +2786,11 @@ class Studio(QObject):
         colors = self._colors()
         svg = svg.replace("#16181d",colors["text"]).replace("#f4f4f1",colors["surface"])
         return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
+
+    def _get_python_pool(self):
+        if self._python_pool is None and not self.retired:
+            self._python_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="supermd-python")
+        return self._python_pool
 
     def _submit(self, action, done, busy=True, executor=None):
         if self.retired:return
@@ -3724,6 +3371,7 @@ class Studio(QObject):
                     self.active=existing["id"]
                     self._activate_tab_state(existing)
             else:
+                note["agent_staged"] = bool(note.get("agent_staged", False))
                 self.tabs.append(note)
                 if note.get("path"):
                     try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
@@ -4169,11 +3817,14 @@ class Studio(QObject):
         elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
-                current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
-                if current_sig != self._folder_search_tabs_sig:
-                    self._start_folder_search()
-                else:
+                if self._folder_search_pending:
                     self.workspaceSearchChanged.emit()
+                else:
+                    current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
+                    if current_sig != self._folder_search_tabs_sig:
+                        self._start_folder_search()
+                    else:
+                        self.workspaceSearchChanged.emit()
         elif operation["action"] == "open_search_match":
             request = json.loads(operation["target"])
             tab_id = request.get("tabId") or ""
@@ -4208,6 +3859,7 @@ class Studio(QObject):
         elif operation["action"] == "reload_reader":
             # The renderer has acknowledged all edits. Reopen it from native
             # state and the just-captured view snapshot in document_flushed.
+            self._python_jobs.cancel_tab(self.active)
             self.ready=False
             self._last_reader_text=None
             self._last_reader_agent_seq.clear()
@@ -4521,7 +4173,7 @@ class Studio(QObject):
     def _autosave(self):
         if not self.settings["autosave"]: return
         for tab in self.tabs:
-            if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and not tab.get("agent_staged") and tab["id"] not in self.saving and tab["id"] not in self._staging_tabs:
+            if tab["path"] and self._is_dirty(tab) and not tab.get("agent_staged") and not tab.get("conflict") and tab["id"] not in self.saving and tab["id"] not in self._staging_tabs:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = "", on_rebound=None):
@@ -4593,7 +4245,7 @@ class Studio(QObject):
             win._recover()
             if win.folder:
                 win._load_tree()
-            if win._folder_search_open and win._folder_search_query.strip():
+            if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
                 win._start_folder_search()
             win._emit()
 
@@ -5207,11 +4859,11 @@ class Studio(QObject):
     def _agent_export_chunk(self, job_id, offset=0, limit=262_144):
         return studio_exports.agent_export_chunk(self, job_id, offset, limit)
 
-    _RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot for the agent patch; retry the patch"
-    _RECOVERY_ERROR_SUPERSEDED = "Could not confirm draft recovery snapshot for the agent patch because the recovery write was superseded; retry the patch"
+    _RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot; the edit was not applied. Retry patch_tab."
+    _RECOVERY_ERROR_SUPERSEDED = "Draft recovery write was superseded before staging completed; retry patch_tab."
     _RECOVERY_NOTICE = "Couldn't save draft recovery data. Keep Super MD open and retry."
 
-    def _validate_and_compute_patch_tab(self, args, *, bridge_revision_json: bool = False):
+    def _validate_and_compute_patch_tab(self, args: dict, *, bridge_revision_json: bool = False):
         tab_id = args.get("tabId")
         tab = next((item for item in self.tabs if item["id"] == tab_id), None)
         if tab is None or tab_id in getattr(self, "_closing_tabs", ()):
@@ -5775,14 +5427,7 @@ class Studio(QObject):
             saving.discard(tab_id)
         return finalize(value, None)
 
-    def _agent_document_action_async(
-        self,
-        args,
-        on_complete,
-        *,
-        register_cancel=None,
-        is_cancelled=None,
-    ):
+    def _agent_document_action_async(self, args, on_complete, *, register_cancel=None, is_cancelled=None):
         action = args.get("action")
         if action == "patch_tab":
             self._stage_inactive_patch_tab_async(
@@ -5836,6 +5481,9 @@ class Studio(QObject):
         tab = next((item for item in self.tabs if item["id"] == tab_id), None)
         if not tab:
             raise ValueError("Save requires a target tab that is still open")
+        staging = getattr(self, "_staging_tabs", None)
+        if staging is not None and tab_id in staging:
+            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
         saving = getattr(self, "saving", None)
         if saving is not None and tab_id in saving:
             raise ValueError("A save is already in progress for this tab; retry after it finishes")
@@ -6301,6 +5949,15 @@ class Studio(QObject):
                     raise ValueError("Invalid PDF export job id")
                 self.replied.emit(id, json.dumps({"cancelled": self._export_jobs.cancel(job_id)}), "")
                 return
+            if command == "stop_python":
+                job_id = args.get("jobId")
+                if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
+                    raise ValueError("Invalid Python cell job id")
+                tab_filter = args.get("id")
+                if tab_filter is not None and (not isinstance(tab_filter, str) or not tab_filter or len(tab_filter) > 128):
+                    raise ValueError("Invalid Python cell tab id")
+                self.replied.emit(id, json.dumps({"stopped": self._python_jobs.cancel_job(job_id, tab_id=tab_filter)}), "")
+                return
             tab = self._current()
             if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._last_reader_agent_seq.clear(); self._emit(); self.replied.emit(id,"true",""); return
             if command == "agent_banner_shown":
@@ -6602,7 +6259,10 @@ class Studio(QObject):
             elif command == "run_python":
                 if self.retired or captured["id"] in self._closing_tabs:
                     raise ValueError("The note for this operation is no longer open")
-                python_job = self._python_jobs.register(captured["id"])
+                py_job_id = args.get("jobId")
+                if py_job_id is None:
+                    py_job_id = uuid.uuid4().hex
+                python_job = self._python_jobs.register(captured["id"], job_id=py_job_id)
             def export_result(path):
                 if agent_export_info:
                     return self._agent_export_metadata(Path(path), agent_export_info["format"])
@@ -6774,10 +6434,16 @@ class Studio(QObject):
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
                 self.saving.discard(saving_tab_id)
                 return
-            if python_job is not None and (self.retired or getattr(self.pool, "_shutdown", False)):
+            python_executor = self._get_python_pool() if command == "run_python" else None
+            if python_job is not None and (self.retired or python_executor is None or getattr(python_executor, "_shutdown", False)):
                 self._python_jobs.discard(python_job)
                 return
-            self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
+            self._submit(
+                work,
+                finished,
+                command in ("export_fmd_native", "export_pdf_native", "export_markdown_native"),
+                python_executor if command == "run_python" else (self.writes if command in ("export_fmd_native", "export_markdown_native") else None),
+            )
         except Exception as error:
             if python_job is not None:
                 self._python_jobs.discard(python_job)

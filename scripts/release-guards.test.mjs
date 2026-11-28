@@ -1,18 +1,94 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { fileURLToPath } from "node:url";
 import {
   validateAssets,
   validateReadmeReleaseLinks,
   validateVersions,
   versionFromTag,
 } from "./release-guards.mjs";
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+const guardScript = fileURLToPath(new URL("./release-guards.mjs", import.meta.url));
 const names = ["Super-MD-0.3.0-arm64-release.apk", "Super.MD_0.3.0_amd64.AppImage", "Super.MD_0.3.0_amd64.deb", "Super.MD-0.3.0-1.x86_64.rpm", "Super.MD_0.3.0_x64-setup.exe", "Super.MD_0.3.0_aarch64.dmg", "Super.MD_0.3.0_x64.dmg"];
 const assets = names.map((name) => ({ name, size: 100_000, state: "uploaded" }));
 test("tags and platform versions must agree", () => {
   assert.equal(validateVersions("v0.3.0", { android: "0.3.0", desktop: "0.3.0" }), "0.3.0");
   for (const tag of ["main", "v0.3.0;evil", "v0.3.0-rc1", "../v0.3.0"]) assert.throws(() => versionFromTag(tag));
   assert.throws(() => validateVersions("v0.3.0", { android: "0.2.0" }));
+});
+test("versions CLI validates package, smd-core, and Android manifests", () => {
+  const pkgVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  assert.equal(
+    execFileSync(process.execPath, ["scripts/release-guards.mjs", "versions", `v${pkgVersion}`], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim(),
+    pkgVersion,
+  );
+  assert.throws(
+    () =>
+      execFileSync(process.execPath, ["scripts/release-guards.mjs", "versions", "v0.0.0"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: "pipe",
+      }),
+    /does not match v0\.0\.0/,
+  );
+
+  for (const iconFile of ["icon.ico", "icon.icns", "icon-source.png"]) {
+    assert.equal(
+      existsSync(path.join(repoRoot, "desktop/brand", iconFile)),
+      true,
+      `Expected desktop brand asset desktop/brand/${iconFile} to exist`,
+    );
+  }
+
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "supermd-release-guards-"));
+  try {
+    mkdirSync(path.join(fixture, "smd-core"), { recursive: true });
+    mkdirSync(path.join(fixture, "android/app"), { recursive: true });
+    const writeManifests = ({
+      pkg = pkgVersion,
+      smdCore = pkgVersion,
+      android = pkgVersion,
+    } = {}) => {
+      writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ version: pkg }));
+      writeFileSync(path.join(fixture, "smd-core/Cargo.toml"), `[package]\nname = "smd-core"\nversion = "${smdCore}"\n`);
+      writeFileSync(path.join(fixture, "android/app/build.gradle.kts"), `defaultConfig { versionName = "${android}" }\n`);
+    };
+    writeManifests();
+    writeFileSync(path.join(fixture, "README.md"), readFileSync(new URL("../README.md", import.meta.url), "utf8"));
+    assert.equal(
+      execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
+        cwd: fixture,
+        encoding: "utf8",
+      }).trim(),
+      pkgVersion,
+    );
+
+    for (const [override, pattern] of [
+      [{ pkg: "0.1.0" }, /package version 0\.1\.0 does not match/],
+      [{ smdCore: "0.1.0" }, /smd-core version 0\.1\.0 does not match/],
+      [{ android: "0.1.0" }, /android version 0\.1\.0 does not match/],
+    ]) {
+      writeManifests(override);
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
+            cwd: fixture,
+            encoding: "utf8",
+            stdio: "pipe",
+          }),
+        pattern,
+      );
+    }
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 test("publication requires all seven supported packages, especially the release APK", () => {
   assert.equal(validateAssets("v0.3.0", assets), true);

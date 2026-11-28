@@ -130,8 +130,9 @@ class StudioAgentActionsTests(unittest.TestCase):
         first = self.studio._agent_export_path("  ..My*Report?!!.pdf ", "pdf", tab)
         second = self.studio._agent_export_path("MyReport.pdf", "pdf", tab)
         third = self.studio._agent_export_path("...", "md", {"name": ""})
-        self.assertEqual((first.name, second.name, third.name), ("MyReport.pdf", "MyReport (2).pdf", "Super MD export.md"))
-        self.assertTrue(first.exists() and second.exists() and third.exists())
+        zipped = self.studio._agent_export_path("Bundle", "mdzip", tab)
+        self.assertEqual((first.name, second.name, third.name, zipped.name), ("MyReport.pdf", "MyReport (2).pdf", "Super MD export.md", "Bundle.zip"))
+        self.assertTrue(first.exists() and second.exists() and third.exists() and zipped.exists())
 
         dl = self.root / "downloads"
         dl.mkdir()
