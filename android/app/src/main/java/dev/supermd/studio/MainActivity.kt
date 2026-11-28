@@ -86,12 +86,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
-internal fun shouldShowNativeBusyOverlay(busy: Boolean, readerReady: Boolean, readerOwnsProgress: Boolean): Boolean =
-    !readerOwnsProgress && (busy || !readerReady)
-
-internal fun isSystemMotionEnabled(context: android.content.Context): Boolean =
-    android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f
-
 private suspend fun View.awaitWindowFocus() {
     if (hasWindowFocus()) return
     suspendCancellableCoroutine<Unit> { continuation ->
@@ -342,38 +336,6 @@ internal fun validateAgentSavePrecheck(
     return null
 }
 
-@Composable private fun Studio(model: StudioViewModel, activity: MainActivity) {
-    val state by model.state.collectAsStateWithLifecycle()
-    val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
-    val theme = if (state.fullscreen) state.fullscreenTheme else state.theme
-    val dark = theme == "dark" || theme == "black" || (theme == "system" && systemDark)
-    val context = LocalContext.current
-    val custom=remember(state.customTheme){themeDocument(state.customTheme)}
-    val colors = remember(context,dark,theme,state.accent,custom) {
-        var base = when { Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context); dark -> darkColorScheme(primary = Color(0xffb2c8ff), secondary = Color(0xffbcc6dc)); else -> lightColorScheme(primary = Color(0xff42669e), onPrimary = Color.White, primaryContainer = Color(0xffd7e3ff), onPrimaryContainer = Color(0xff162c4c), secondary = Color(0xff56647c), surface = Color(0xfff7f9fd), background = Color(0xfff7f9fd), surfaceContainerLow = Color(0xfff0f3fa), surfaceContainerHigh = Color(0xffe5ebf5)) }
-        base=accentColors(base,custom?.optString("accent")?:state.accent,dark)
-        if (!dark) base = studyLightColors(base)
-        if (theme == "black") base = manualAccent("neutral",true).copy(primary=Color(0xffdedede),onPrimary=Color(0xff1a1a1a),primaryContainer=Color(0xff343434),onPrimaryContainer=Color(0xfff0f0f0),background=Color.Black,surface=Color.Black,surfaceContainer=Color(0xff171717),surfaceContainerLow=Color(0xff101010),surfaceContainerHigh=Color(0xff242424))
-        customThemeColors(base,custom,theme,dark)
-    }
-    val systemMotion = isSystemMotionEnabled(context)
-    val shapes=remember(custom){val radius=custom?.optJSONObject("metrics")?.optDouble("controlRadius",Double.NaN);if(radius!=null&&radius.isFinite())Shapes().copy(small=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp),medium=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp),large=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp))else Shapes()}
-    MaterialExpressiveTheme(colorScheme = colors, shapes=shapes, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {
-        Surface(Modifier.fillMaxSize(), color = colors.surface, contentColor = colors.onSurface) {
-            StudioContent(model, state, activity, dark, state.motion && systemMotion)
-        }
-    }
-}
-
-private object NoMotionScheme : MotionScheme {
-    override fun <T> defaultSpatialSpec(): FiniteAnimationSpec<T> = snap()
-    override fun <T> fastSpatialSpec(): FiniteAnimationSpec<T> = snap()
-    override fun <T> slowSpatialSpec(): FiniteAnimationSpec<T> = snap()
-    override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = snap()
-    override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = snap()
-    override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
-}
-
 internal fun shouldAcceptExternalDrag(localState: Any?, description: android.content.ClipDescription?): Boolean {
     if (localState != null || description == null) return false
     val count = description.mimeTypeCount
@@ -463,7 +425,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
 
 internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")
 
-@Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
+@Composable internal fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val snackbar = remember { SnackbarHostState() }
@@ -960,23 +922,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     }
     val saveAction: () -> Unit = { model.saveManual() }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
-    val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
-    LaunchedEffect(immersive, dark) {
-        WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
-    }
-    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) {
-        if (contentsShown) {
-            contentsShown = false
-        } else if (drawer.isOpen) {
-            if (state.folder != null && state.folderRelative.isNotEmpty() && model.navigateFolderUp()) {
-                Unit
-            } else {
-                scope.launch { drawer.close() }
-            }
-        } else {
-            web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) }
-        }
-    }
+    BindStudioSystemBarsAndBack(activity, model, state, dark, readingChromeVisible, settings, contentsShown, drawer, scope, web) { contentsShown = false }
     val palette = MaterialTheme.colorScheme
     val density = LocalDensity.current
     val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("primary-container",hex(palette.primaryContainer)).put("on-primary-container",hex(palette.onPrimaryContainer)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
@@ -1048,33 +994,11 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         LaunchedEffect(readerReady, state.zoomCommand) {
             if (readerReady) web?.evaluateJavascript("window.supermdSetZoom?.(${state.zoom},${state.zoomCommand})", null)
         }
-        val headings by model.headings.collectAsStateWithLifecycle()
-        val imageOverlay by model.imageOverlay.collectAsStateWithLifecycle()
-        val chromeShown = !state.readerOverlay && !imageOverlay && (readingChromeVisible || state.activeConflicted)
-        val chromeReveal by animateFloatAsState(if(chromeShown) 1f else 0f,
-            animationSpec=tween(if(motion) 120 else 0),label="Reading chrome")
-        LaunchedEffect(readerReady,chromeHeight) {
-            if(readerReady) web?.evaluateJavascript("window.supermdChromeInset?.(${chromeHeight/density.density})",null)
-        }
-        // Navigation needs to avoid visible controls, but showing/hiding an
-        // overlay must never resize the reader or change its first-note spacer.
-        LaunchedEffect(readerReady,chromeHeight,chromeShown) {
-            val visibleInset=if(chromeShown) chromeHeight/density.density else 0f
-            if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-visible-chrome-inset','${visibleInset}px')",null)
-        }
-        // Reader overlays (search, repair) hide the top bar and system bars, so
-        // they anchor to the cutout-safe top edge, not the hidden chrome height.
-        val safeTop = WindowInsets.displayCutout.getTop(density) / density.density
-        LaunchedEffect(readerReady,safeTop) {
-            if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-safe-top','${safeTop}px')",null)
-        }
-        if (contentsShown) {
-            ContentsBottomSheet(headings = headings, noteId = state.active.id, motion = motion, onDismiss = { contentsShown = false }) { heading ->
-                if (actualMode in listOf("live", "reader") || state.fullscreen) readingChromeVisible = false
-                web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})", null)
-                contentsShown = false
-            }
-        }
+        val (chromeShown, chromeReveal) = BindStudioChromeEffectsAndContents(
+            model = model, state = state, actualMode = actualMode, motion = motion, readerReady = readerReady,
+            chromeHeight = chromeHeight, readingChromeVisible = readingChromeVisible, contentsShown = contentsShown,
+            density = density, web = web, onHideReadingChrome = { readingChromeVisible = false }, onDismissContents = { contentsShown = false },
+        )
         // Closed-drawer drag recognition steals diagonal scrolls and pinch
         // gestures from WebView. Opening is deliberate (menu button); dragging
         // still dismisses an already-open drawer.
@@ -1109,59 +1033,14 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             // Measure chrome even when hidden, but place it in a separate layer.
             // Its visibility must never resize/recreate the WebView underneath.
             Box(Modifier.fillMaxSize().imePadding().clipToBounds()) {
-                    Column(Modifier.fillMaxWidth().zIndex(2f).onSizeChanged {chromeHeight=it.height}
-                        .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
-                        .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
-                        .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
-                        val activeNeedsAccess = state.writeNeedsAccess(state.active.id) || model.documentWriteNeedsAccess(state.active.id)
-                        StudioTopBar(
-                            noteName = state.active.name,
-                            statusLabel = if (activeNeedsAccess) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
-                            onRestoreAccess = if (activeNeedsAccess) ({ model.requestWriteAccessIfBlocked(state.active.id, explicit = true) }) else null,
-                            fullscreen = state.fullscreen,
-                            wide = wide,
-                            actualMode = actualMode,
-                            centerLock = state.centerLock,
-                            readerReady = readerReady,
-                            busy = state.busy,
-                            menuExpanded = menu,
-                            onMenuExpandedChange = { menu = it },
-                            onNavigateIcon = {
-                                if (state.fullscreen) contentsShown = true
-                                else {
-                                    scope.launch { drawer.open() }
-                                    state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), state.folderRelative) }
-                                }
-                            },
-                            onFolderSearch = { model.openFolderSearch() },
-                            onFind = { activity.openReaderFind?.invoke(false) },
-                            onSave = saveAction,
-                            onExport = { sharing = false; exporting = true },
-                            onToggleFullscreen = { model.fullscreen(!state.fullscreen) },
-                            onToggleCenterLock = { model.centerLock(!state.centerLock) },
-                            canReopenClosedTab = state.closedTabs.isNotEmpty(),
-                            onReopenClosedTab = model::reopen,
-                            onSaveAs = model::beginSaveAs,
-                            onNewWindow = activity::newWindow,
-                            onShare = { sharing = true; exporting = true },
-                            onInsertMedia = { web?.evaluateJavascript("window.supermdMedia?.()", null) },
-                            onFixLatex = { web?.evaluateJavascript("window.supermdRepairMath?.()", null) },
-                            onRename = { renaming = true },
-                            onSettings = { settingsSection = null; settings = true },
-                        )
-                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::requestClose, model::reorder, model::newNote)
-                        if(!state.fullscreen) StudioModeBar(
-                            wide = wide,
-                            actualMode = actualMode,
-                            centerLock = state.centerLock,
-                            readerReady = readerReady,
-                            onShowContents = { contentsShown = true },
-                            onSelectMode = model::mode,
-                            onUndo = { web?.evaluateJavascript("window.supermdHistory?.('undo')", null) },
-                            onRedo = { web?.evaluateJavascript("window.supermdHistory?.('redo')", null) },
-                            onEnterFullscreen = { model.fullscreen(true) },
-                            onToggleCenterLock = { model.centerLock(!state.centerLock) },
-                        )
+                    StudioFloatingChromeColumn(
+                        model = model, activity = activity, state = state, wide = wide, actualMode = actualMode, motion = motion,
+                        readerReady = readerReady, chromeShown = chromeShown, chromeReveal = chromeReveal, menu = menu, drawer = drawer,
+                        scope = scope, web = web, onChromeHeightChange = { chromeHeight = it }, onMenuChange = { menu = it },
+                        onShowContents = { contentsShown = true }, onSave = saveAction,
+                        onOpenExport = { share -> sharing = share; exporting = true },
+                        onRename = { renaming = true }, onOpenSettings = { settingsSection = null; settings = true },
+                    ) {
                         if (state.activeConflicted) {
                             ConflictBanner(
                                 busy = state.busy,
@@ -1170,7 +1049,6 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                 onOverwrite = { model.saveManual(forceOverwrite = true) },
                             )
                         }
-                        HorizontalDivider(color = palette.outlineVariant.copy(alpha = .55f))
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
@@ -1722,253 +1600,6 @@ internal fun buildHighlightedSnippet(
         }
     }
 }
-
-@Composable internal fun StudioTopBar(
-    noteName: String,
-    statusLabel: String,
-    fullscreen: Boolean,
-    wide: Boolean,
-    actualMode: String,
-    centerLock: Boolean,
-    readerReady: Boolean,
-    busy: Boolean,
-    menuExpanded: Boolean,
-    onMenuExpandedChange: (Boolean) -> Unit,
-    onNavigateIcon: () -> Unit,
-    onFind: () -> Unit,
-    onSave: () -> Unit,
-    onExport: () -> Unit,
-    onToggleFullscreen: () -> Unit,
-    onToggleCenterLock: () -> Unit,
-    canReopenClosedTab: Boolean = false,
-    onReopenClosedTab: () -> Unit = {},
-    onSaveAs: () -> Unit = {},
-    onNewWindow: () -> Unit,
-    onShare: () -> Unit,
-    onInsertMedia: () -> Unit,
-    onFixLatex: () -> Unit,
-    onRename: () -> Unit,
-    onSettings: () -> Unit,
-    onFolderSearch: () -> Unit = {},
-    onRestoreAccess: (() -> Unit)? = null,
-) {
-    val palette = MaterialTheme.colorScheme
-    TopAppBar(
-        windowInsets = WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
-        colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-        title = {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .then(
-                        if (onRestoreAccess != null) {
-                            Modifier.heightIn(min = 48.dp).clickable(onClick = onRestoreAccess)
-                        } else {
-                            Modifier
-                        },
-                    ),
-                verticalArrangement = Arrangement.Center,
-            ) {
-                Text(noteName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
-                Text(statusLabel, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant)
-            }
-        },
-        navigationIcon = {
-            IconButton(onClick = onNavigateIcon, modifier = Modifier.size(48.dp)) {
-                Icon(painterResource(if (fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if (fullscreen) "Show contents" else "Open files")
-            }
-        },
-        actions = {
-            StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
-            IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
-            IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
-            if (fullscreen || (wide && actualMode != "reader")) {
-                FullscreenAndCenterLockActions(fullscreen = fullscreen, centerLock = centerLock, onToggleFullscreen = onToggleFullscreen, onToggleCenterLock = onToggleCenterLock)
-            }
-            Box {
-                IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
-                DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
-                    DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = canReopenClosedTab, onClick = { onMenuExpandedChange(false); onReopenClosedTab() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
-                    DropdownMenuItem(text = { Text("Save as") }, enabled = !busy, onClick = { onMenuExpandedChange(false); onSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
-                    HorizontalDivider()
-                    DropdownMenuItem(text = { Text("New window") }, onClick = { onMenuExpandedChange(false); onNewWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
-                    DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !busy, onClick = { onMenuExpandedChange(false); onShare() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
-                    DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { onMenuExpandedChange(false); onInsertMedia() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
-                    DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { onMenuExpandedChange(false); onFixLatex() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
-                    DropdownMenuItem(text = { Text("Rename note") }, onClick = { onMenuExpandedChange(false); onRename() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_rename), null) })
-                    DropdownMenuItem(text = { Text("Settings") }, onClick = { onMenuExpandedChange(false); onSettings() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
-                }
-            }
-        }
-    )
-}
-
-@Composable internal fun StudioModeBar(
-    wide: Boolean,
-    actualMode: String,
-    centerLock: Boolean,
-    readerReady: Boolean,
-    onShowContents: () -> Unit,
-    onSelectMode: (String) -> Unit,
-    onUndo: () -> Unit,
-    onRedo: () -> Unit,
-    onEnterFullscreen: () -> Unit,
-    onToggleCenterLock: () -> Unit,
-) {
-    val palette = MaterialTheme.colorScheme
-    val modes = if (wide) listOf("live", "editor", "reader", "split") else listOf("live", "editor", "reader")
-    Row(Modifier.fillMaxWidth().padding(horizontal = if (wide) 24.dp else 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        StudyIcon("Show contents", R.drawable.symbol_contents, action = onShowContents)
-        Spacer(Modifier.width(4.dp))
-        SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
-            modes.forEachIndexed { index, mode ->
-                SegmentedButton(
-                    selected = actualMode == mode,
-                    onClick = { onSelectMode(mode) },
-                    icon = {},
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                    colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary),
-                    shape = SegmentedButtonDefaults.itemShape(index, modes.size),
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) {
-                    Text(
-                        when (mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" },
-                        maxLines = 1,
-                        softWrap = false,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.width(4.dp))
-        if (actualMode == "reader") {
-            FullscreenAndCenterLockActions(fullscreen = false, centerLock = centerLock, onToggleFullscreen = onEnterFullscreen, onToggleCenterLock = onToggleCenterLock)
-        } else {
-            IconButton(onClick = onUndo, enabled = readerReady, modifier = Modifier.size(48.dp)) { Icon(Icons.AutoMirrored.Rounded.Undo, "Undo (Ctrl+Z)") }
-            IconButton(onClick = onRedo, enabled = readerReady, modifier = Modifier.size(48.dp)) { Icon(Icons.AutoMirrored.Rounded.Redo, "Redo (Ctrl+Y)") }
-        }
-    }
-}
-
-@Composable internal fun ContentsBottomSheet(
-    headings: List<OutlineHeading>,
-    noteId: String,
-    motion: Boolean = isSystemMotionEnabled(LocalContext.current),
-    onDismiss: () -> Unit,
-    onNavigate: (OutlineHeading) -> Unit,
-) {
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) {
-        ContentsSheetContent(headings = headings, noteId = noteId, motion = motion, onNavigate = onNavigate)
-    }
-}
-
-@Composable internal fun ContentsSheetContent(
-    headings: List<OutlineHeading>,
-    noteId: String,
-    motion: Boolean = isSystemMotionEnabled(LocalContext.current),
-    onNavigate: (OutlineHeading) -> Unit,
-) {
-    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
-        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
-            Text("Contents", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp))
-            OutlinePanel(headings, noteId, Modifier.weight(1f, fill = false), motion = motion, navigate = onNavigate)
-        }
-    }
-}
-
-@Composable internal fun FilesDrawerContent(
-    state: StudioState,
-    recent: List<RecentNote>,
-    folderRelative: String = state.folderRelative,
-    onOpenNote: () -> Unit,
-    onOpenFolder: () -> Unit,
-    onCloseFolder: () -> Unit,
-    onFolderRoot: () -> Unit,
-    onActivateEntry: (FileEntry) -> Unit,
-    onClearRecent: () -> Unit,
-    onOpenRecent: (RecentNote) -> Unit,
-    onPinRecent: (RecentNote) -> Unit,
-    onNavigateFolderRelative: (String) -> Unit = { onFolderRoot() },
-    onCreateInFolder: (CreateFolderRequest) -> Unit = {},
-    onRenameEntry: (FileEntry) -> Unit = {},
-    modifier: Modifier = Modifier,
-    onFolderSearch: () -> Unit = {},
-) {
-    val palette = MaterialTheme.colorScheme
-    LazyColumn(
-        modifier = modifier.fillMaxSize().themeArtwork(state, "sidebar").safeDrawingPadding(),
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-    ) {
-        item(key = "header") {
-            Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 8.dp))
-        }
-        item(key = "file-actions") {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onOpenNote, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-                    Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note")
-                }
-                FilledTonalButton(onClick = onOpenFolder, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-                    Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder")
-                }
-                OutlinedButton(onClick = onFolderSearch, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-                    Icon(Icons.Rounded.Search, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Search across notes", maxLines = 1)
-                }
-                if (state.folder != null) {
-                    FolderDrawerHeader(
-                        folderUriRaw = state.folder,
-                        folderRelative = folderRelative,
-                        onNavigateRelative = onNavigateFolderRelative,
-                        onRequestCreate = onCreateInFolder,
-                        onCloseFolder = onCloseFolder,
-                    )
-                }
-                Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
-            }
-        }
-        folderFileItems(
-            files = state.files,
-            activeUri = state.active.uri,
-            onActivate = onActivateEntry,
-            onCreateInFolder = onCreateInFolder,
-            onRename = onRenameEntry,
-        )
-        if (recent.isNotEmpty()) {
-            item(key = "recent-header") {
-                Column {
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Recent notes", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-                        TextButton(onClick = onClearRecent, modifier = Modifier.heightIn(min = 48.dp)) { Text("Clear unpinned") }
-                    }
-                }
-            }
-            items(recent, key = { "recent:${it.uri}" }) { note ->
-                Box(Modifier.padding(vertical = 3.dp)) {
-                    RecentNoteCard(
-                        note = note,
-                        selected = state.active.uri == note.uri,
-                        onOpen = { onOpenRecent(note) },
-                        onPin = { onPinRecent(note) },
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable internal fun FullscreenAndCenterLockActions(fullscreen: Boolean, centerLock: Boolean, onToggleFullscreen: () -> Unit, onToggleCenterLock: () -> Unit) {
-    StudyIcon(if (fullscreen) "Exit fullscreen" else "Fullscreen study", if (fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen, action = onToggleFullscreen)
-    StudyIcon(if (centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre", if (centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open, action = onToggleCenterLock)
-}
-
-@Composable private fun StudyIcon(label:String, resource:Int, enabled:Boolean=true, action:()->Unit) {
-    TooltipBox(positionProvider=TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),tooltip={PlainTooltip{Text(label)}},state=rememberTooltipState()) {
-        IconButton(onClick=action, enabled=enabled, modifier=Modifier.size(48.dp)) {Icon(painterResource(resource),label,Modifier.size(24.dp))}
-    }
-}
-private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
 
 @Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, section: String?, onSection: (String?)->Unit, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, showThemeGuide:()->Unit, themeGuideReady:Boolean, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
