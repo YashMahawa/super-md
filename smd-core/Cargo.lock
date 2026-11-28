@@ -2505,6 +2505,8 @@ dependencies = [
  "typst",
  "typst-kit",
  "typst-pdf",
+ "unicode-normalization",
+ "unicode-properties",
 ]
 
 [[package]]

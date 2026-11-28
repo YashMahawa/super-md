@@ -15,7 +15,6 @@ import re
 import secrets
 import sys
 import threading
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -1242,9 +1241,9 @@ def _qt_bridge_class():
             action = args.get("assetAction")
             try:
                 try:
-                    from .documents import image_data, open_note, write_portable, MIMES
+                    from .documents import image_data
                 except ImportError:
-                    from documents import image_data, open_note, write_portable, MIMES
+                    from documents import image_data
             except ImportError as error:
                 raise ValueError("Portable asset handling is unavailable") from error
 
