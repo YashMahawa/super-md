@@ -70,7 +70,7 @@ def install(package):
         from PySide6.QtCore import Qt
         from PySide6.QtGui import QGuiApplication, QImage, QPainter
         from PySide6.QtSvg import QSvgRenderer
-        app = QGuiApplication.instance() or QGuiApplication([])
+        _app = QGuiApplication.instance() or QGuiApplication([])
         renderer = QSvgRenderer(str(resources / "public/brand-mark-fixed.svg"))
         for size in (16, 24, 32, 48, 64, 128, 256, 512):
             image = QImage(size, size, QImage.Format.Format_ARGB32)

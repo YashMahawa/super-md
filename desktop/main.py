@@ -25,13 +25,17 @@ if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--tls-probe
         "verifyRequired": context.verify_mode == ssl.CERT_REQUIRED,
     }), encoding="utf-8")
     sys.exit(0)
+ENGINE_COMMANDS = (
+    "read", "inspect", "assets", "extract", "unpack", "pack",
+    "export", "export-json", "doctor", "validate-theme",
+)
+
 if __name__ == "__main__":
     from graphics_runtime import configure, probe
     if len(sys.argv) > 1 and sys.argv[1] == "--graphics-probe":
         sys.exit(probe(Path(sys.argv[2]) if len(sys.argv) > 2 else None))
     # CLI/identity queries never need a display or a graphics probe.
-    commands = {"read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme",
-                "--version", "--help", "-h"}
+    commands = {*ENGINE_COMMANDS, "--version", "--help", "-h"}
     if len(sys.argv) == 1 or sys.argv[1] not in commands:
         configure(safe="--safe-graphics" in sys.argv)
 from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal, QPointF
@@ -40,8 +44,9 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
-from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
+from PySide6.QtWebEngineCore import QWebEngineProfile
 from studio import Session, Studio, ROOT
+from external_open import ExternalOpenRouter
 from agent_live import create_qt_bridge
 from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes
 from instance import InstanceBroker
@@ -66,7 +71,7 @@ class StudioApplication(QApplication):
         return super().event(event)
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme"):
+    if len(sys.argv) > 1 and sys.argv[1] in ENGINE_COMMANDS:
         executable = "smd-engine.exe" if sys.platform == "win32" else "smd-engine"
         candidates = (ROOT / "desktop" / executable, ROOT / "smd-core/target/release" / executable,
                       ROOT / "smd-core/target/debug" / executable)
@@ -269,6 +274,7 @@ def main():
             sync_frame()
         engines.append(engine)
         studios.append(studio)
+        external_router.register_window(studio, activated=show_window)
         if args.smoke:
             import time
             smoke_deadline = time.monotonic() + 30
@@ -517,8 +523,12 @@ def main():
         if note:
             studio.openPath(str(note))
         return studio
+    external_router = ExternalOpenRouter(studios, lambda note=None: create_window(note), app=app)
     app.aboutToQuit.connect(lambda:setattr(session,"quitting",True))
     def open_from_service(note=None):
+        if note:
+            external_router.open_requested(note)
+            return
         hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
         if hidden is not None:
             ensure_reader_profile()

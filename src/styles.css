@@ -111,10 +111,12 @@ button { color: inherit; }
 .media-dialog small { color: var(--muted); font-size: .76rem; line-height: 1.6; }
 .media-dialog p[role=alert] { margin: 0; color: var(--error); font-size: .78rem; overflow-wrap: anywhere; }
 .note-image { position: relative; display: inline-block; max-width: 100%; border-radius: 12px; }
-/* Standalone vector diagrams use the reading column, not their export's
-   intrinsic pixel width. Inline icons and ordinary photographs stay authored. */
-.markdown-body .media-paragraph > .note-image--diagram { width:100%; }
-.markdown-body .media-paragraph > .note-image--diagram > img,
+/* Standalone vector diagrams respect suitable intrinsic dimensions while panning
+   wide diagrams on narrow viewports; Python plots fill their output column, and
+   inline icons and ordinary photographs stay authored. */
+.markdown-body .media-paragraph > .note-image--diagram { display:block; width:fit-content; max-width:100%; margin:0 auto; }
+.markdown-body .media-paragraph > .note-image--diagram[data-svg-sized="true"] { width:clamp(calc(var(--svg-min-width,0px) + 2px),100%,calc(var(--svg-width) + 2px)); max-width:none; }
+.markdown-body .media-paragraph > .note-image--diagram > img { width:100%; max-width:none; margin:0; box-sizing:border-box; }
 .python-cell .cell-output > img { width:100%; box-sizing:border-box; }
 .note-image.is-selected, .note-image:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
 .image-edit-tools { position: absolute; bottom: 8px; left: 8px; display: flex; gap: 4px; padding: 4px; border-radius: 999px; background: var(--surface-high); color: var(--text); box-shadow: 0 2px 12px var(--shadow); font-family: var(--md-ref-typeface-plain); font-size: 13px; }
@@ -198,7 +200,6 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .format-hint { margin-left: auto; color: var(--muted); font-size: .76rem; }
 .workspace { position: relative; min-height: 0; display: grid; grid-template-columns: minmax(0, var(--split-left, 50fr)) 12px minmax(0, var(--split-right, 50fr)); gap: 4px; padding: 12px; background: var(--surface-low); transition: grid-template-columns .38s var(--standard); }
 .workspace[data-resizing="true"] { transition: none; cursor: col-resize; user-select: none; }
-.workspace[data-dragging-file="true"]::after { content: "Drop to open Markdown"; position: absolute; z-index: 6; inset: 12px; display: grid; place-items: center; border: 2px dashed var(--primary); border-radius: 22px; color: var(--primary); background: color-mix(in srgb, var(--surface) 92%, transparent); font-size: 1.12rem; font-weight: 760; pointer-events: none; }
 .view-editor .workspace, .view-reader .workspace, .view-live .workspace { grid-template-columns: minmax(0, 1fr); }
 .pane-resizer { display: grid; place-items: center; min-width: 12px; border-radius: 99px; cursor: col-resize; touch-action: none; outline: none; }
 .pane-resizer span { width: 4px; height: 50px; border-radius: 99px; background: var(--outline); transition: width .25s var(--expressive), height .25s var(--expressive), background-color .25s var(--standard); }
@@ -239,6 +240,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .live-block:has(.code-copy) > .live-block-edit { top: calc(22px / var(--document-scale, 1)); right: calc(78px / var(--document-scale, 1)); }
 .live-block:has(.chart-actions) > .live-block-edit { top: calc(16px / var(--document-scale, 1)); right: calc(96px / var(--document-scale, 1)); }
 .live-block:has(.cell-toolbar) > .live-block-edit { top: calc(10px / var(--document-scale, 1)); right: calc(88px / var(--document-scale, 1)); }
+.live-block:has(.python-stop) > .live-block-edit { right: calc(292px / var(--document-scale, 1)); }
 .live-block:has(.step-cards-enlarge) > .live-block-edit { top: calc(6px / var(--document-scale, 1)); right: calc(44px / var(--document-scale, 1)); }
 .live-block-edit:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
 .live-block-edit:active { transform: scale(calc(.96 / var(--document-scale, 1))); }
@@ -286,6 +288,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .markdown-body h1 { font-size: clamp(2rem, 3vw, 2.65rem); margin-top: .25em; font-weight: 800; }
 .markdown-body h2 { font-size: 1.63rem; border-bottom: 1px solid var(--outline); padding-bottom: .36em; }
 .markdown-body p { margin: .95em 0; }
+.markdown-body p:where(.media-paragraph:has(> .note-image--diagram)) { overflow-x:auto; overflow-y:hidden; max-width:100%; padding:8px 0; margin:calc(.95em - 8px) 0; }
 .markdown-body blockquote:not(.callout) { margin: 1.4em 0; padding: .2em 1.1em; border-left: 3px solid var(--outline); color: var(--muted); }
 .markdown-body a { color: var(--primary); text-underline-offset: 3px; }
 .markdown-body a:visited,.markdown-body a[data-visited="true"] { color:color-mix(in srgb,var(--primary) 55%,var(--text)); }
@@ -300,7 +303,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .remote-image-card small { color: var(--muted); }
 .remote-image-actions, .image-error-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .remote-image-actions button, .image-error-actions button { padding: 7px 10px; background: var(--surface-high); color: var(--text); font-size: .82em; font-weight: 700; }
-.markdown-body table { width: 100%; display: block; overflow-x: auto; border-collapse: collapse; margin: 1.4em 0; }
+.markdown-body table { width: max-content; max-width: 100%; display: block; overflow-x: auto; border-collapse: collapse; margin: 1.4em 0; }
 .markdown-body th, .markdown-body td { padding: 9px 12px; border: 1px solid var(--outline); text-align: left; min-width: 90px; }
 .markdown-body th { background: var(--surface-high); }
 .markdown-body pre { max-width: 100%; overflow: auto; padding: 16px 18px; border-radius: 16px; background: var(--code-bg); color: var(--code-text); border: 1px solid var(--code-border); font: .88em/1.65 var(--mono); tab-size: 4; }
@@ -435,8 +438,8 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .chart-warning { display: block; margin: 8px 4px; color: var(--error); font-size: .8em; }
 .mermaid { padding: 18px; overflow: auto; border-radius: 14px; background: var(--surface); }
 .mermaid svg { max-width: 100%; height: auto; display: block; margin: auto; }
-.mermaid .svg-figure {margin:0;}
-.mermaid img.svg-diagram {padding:16px;box-sizing:border-box;max-width:100%;height:auto;margin:auto;}
+.mermaid .svg-figure { margin:0; padding:0; width:fit-content; min-width:100%; overflow:visible; }
+.mermaid img.svg-diagram { --svg-pad:16px; box-sizing:border-box; height:auto; margin:0 auto; }
 .render-error { padding: 15px; border: 1px solid var(--error); border-radius: 10px; color: var(--error); white-space: pre-wrap; }
 .python-cell { margin: 1.5em 0; border: 1px solid var(--code-border); border-radius: 20px; overflow: hidden; background: var(--code-bg); }
 .python-cell pre { margin: 0; border: 0; border-radius: 0; }
@@ -458,11 +461,15 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .cell-toolbar { min-height: 48px; padding: 0 8px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--code-accent); background: transparent; border-bottom: 1px solid var(--code-border); font: 650 .8rem/1.4 var(--md-ref-typeface-plain,system-ui); }
 .cell-toolbar button { min-height: 36px; padding: 6px 16px; border-radius: 18px; background: var(--primary); color: var(--on-primary); font-weight: 650; transition: border-radius .18s cubic-bezier(.2,0,0,1), transform .12s ease; }
 .cell-toolbar button:active { border-radius: 10px; transform: scale(.97); }
+.cell-toolbar button.python-run:disabled { opacity: .72; cursor: default; }
+.cell-toolbar button.python-stop { background: color-mix(in srgb, var(--error) 16%, var(--surface-high)); color: var(--error); border: 1px solid color-mix(in srgb, var(--error) 42%, var(--code-border)); cursor: pointer; }
+.cell-toolbar button.python-stop:hover:not(:disabled) { background: var(--error); color: var(--surface); border-color: var(--error); }
+.cell-toolbar button.python-stop:disabled { opacity: .65; cursor: default; }
 .cell-output { padding: 14px; border-top: 1px solid var(--code-border); background: color-mix(in srgb, var(--surface) 60%, var(--code-bg)); }
 .cell-output.failed { color: var(--error); }
 .cell-output.stale { opacity: .48; }
 .stale-badge { display: inline-block; margin-left: 8px; padding: 3px 7px; border-radius: 99px; color: var(--on-primary); background: var(--primary); font-size: .68em; font-weight: 750; }
-.cell-output pre { background: transparent; color: inherit; padding: 5px; white-space: pre-wrap; }
+.cell-output pre { background: transparent; color: inherit; padding: 5px; white-space: pre-wrap; overflow-wrap: normal; }
 .cell-output img { background: white; }
 .focus-mode .editor-pane .cm-gutters { visibility: hidden; }
 .focus-mode .markdown-body { width: min(760px, calc(100% - 48px)); }
@@ -724,11 +731,16 @@ button.code-copy:active { border-radius:10px; }
 @media (prefers-reduced-motion:reduce) { .code-disclosure > summary::before, button.code-copy { transition:none; } }
 
 /* Inline SVG drawings */
-.svg-figure { margin: 1.4em 0; display: flex; justify-content: center; }
-.svg-figure img.svg-diagram { display: block; width:100%; max-width: 100%; min-width:0; height: auto; box-sizing:border-box; }
-.svg-figure--color img.svg-diagram { padding: 16px; border-radius: 20px; background: #fdfdfc; box-shadow: 0 0 0 1px var(--code-border); }
+.svg-figure { margin: calc(1.4em - 8px) 0; padding: 8px 0; display: block; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+.svg-figure img.svg-diagram { --svg-pad: 0px; --svg-border: 0px; display: block; width: auto; max-width: 100%; min-width: 0; height: auto; margin: 0 auto; padding: var(--svg-pad); box-sizing: border-box; }
+.markdown-body .svg-figure img.svg-diagram { --svg-border: 2px; }
+.svg-figure img.svg-diagram[data-svg-sized="true"] { width: clamp(calc(var(--svg-min-width, 0px) + 2 * var(--svg-pad) + var(--svg-border)), 100%, calc(var(--svg-width) + 2 * var(--svg-pad) + var(--svg-border))); max-width: none; }
+.svg-figure--color img.svg-diagram { --svg-pad: 16px; border-radius: 20px; background: #fdfdfc; box-shadow: 0 0 0 1px var(--code-border); }
 .mermaid[data-render-dark="true"] .svg-figure--color img.svg-diagram { background: var(--surface, #19171b); }
 .svg-figure--own-background img.svg-diagram { border-radius: 16px; }
+.python-cell .cell-output .svg-figure { margin: 1.4em 0; padding: 0; overflow: visible; }
+.python-cell .cell-output .svg-figure img.svg-diagram { width: 100%; min-width: 0; max-width: 100%; }
+@media print { .mermaid, .svg-figure, .markdown-body p:where(.media-paragraph:has(> .note-image--diagram)) { overflow: visible; } .svg-figure img.svg-diagram[data-svg-sized="true"] { width: auto; min-width: 0; max-width: 100%; } .markdown-body .media-paragraph > .note-image--diagram[data-svg-sized="true"] { width: fit-content; min-width: 0; max-width: 100%; } }
 .media-save-menu{position:fixed;z-index:2147483000;min-width:240px;max-width:calc(100vw - 16px);padding:8px;border:1px solid var(--border,#7776);border-radius:18px;background:var(--surface,#fff);color:var(--text,#20252d);box-shadow:0 14px 42px #0004;font:14px/1.45 'Manrope Variable',sans-serif;filter:none;user-select:none}
 .media-save-title{padding:7px 12px;color:var(--muted,var(--text));font-size:12px;max-width:320px;overflow-wrap:anywhere}
 .media-save-menu button{display:block;width:100%;padding:12px;border:0;border-radius:12px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}

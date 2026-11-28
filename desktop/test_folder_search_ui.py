@@ -1,5 +1,4 @@
 """Software-rendered QML tests for workspace subfolder filtering and empty states."""
-import json
 import os
 import time
 import unittest
