@@ -4,7 +4,7 @@ import { FrameScrollQueue, zoomFrameStep } from "./frameMotion";
 import { applyChainedNativeScroll, NON_VIEWER_OVERLAY_SELECTOR, resolveNativeWheelScrollOrigin } from "./nativeWheelScroll";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom, documentPoint, enforceDocumentCenter, invalidateDocumentZoom, refreshDocumentExtent, settleDocumentZoom } from "./documentZoom";
-import { cancelHeadingNavigation } from "./documentNavigation";
+import { cancelHeadingNavigation, readingKeyboardScrollDelta } from "./documentNavigation";
 import { invoke } from "./nativeBridge";
 import { captureScrollAnchor, markScrollInput } from "./scrollAnchor";
 import { clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, type AnchorViewMode, type SplitAnchorPane } from "./sourceAnchor";
@@ -264,13 +264,13 @@ export function useReaderGesturesAndZoom({ state, reference, controls }: { state
       }
     };
     const scrollKey = (event: KeyboardEvent) => {
-      const target = event.target as Element;
-      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || target.closest('input,textarea,button,summary,[contenteditable="true"],.image-viewer,.media-dialog,.reading-search')) return;
-      const root = target.closest<HTMLElement>(".android-reading") || (target === document.body ? document.querySelector<HTMLElement>(".android-reading") : null);
+      const target = event.target instanceof Element ? event.target : null;
+      const root = target?.closest<HTMLElement>(".android-reading") || (!target || target === document.body || target === document.documentElement ? document.querySelector<HTMLElement>(".android-reading") : null);
       if (!root) return;
-      const page = root.clientHeight * .875;
-      const delta = event.key === "ArrowUp" ? -40 : event.key === "ArrowDown" ? 40 : event.key === "PageUp" ? -page : event.key === "PageDown" ? page : event.key === " " ? (event.shiftKey ? -page : page) : 0;
-      if (delta) rememberWindowedScrollSource(root, delta);
+      const delta = readingKeyboardScrollDelta(event, root);
+      if (delta === null) return;
+      cancelHeadingNavigation(root);
+      rememberWindowedScrollSource(root, delta);
     };
     document.addEventListener("wheel", wheel, { passive: false });
     document.addEventListener("keydown", scrollKey);
