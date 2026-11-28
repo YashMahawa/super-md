@@ -986,8 +986,18 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
-        val imeVisible = WindowInsets.ime.getBottom(density) > 0
+        val imeBottomPx = WindowInsets.ime.getBottom(density)
+        val imeVisible = imeBottomPx > 0
         val modalOpen = settings || exporting || renaming || contentsShown || folderSearch.visible || drawer.isOpen || (!accessPickerShowing && accessRequest != null) || state.pendingCloseNote != null || state.pendingSaveConflictNote != null || state.error != null || !state.welcomed
+        val collapseChromeForKeyboard = shouldCollapseChromeForLandscapeKeyboard(
+            mode = actualMode,
+            imeVisible = imeVisible,
+            modalOpen = modalOpen,
+            viewportWidthDp = maxWidth.value,
+            viewportHeightDp = maxHeight.value,
+            imeBottomDp = imeBottomPx / density.density,
+            chromeHeightDp = chromeHeight / density.density,
+        )
         val showFormattingBar = shouldShowKeyboardFormattingBar(actualMode, imeVisible, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
         val triggerFormat = rememberUpdatedState<(String) -> Unit> { action ->
             val reader = web
@@ -1050,21 +1060,36 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         }
         val headings by model.headings.collectAsStateWithLifecycle()
         val imageOverlay by model.imageOverlay.collectAsStateWithLifecycle()
-        val chromeShown = !state.readerOverlay && !imageOverlay && (readingChromeVisible || state.activeConflicted)
+        val statusTop = WindowInsets.statusBars.getTop(density) / density.density
+        val safeTop = WindowInsets.displayCutout.getTop(density) / density.density
+        val chromeShown = !state.readerOverlay && !imageOverlay && !collapseChromeForKeyboard && (readingChromeVisible || state.activeConflicted)
         val chromeReveal by animateFloatAsState(if(chromeShown) 1f else 0f,
             animationSpec=tween(if(motion) 120 else 0),label="Reading chrome")
-        LaunchedEffect(readerReady,chromeHeight) {
-            if(readerReady) web?.evaluateJavascript("window.supermdChromeInset?.(${chromeHeight/density.density})",null)
+        val effectiveChromeInset = if (collapseChromeForKeyboard) {
+            if (immersive) safeTop else maxOf(safeTop, statusTop)
+        } else {
+            chromeHeight / density.density
+        }
+        LaunchedEffect(readerReady, effectiveChromeInset, collapseChromeForKeyboard) {
+            if (readerReady) {
+                web?.evaluateJavascript(
+                    "document.documentElement.dataset.landscapeKeyboard='${if (collapseChromeForKeyboard) "true" else "false"}';window.supermdChromeInset?.($effectiveChromeInset)",
+                    null,
+                )
+            }
         }
         // Navigation needs to avoid visible controls, but showing/hiding an
         // overlay must never resize the reader or change its first-note spacer.
-        LaunchedEffect(readerReady,chromeHeight,chromeShown) {
-            val visibleInset=if(chromeShown) chromeHeight/density.density else 0f
+        LaunchedEffect(readerReady, chromeHeight, chromeShown, effectiveChromeInset, collapseChromeForKeyboard) {
+            val visibleInset = when {
+                chromeShown -> chromeHeight / density.density
+                collapseChromeForKeyboard -> effectiveChromeInset
+                else -> 0f
+            }
             if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-visible-chrome-inset','${visibleInset}px')",null)
         }
         // Reader overlays (search, repair) hide the top bar and system bars, so
         // they anchor to the cutout-safe top edge, not the hidden chrome height.
-        val safeTop = WindowInsets.displayCutout.getTop(density) / density.density
         LaunchedEffect(readerReady,safeTop) {
             if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-safe-top','${safeTop}px')",null)
         }
@@ -1302,7 +1327,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
-                if (showFormattingBar) KeyboardFormattingBar(onFormat = { triggerFormat.value(it) }) }
+                if (showFormattingBar) KeyboardFormattingBar(onFormat = { triggerFormat.value(it) }, compact = collapseChromeForKeyboard) }
             }
         }
     }
