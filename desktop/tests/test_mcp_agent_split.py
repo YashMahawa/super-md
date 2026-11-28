@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -346,17 +347,35 @@ class AgentMCPExtractionUnitTest(unittest.TestCase):
                 lh.resolve_live_asset_path(store, str(fig))
             if os.name == "posix":
                 priv = base / "private" / "var"
-                (priv / "notes").mkdir(parents=True)
+                (priv / "notes" / ".hidden").mkdir(parents=True)
                 real_fig = priv / "notes" / "ok.svg"
                 real_fig.write_text("<svg/>", encoding="utf-8")
+                hidden_fig = priv / "notes" / ".hidden" / "secret.svg"
+                hidden_fig.write_text("<svg/>", encoding="utf-8")
+                note_md = priv / "notes" / "doc.md"
+                note_md.write_text("# Doc\n", encoding="utf-8")
+                hidden_md = priv / "notes" / ".hidden" / "doc.md"
+                hidden_md.write_text("# Hidden\n", encoding="utf-8")
                 alias_var = base / "var"
                 alias_var.symlink_to(priv)
                 esc = priv / "notes" / "esc.svg"
                 esc.symlink_to(fig)
-                with patch.object(v, "SYSTEM_PATH_ALIASES", ((str(alias_var), str(priv)),)):
+                aliases = ((str(alias_var), str(priv)),)
+                ws_store = DocumentStore([str(priv / "notes")])
+                with patch.object(v, "SYSTEM_PATH_ALIASES", aliases):
                     self.assertEqual(lh.resolve_live_asset_path(store, str(alias_var / "notes" / "ok.svg")), str(alias_var / "notes" / "ok.svg"))
+                    self.assertEqual(lh.resolve_live_asset_path(ws_store, str(alias_var / "notes" / "ok.svg")), str(alias_var / "notes" / "ok.svg"))
+                    with self.assertRaisesRegex(AgentDocumentError, "Hidden"):
+                        lh.resolve_live_asset_path(ws_store, str(alias_var / "notes" / ".hidden" / "secret.svg"))
                     with self.assertRaisesRegex(AgentDocumentError, "Symbolic links"):
                         lh.resolve_live_asset_path(store, str(alias_var / "notes" / "esc.svg"))
+                if importlib.util.find_spec("PySide6"):
+                    from studio import Studio
+
+                    stub = types.SimpleNamespace(folder=str(alias_var / "notes"), settings={}, tabs=[], _agent_open_paths=(), _agent_owned_files=())
+                    self.assertTrue(Studio._agent_path_allowed(stub, alias_var / "notes" / "doc.md", _system_aliases=aliases))
+                    self.assertEqual(Studio._resolve_agent_open_path(stub, str(alias_var / "notes" / "doc.md"), _system_aliases=aliases), note_md.resolve())
+                    self.assertFalse(Studio._agent_path_allowed(stub, alias_var / "notes" / ".hidden" / "doc.md", _system_aliases=aliases))
 
 
 if __name__ == "__main__":

@@ -162,7 +162,7 @@ def resolve_live_asset_path(store: DocumentStore, raw_path: str) -> str:
             raise AgentDocumentError("Symbolic links are not allowed")
         if store.roots:
             try:
-                store.resolve(expanded)
+                store.resolve(aliased)
             except AgentDocumentError as error:
                 if "outside the configured workspace roots" not in str(error):
                     raise
