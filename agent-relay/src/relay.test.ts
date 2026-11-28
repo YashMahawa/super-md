@@ -118,24 +118,21 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   t.after(async () => { await http.close().catch(() => undefined); await httpTransport.close().catch(() => undefined); });
   const list = await http.listTools();
   const expectedToolSchemas: Record<string, { properties: string[]; required?: string[] }> = {
-    list_devices: { properties: [] },
-    list_tabs: { properties: ["deviceId"] },
+    list_devices: { properties: [] }, list_tabs: { properties: ["deviceId"] },
     read_tab: { properties: ["deviceId", "tabId", "heading", "view", "offset", "limit"] },
     search_tab: { properties: ["deviceId", "tabId", "query", "offset", "limit", "context", "caseSensitive", "wholeWord", "regex", "excludeDiagrams"], required: ["tabId", "query"] },
     patch_tab: { properties: ["deviceId", "tabId", "expectedRevision", "operations"], required: ["tabId", "expectedRevision", "operations"] },
-    render_tab: { properties: ["deviceId", "tabId", "width", "quality"], required: ["tabId"] },
-    view_current: { properties: ["deviceId", "tabId", "width", "quality", "includeImage"] },
+    render_tab: { properties: ["deviceId", "tabId", "width", "quality"], required: ["tabId"] }, view_current: { properties: ["deviceId", "tabId", "width", "quality", "includeImage"] },
     diagram_action: { properties: ["deviceId", "tabId", "diagramAction", "diagramId", "expectedRevision", "offset", "limit", "width", "quality"], required: ["tabId", "diagramAction"] },
     replace_tab_asset: { properties: ["deviceId", "tabId", "assetName", "assetPath", "expectedRevision"], required: ["tabId", "assetName", "assetPath", "expectedRevision"] },
     asset_action: { properties: ["deviceId", "tabId", "assetAction", "assetName", "mimeType", "body", "offset", "limit", "expectedRevision"], required: ["tabId", "assetAction", "expectedRevision"] },
-    document_action: { properties: ["deviceId", "documentAction", "tabId", "expectedRevision", "operations", "content", "options"], required: ["documentAction"] },
+    document_action: { properties: ["deviceId", "documentAction", "tabId", "expectedRevision", "content", "options"], required: ["documentAction"] },
   };
   assert.deepEqual(list.tools.map((x) => x.name).sort(), Object.keys(expectedToolSchemas).sort());
   const toolsByName = new Map(list.tools.map((tool) => [tool.name, tool]));
   for (const [name, expected] of Object.entries(expectedToolSchemas)) {
     const tool = toolsByName.get(name);
-    assert.ok(tool, `missing MCP tool ${name}`);
-    assert.ok(typeof tool.description === "string" && tool.description.length > 0, `${name} must advertise a description`);
+    assert.ok(tool && typeof tool.description === "string" && tool.description.length > 0, `${name} must advertise a description`);
     const schema = tool.inputSchema as Record<string, unknown>;
     assert.equal(schema.type, "object", `${name} inputSchema must be object-rooted`);
     assert.notEqual(schema.additionalProperties, false, `${name} top-level inputSchema must not reject unknown keys`);
@@ -143,40 +140,21 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
     assert.ok(props && typeof props === "object" && !Array.isArray(props), `${name} inputSchema must define properties`);
     assert.deepEqual(Object.keys(props), expected.properties, `${name} advertised unexpected property keys`);
     assert.deepEqual(schema.required, expected.required, `${name} advertised unexpected required fields`);
-    if (expected.properties.includes("deviceId")) {
-      assert.equal(props.deviceId?.type, "string");
-      assert.match(String(props.deviceId?.pattern ?? ""), /^\^\[0-9a-f\]\{8\}-/);
-    }
-    if (expected.properties.includes("tabId")) {
-      assert.deepEqual({ type: props.tabId?.type, minLength: props.tabId?.minLength, maxLength: props.tabId?.maxLength }, { type: "string", minLength: 1, maxLength: 512 });
-    }
-    if (expected.properties.includes("expectedRevision")) {
-      assert.deepEqual({ type: props.expectedRevision?.type, pattern: props.expectedRevision?.pattern }, { type: "string", pattern: "^[a-f0-9]{64}$" });
-    }
-    if (expected.properties.includes("width")) {
-      assert.deepEqual({ type: props.width?.type, minimum: props.width?.minimum, maximum: props.width?.maximum }, { type: "integer", minimum: 64, maximum: 1600 });
-    }
-    if (expected.properties.includes("quality")) {
-      assert.deepEqual({ type: props.quality?.type, enum: props.quality?.enum }, { type: "string", enum: ["standard", "high"] });
-    }
+    if (expected.properties.includes("deviceId")) { assert.equal(props.deviceId?.type, "string"); assert.match(String(props.deviceId?.pattern ?? ""), /^\^\[0-9a-f\]\{8\}-/); }
+    if (expected.properties.includes("tabId")) assert.deepEqual({ type: props.tabId?.type, minLength: props.tabId?.minLength, maxLength: props.tabId?.maxLength }, { type: "string", minLength: 1, maxLength: 512 });
+    if (expected.properties.includes("expectedRevision")) assert.deepEqual({ type: props.expectedRevision?.type, pattern: props.expectedRevision?.pattern }, { type: "string", pattern: "^[0-9a-f]{64}$" });
+    if (expected.properties.includes("width")) assert.deepEqual({ type: props.width?.type, minimum: props.width?.minimum, maximum: props.width?.maximum }, { type: "integer", minimum: 64, maximum: 1600 });
+    if (expected.properties.includes("quality")) assert.deepEqual({ type: props.quality?.type, enum: props.quality?.enum }, { type: "string", enum: ["standard", "high"] });
   }
-  const readProps = (toolsByName.get("read_tab")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
-  assert.deepEqual({ minimum: readProps.offset?.minimum, maximum: readProps.offset?.maximum }, { minimum: 0, maximum: 20_000_000 });
-  assert.deepEqual({ minimum: readProps.limit?.minimum, maximum: readProps.limit?.maximum }, { minimum: 1, maximum: 12_000 });
-  const searchProps = (toolsByName.get("search_tab")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
-  assert.deepEqual({ minimum: searchProps.limit?.minimum, maximum: searchProps.limit?.maximum }, { minimum: 1, maximum: 25 });
-  assert.deepEqual({ minimum: searchProps.context?.minimum, maximum: searchProps.context?.maximum }, { minimum: 0, maximum: 500 });
-  const assetProps = (toolsByName.get("asset_action")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
-  assert.deepEqual({ minimum: assetProps.offset?.minimum, maximum: assetProps.offset?.maximum }, { minimum: 0, maximum: 1_048_576 });
-  assert.deepEqual({ minimum: assetProps.limit?.minimum, maximum: assetProps.limit?.maximum }, { minimum: 1, maximum: 12_000 });
-  const docProps = (toolsByName.get("document_action")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+  const propsOf = (n: string) => (toolsByName.get(n)!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+  const [readProps, searchProps, assetProps, docProps] = [propsOf("read_tab"), propsOf("search_tab"), propsOf("asset_action"), propsOf("document_action")];
+  assert.deepEqual({ minimum: readProps.offset?.minimum, maximum: readProps.offset?.maximum, limitMin: readProps.limit?.minimum, limitMax: readProps.limit?.maximum }, { minimum: 0, maximum: 20_000_000, limitMin: 1, limitMax: 12_000 });
+  assert.deepEqual({ limitMin: searchProps.limit?.minimum, limitMax: searchProps.limit?.maximum, ctxMin: searchProps.context?.minimum, ctxMax: searchProps.context?.maximum }, { limitMin: 1, limitMax: 25, ctxMin: 0, ctxMax: 500 });
+  assert.deepEqual({ minimum: assetProps.offset?.minimum, maximum: assetProps.offset?.maximum, limitMin: assetProps.limit?.minimum, limitMax: assetProps.limit?.maximum }, { minimum: 0, maximum: 1_048_576, limitMin: 1, limitMax: 12_000 });
   const docOptionsProps = (docProps.options as { properties?: Record<string, Record<string, unknown>> } | undefined)?.properties ?? {};
-  assert.deepEqual(Object.keys(docOptionsProps), [
-    "pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed",
-    "section", "offset", "background", "saveAs", "discardChanges", "archive", "title", "format", "repairIndices", "filename", "jobId", "limit", "width", "quality",
-  ]);
-  for (const opToolName of ["patch_tab", "document_action"] as const) {
-    const opsItems = ((toolsByName.get(opToolName)!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties.operations?.items ?? {}) as { oneOf?: Array<Record<string, unknown>> };
+  assert.deepEqual(Object.keys(docOptionsProps), ["pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed", "section", "offset", "background", "saveAs", "discardChanges", "archive", "title", "format", "repairIndices", "filename", "jobId", "limit", "width", "quality"]);
+  for (const opToolName of ["patch_tab"] as const) {
+    const opsItems = (propsOf(opToolName).operations?.items ?? {}) as { oneOf?: Array<Record<string, unknown>> };
     assert.equal(opsItems.oneOf?.length, 3, `${opToolName} operations must expose all three patch variants`);
     for (const branch of opsItems.oneOf ?? []) assert.equal(branch.additionalProperties, false, `${opToolName} patch variants must stay strict`);
   }
@@ -198,9 +176,9 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   const badPatch = await http.callTool({name:"patch_tab",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",expectedRevision:revision,operations:[{type:"lines",start_line:1,end_line:1,text:"test",startLine:1}]}});
   assert.equal(badPatch.isError,true);
   assert.equal(fastRequests.length,beforeInvalidPatch,"unknown operation fields never reach a device");
-  const badDocPatch = await http.callTool({name:"document_action",arguments:{deviceId,documentAction:"create",operations:[{type:"insert",line:1,text:"test",extraNestedField:true}]}});
-  assert.equal(badDocPatch.isError,true);
-  assert.equal(fastRequests.length,beforeInvalidPatch,"unknown nested operation fields in document_action never reach a device");
+  const docWithIgnoredOps = await http.callTool({name:"document_action",arguments:{deviceId,documentAction:"create",operations:[{type:"insert",line:1,text:"test",extraNestedField:true}]}});
+  assert.equal(docWithIgnoredOps.isError,undefined,"extra operations property on document_action is stripped by Zod schema");
+  assert.equal("operations" in (fastRequests.at(-1) ?? {}),false,"stripped operations on document_action never reach device RPC");
   await http.callTool({name:"search_tab",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",query:"Ward",offset:100,wholeWord:true,excludeDiagrams:true,caseSensitive:true,limit:4}});
   assert.deepEqual(Object.fromEntries(Object.entries(fastRequests.at(-1)!).filter(([key])=>["offset","wholeWord","excludeDiagrams","caseSensitive","limit"].includes(key))),{offset:100,limit:4,caseSensitive:true,wholeWord:true,excludeDiagrams:true});
   await http.callTool({name:"diagram_action",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",diagramAction:"list",offset:10,limit:5}});
@@ -439,11 +417,27 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   const propsWithImage = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: true } });
   assert.equal(propsWithImage.isError, undefined);
   const propsWithImagePayload = JSON.parse(String(propsWithImage.content?.[1]?.type === "text" ? propsWithImage.content[1].text : "{}"));
+  assert.equal(propsWithImagePayload.readingContextSource, "viewport_capture");
+  assert.equal(propsWithImagePayload.readingContext.tabId, qualifiedDesktopTab);
+  assert.equal(propsWithImagePayload.readingContext.nativeTabId, "note-17");
   assert.deepEqual(propsWithImagePayload.readingContext.properties, expectedProps);
   assert.deepEqual(propsWithImagePayload.captureContext.properties, expectedProps);
+  delete (fastCaptureContext as Record<string, unknown>).properties;
+  const propsFallbackView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: true } });
+  const propsFallbackPayload = JSON.parse(String(propsFallbackView.content?.[1]?.type === "text" ? propsFallbackView.content[1].text : "{}"));
+  assert.equal(propsFallbackPayload.readingContextSource, "viewport_capture");
+  assert.equal(propsFallbackPayload.captureContext.properties, undefined);
+  assert.deepEqual(propsFallbackPayload.readingContext.properties, expectedProps);
+  fastCaptureContext = { context: { ...fastCaptureContext, revision: "c".repeat(64), properties: { title: "Stale title" } } };
+  const propsStaleCapture = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: true } });
+  const propsStalePayload = JSON.parse(String(propsStaleCapture.content?.[1]?.type === "text" ? propsStaleCapture.content[1].text : "{}"));
+  assert.equal(propsStalePayload.readingContextSource, "context_read");
+  assert.equal(propsStalePayload.captureContext.contextRevisionMatches, false);
+  assert.deepEqual(propsStalePayload.readingContext.properties, expectedProps);
   const propsNoImage = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: false } });
   assert.equal(propsNoImage.isError, undefined);
   const propsNoImagePayload = JSON.parse(String(propsNoImage.content?.[0]?.type === "text" ? propsNoImage.content[0].text : "{}"));
+  assert.equal(propsNoImagePayload.readingContextSource, "context_read");
   assert.deepEqual(propsNoImagePayload.readingContext.properties, expectedProps);
   fastContext = undefined;
   fastCaptureContext = undefined;
