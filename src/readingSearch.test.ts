@@ -1414,5 +1414,112 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
     expect(resolveSourceHighlightRange(host,blockNested,nestedMatches,400,"straße",false)).toBeNull();
     host.remove();
   });
+
+  it("resolves search results after inline SVG class mutations without throwing or rebuilding the source-range index",async()=>{
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    Element.prototype.scrollIntoView=vi.fn();
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+    const flushFrames=async()=>{
+      await act(async()=>{
+        await new Promise(resolve=>setTimeout(resolve,15));
+        await new Promise(resolve=>setTimeout(resolve,15));
+      });
+    };
+
+    const p0="Alpha diagram intro.";
+    const p1="Alpha conclusion.";
+    const doc=`${p0}\n\n${p1}`;
+    const p1Start=doc.indexOf(p1);
+    const host=document.createElement("div");
+    host.className="android-reading";
+    host.innerHTML=[
+      `<section class="live-block" data-windowed-block="" data-windowed-mounted="true" data-source-start="0" data-source-end="${p0.length}">`,
+      `  <p data-source-start="0" data-source-end="${p0.length}">${p0}</p>`,
+      `  <svg viewBox="0 0 16 16" aria-hidden="true"><g><path d="M0 0h16v16H0z"></path></g></svg>`,
+      `</section>`,
+      `<section class="live-block" data-windowed-block="" data-windowed-mounted="true" data-source-start="${p1Start}" data-source-end="${doc.length}">`,
+      `  <p data-source-start="${p1Start}" data-source-end="${doc.length}">${p1}</p>`,
+      `</section>`,
+    ].join("");
+    const searchRootEl=document.createElement("div");
+    document.body.append(searchRootEl,host);
+    const sections=host.querySelectorAll<HTMLElement>("[data-windowed-block]");
+    const clean0=registerWindowedText(sections[0],p0);
+    const clean1=registerWindowedText(sections[1],p1);
+
+    const svg=host.querySelector("svg")!;
+    const svgPath=svg.querySelector("path")!;
+    expect(svg).toBeInstanceOf(SVGElement);
+    expect(svg).not.toBeInstanceOf(HTMLElement);
+    expect(typeof (svg as Element).className).toBe("object");
+
+    const ranges=sourceMatches(doc,"Alpha");
+    expect(ranges).toHaveLength(2);
+    // Prime the shared SourceRangeIndex on `host`.
+    expect(resolveSourceHighlightRange(host,doc,ranges,0,"Alpha")?.toString()).toBe("Alpha");
+
+    const qsaSpy=vi.spyOn(Element.prototype,"querySelectorAll");
+    const candidateScans=()=>qsaSpy.mock.calls.filter(([sel])=>String(sel).includes("data-windowed-block")&&String(sel).includes("data-source-start")).length;
+
+    // 1. Synchronous `observer.takeRecords()` path: mutate `<svg>` and `<path>` classes, then immediately resolve source mappings before microtask flush.
+    svg.setAttribute("class","diagram-svg is-zoomed");
+    svg.classList.add("live-block");
+    svgPath.setAttribute("class","diagram-node is-hovered");
+    expect(resolveSourceBlock(host,ranges[0],doc)?.tagName).toBe("P");
+    expect(resolveSourceHighlightRange(host,doc,ranges,0,"Alpha")?.toString()).toBe("Alpha");
+    expect(resolveSourceHighlightRange(host,doc,ranges,1,"Alpha")?.toString()).toBe("Alpha");
+    expect(translateRenderedIndexToSource(host,doc,ranges,1,"Alpha")).toBe(1);
+    expect(translateSourceIndexToRendered(host,doc,ranges,1,"Alpha")).toBe(1);
+    expect(candidateScans()).toBe(0);
+
+    // 2. Async `MutationObserver` callback + interactive `ReadingSearch` resolution (Find & Replace in source).
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{
+        content:doc,
+        close:()=>{},
+        onChange:()=>{},
+        seed:{query:"Alpha",nonce:1},
+      }));
+    });
+    await flushFrames();
+    expect(searchRootEl.querySelector("output")?.textContent).toBe("1 / 2");
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Alpha");
+
+    qsaSpy.mockClear();
+    svg.classList.remove("live-block");
+    svg.classList.add("is-panning");
+    svgPath.classList.toggle("is-selected");
+    await Promise.resolve();
+
+    // Toggling `Replace in source` ON and stepping to match 2 / 2 resolves cleanly without throwing or rebuilding the index.
+    act(()=>searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!.click());
+    await flushFrames();
+    expect(searchRootEl.querySelector("output")?.textContent).toBe("1 / 2");
+
+    svg.setAttribute("class","diagram-svg is-settled");
+    act(()=>searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!.click());
+    await flushFrames();
+    expect(searchRootEl.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Alpha");
+    expect(candidateScans()).toBe(0);
+
+    // A genuine HTMLElement source-relevant class mutation (`code-container`) still invalidates and rebuilds as expected.
+    const extraDiv=document.createElement("div");
+    host.firstElementChild!.append(extraDiv);
+    resolveSourceBlock(host,ranges[0],doc);
+    qsaSpy.mockClear();
+    extraDiv.classList.add("code-container");
+    expect(resolveSourceHighlightRange(host,doc,ranges,1,"Alpha")?.toString()).toBe("Alpha");
+    expect(candidateScans()).toBe(1);
+
+    qsaSpy.mockRestore();
+    clean0();
+    clean1();
+    act(()=>root.unmount());
+  });
 });
 

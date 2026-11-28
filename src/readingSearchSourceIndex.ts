@@ -215,7 +215,8 @@ function hasSourceRelevantMutation(records: MutationRecord[]): boolean {
   for (let i = 0; i < records.length; i++) {
     const m = records[i];
     if (m.type === "childList" || m.attributeName !== "class") return true;
-    const cur = m.target instanceof Element ? m.target.className : "", prev = m.oldValue ?? "";
+    if (!(m.target instanceof HTMLElement)) continue;
+    const cur = m.target.getAttribute("class") ?? "", prev = m.oldValue ?? "";
     if (cur.includes("live-block") !== prev.includes("live-block") || cur.includes("code-container") !== prev.includes("code-container")) return true;
   }
   return false;
