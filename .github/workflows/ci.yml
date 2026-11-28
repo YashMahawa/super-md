@@ -171,7 +171,7 @@ jobs:
       - run: npm test
       - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - name: Test native state, file safety, themes and actual Qt menu geometry
-        timeout-minutes: 8
+        timeout-minutes: 15
         run: python desktop/run_tests.py
         env:
           QT_QPA_PLATFORM: offscreen

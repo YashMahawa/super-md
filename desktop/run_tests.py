@@ -8,15 +8,15 @@ from pathlib import Path
 def suite_watchdog_seconds(platform_name: str = sys.platform, machine: str | None = None) -> int:
     """Return the faulthandler watchdog timeout in seconds.
 
-    CI steps allow 8 minutes (480s) on Linux, Windows, and arm64 macOS
-    (`macos-latest`) because the 80+ Qt Quick / WebEngine / desktop test files
-    (~600 tests) take ~4 minutes in software/offscreen mode. Keep the default
-    suite watchdog at 420s (and 720s on x86_64 macOS under release.yml's
-    15-minute budget) so faulthandler still dumps Python tracebacks before the
-    GitHub Actions step timeout if a Qt driver genuinely stalls.
+    CI and release steps allow 15 minutes (900s) because the 100+ Qt Quick /
+    WebEngine / desktop test modules (720+ tests) take ~6.5-7+ minutes on macOS
+    (`macos-latest` arm64 and `macos-15-intel` x86_64) and ~4-5.5 minutes on
+    Linux and Windows in software/offscreen mode. Keep macOS at 720s (12m) and
+    Linux/Windows at 420s (7m) so faulthandler still dumps Python tracebacks
+    before the GitHub Actions step timeout if a Qt driver genuinely stalls.
     """
-    resolved_machine = platform.machine() if machine is None else machine
-    if platform_name == "darwin" and resolved_machine == "x86_64":
+    _ = platform.machine() if machine is None else machine
+    if platform_name == "darwin":
         return 720
     return 420
 

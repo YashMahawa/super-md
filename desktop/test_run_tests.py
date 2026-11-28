@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import runpy
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -73,7 +74,7 @@ class RunTestsWatchdogTest(unittest.TestCase):
         self.assertTrue(x64_exit)
         self.assertTrue(linux_exit)
         self.assertTrue(win_exit)
-        self.assertEqual(arm64_timeout, 420)
+        self.assertEqual(arm64_timeout, 720)
         self.assertEqual(x64_timeout, 720)
         self.assertEqual(linux_timeout, 420)
         self.assertEqual(win_timeout, 420)
@@ -85,8 +86,11 @@ class RunTestsWatchdogTest(unittest.TestCase):
         win_watchdog, _ = _captured_watchdog_timeout("win32", "AMD64")
         ci_minutes = _workflow_desktop_test_timeout_minutes(REPO_ROOT / ".github" / "workflows" / "ci.yml")
         release_minutes = _workflow_desktop_test_timeout_minutes(REPO_ROOT / ".github" / "workflows" / "release.yml")
+        self.assertEqual(ci_minutes, 15)
+        self.assertEqual(release_minutes, 15)
         for label, watchdog in (
             ("arm64", arm64_watchdog),
+            ("x86_64", x64_watchdog),
             ("linux", linux_watchdog),
             ("windows", win_watchdog),
         ):
@@ -100,11 +104,46 @@ class RunTestsWatchdogTest(unittest.TestCase):
                 watchdog,
                 f"release.yml timeout-minutes ({release_minutes}m = {release_minutes * 60}s) must exceed {label} watchdog ({watchdog}s)",
             )
-        self.assertGreater(
-            release_minutes * 60,
-            x64_watchdog,
-            f"release.yml timeout-minutes ({release_minutes}m = {release_minutes * 60}s) must exceed x86_64 watchdog ({x64_watchdog}s)",
+
+    def test_watchdog_expiration_exits_with_code_1_while_widened_budget_succeeds(self) -> None:
+        probe_code = """
+import faulthandler, runpy, sys, time, unittest
+from unittest import mock
+
+budget = int(sys.argv[1])
+sleep_s = float(sys.argv[2])
+
+class _SlowCase(unittest.TestCase):
+    def runTest(self) -> None:
+        time.sleep(sleep_s)
+
+orig = faulthandler.dump_traceback_later
+def patched(_timeout: int, *, repeat: bool = False, file: object = None, exit: bool = False) -> None:
+    orig(budget, repeat=repeat, file=file, exit=exit)
+
+with (
+    mock.patch("unittest.defaultTestLoader.discover", return_value=unittest.TestSuite([_SlowCase()])),
+    mock.patch("faulthandler.dump_traceback_later", side_effect=patched),
+):
+    runpy.run_path(sys.argv[3], run_name="__main__")
+"""
+        runner_path = str(ROOT / "run_tests.py")
+        expired = subprocess.run(
+            [sys.executable, "-c", probe_code, "1", "1.6", runner_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
+        self.assertEqual(expired.returncode, 1)
+        self.assertIn("Timeout (0:00:01)!", expired.stderr)
+
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code, "5", "0.2", runner_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0)
 
 
 if __name__ == "__main__":
