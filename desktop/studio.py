@@ -57,6 +57,10 @@ from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
+if __package__:
+    from . import studio_assets_rename, studio_portable_assets
+else:
+    import studio_assets_rename, studio_portable_assets
 from latest_writes import ExactWriteAborted, LatestWriteExecutor
 if __package__:
     from . import studio_runtime
@@ -214,20 +218,7 @@ def _is_windows() -> bool:
 
 def _rename_path_with_windows_retry(before: Path, after: Path) -> None:
     """Retry brief Windows sharing/access-denied locks (e.g. watcher teardown or indexer)."""
-    if not _is_windows():
-        before.rename(after)
-        return
-    delay = 0.005
-    deadline = time.monotonic() + 1.5
-    while True:
-        try:
-            before.rename(after)
-            return
-        except PermissionError as error:
-            if getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
-                raise
-            time.sleep(delay)
-            delay = min(0.05, delay * 2.0)
+    studio_assets_rename.rename_path_with_windows_retry(before, after, is_windows_fn=_is_windows)
 
 def _normalize_mcp_roots(roots) -> list[str]:
     if not roots:
@@ -761,71 +752,7 @@ class Session(QObject):
 
     def _remap_session_paths(self, old_path: str, new_path: str, *, is_dir: bool):
         with self._rename_state_lock:
-            for loc_key in list(self.locations.keys()):
-                if folder_ops.matches_path_prefix(loc_key, old_path, is_directory=is_dir):
-                    value = self.locations.pop(loc_key)
-                    self.locations[folder_ops.remap_path_prefix(loc_key, old_path, new_path, is_directory=is_dir)] = value
-            self.pinned = list(dict.fromkeys(
-                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
-                for p in self.pinned
-            ))[:10]
-            remapped_recent = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in self.recent]
-            self.recent = list(dict.fromkeys(self.pinned + remapped_recent))[:10]
-            for entries in self.workspace.values():
-                for entry in entries:
-                    if entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
-                        entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
-            for ws in getattr(self, "window_workspaces", {}).values():
-                if isinstance(ws, dict):
-                    if ws.get("folder") and folder_ops.matches_path_prefix(ws["folder"], old_path, is_directory=is_dir):
-                        ws["folder"] = folder_ops.remap_path_prefix(ws["folder"], old_path, new_path, is_directory=is_dir)
-                    if isinstance(ws.get("expanded"), list):
-                        ws["expanded"] = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in ws["expanded"]]
-                    if ws.get("active") and folder_ops.matches_path_prefix(ws["active"], old_path, is_directory=is_dir):
-                        ws["active"] = folder_ops.remap_path_prefix(ws["active"], old_path, new_path, is_directory=is_dir)
-            for draft_key, draft_list in self.drafts.items():
-                if draft_key == "deleted-notes" or not isinstance(draft_list, list):
-                    continue
-                for draft in draft_list:
-                    if isinstance(draft, dict) and draft.get("path") and folder_ops.matches_path_prefix(draft["path"], old_path, is_directory=is_dir):
-                        updated_path = folder_ops.remap_path_prefix(draft["path"], old_path, new_path, is_directory=is_dir)
-                        draft.update(path=updated_path, name=Path(updated_path).name)
-            if getattr(self, "startup_folder", ""):
-                self.startup_folder = folder_ops.remap_path_prefix(
-                    self.startup_folder, old_path, new_path, is_directory=is_dir
-                )
-            if getattr(self, "startup_expanded", None):
-                self.startup_expanded = [
-                    folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
-                    for p in self.startup_expanded
-                ]
-            for spec_list_attr in ("startup_windows", "_pending_startup_windows"):
-                for spec in getattr(self, spec_list_attr, ()):
-                    if not isinstance(spec, dict):
-                        continue
-                    if spec.get("folder") and folder_ops.matches_path_prefix(spec["folder"], old_path, is_directory=is_dir):
-                        spec["folder"] = folder_ops.remap_path_prefix(spec["folder"], old_path, new_path, is_directory=is_dir)
-                    if isinstance(spec.get("expanded"), list):
-                        spec["expanded"] = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in spec["expanded"]]
-                    if isinstance(spec.get("paths"), list):
-                        spec["paths"] = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in spec["paths"]]
-                    if spec.get("active"):
-                        spec["active"] = folder_ops.remap_path_prefix(spec["active"], old_path, new_path, is_directory=is_dir)
-                    for entry in spec.get("tabs", ()):
-                        if isinstance(entry, dict) and entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
-                            entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
-            self.startup_paths = [
-                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
-                for p in self.startup_paths
-            ]
-            if self.startup_active:
-                self.startup_active = folder_ops.remap_path_prefix(
-                    self.startup_active, old_path, new_path, is_directory=is_dir
-                )
-            for entry in self.startup_entries:
-                if entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
-                    entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
-            self.workspace_links.invalidate()
+            studio_assets_rename.remap_session_paths(self, old_path, new_path, is_dir=is_dir)
 
     def _build_retired_persistence_payloads(self):
         with self._rename_state_lock:
@@ -1621,11 +1548,7 @@ class Studio(QObject):
     def _notify_shortcuts(self): studio_chrome.notify_shortcuts(self)
 
     def _active_watch_suspensions(self):
-        with self.session._watch_suspension_lock:
-            active = [item for item in self.session._watch_suspensions if not item[3].is_set()]
-            if len(active) != len(self.session._watch_suspensions):
-                self.session._watch_suspensions[:] = active
-            return list(active)
+        return studio_assets_rename.active_watch_suspensions(self.session)
 
     def _is_path_suspended(self, candidate: str, suspensions=None) -> bool:
         if not candidate:
@@ -1944,40 +1867,12 @@ class Studio(QObject):
         if targets-watched:self.note_watcher.addPaths(list(targets-watched))
 
     def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool, new_path: str = ""):
-        parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
-        entry_list = [(target_path, parent_str, is_dir, threading.Event(), new_path)]
-        for win in list(self.session.windows.values()):
-            if win.retired or not _watcher_alive(win.note_watcher):
-                continue
-            win.note_watch_paths = None
-            watched = list(win.note_watcher.files() + win.note_watcher.directories())
-            to_remove = [
-                watched_path
-                for watched_path in watched
-                if win._is_watch_target_suspended(watched_path, entry_list)
-            ]
-            if to_remove:
-                win.note_watcher.removePaths(to_remove)
-            if win.external_paths:
-                win.external_paths = {
-                    ext_path
-                    for ext_path in win.external_paths
-                    if not win._is_watch_target_suspended(ext_path, entry_list)
-                }
-                if not win.external_paths:
-                    win.external_timer.stop()
+        studio_assets_rename.suspend_watches_for_prefix(
+            self, target_path, is_dir=is_dir, new_path=new_path, watcher_alive_fn=_watcher_alive
+        )
 
     def _hold_watches_for_rename(self, target_path: str, *, is_dir: bool, new_path: str = "") -> threading.Event:
-        resume_event = threading.Event()
-        parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
-        entry = (target_path, parent_str, is_dir, resume_event, new_path)
-        with self.session._watch_suspension_lock:
-            self.session._watch_suspensions[:] = [
-                item for item in self.session._watch_suspensions if not item[3].is_set()
-            ]
-            self.session._watch_suspensions.append(entry)
-        self._suspend_watches_for_prefix(target_path, is_dir=is_dir, new_path=new_path)
-        return resume_event
+        return studio_assets_rename.hold_watches_for_rename(self, target_path, is_dir=is_dir, new_path=new_path)
 
     def _external_note_changed(self,path):
         if self.retired:return
@@ -4439,79 +4334,9 @@ class Studio(QObject):
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = "", on_rebound=None):
-        parent_str = folder_ops.canonical_path_str(Path(old_path).parent)
-        target_windows = [win for win in list(self.session.windows.values()) if not win.retired]
-        for win in target_windows:
-            for stamp_key in list(win.note_file_stamps.keys()):
-                if folder_ops.matches_path_prefix(stamp_key, old_path, is_directory=is_dir):
-                    win.note_file_stamps.pop(stamp_key, None)
-            for tab in win.tabs:
-                if tab["path"] and folder_ops.matches_path_prefix(tab["path"], old_path, is_directory=is_dir):
-                    updated = folder_ops.remap_path_prefix(tab["path"], old_path, new_path, is_directory=is_dir)
-                    tab.update(path=updated, name=Path(updated).name)
-                    try:
-                        st = Path(updated).stat()
-                        win.note_file_stamps[updated] = (st.st_mtime_ns, st.st_size)
-                    except OSError:
-                        pass
-            for path_set in (win._agent_open_paths, win._agent_owned_files):
-                remapped = {folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in path_set}
-                path_set.clear()
-                path_set.update(remapped)
-            if win.external_paths:
-                win.external_paths = {
-                    ext_path
-                    for ext_path in win.external_paths
-                    if not folder_ops.matches_path_prefix(ext_path, old_path, is_directory=is_dir)
-                    and not folder_ops.matches_path_prefix(ext_path, new_path, is_directory=is_dir)
-                    and not (parent_str and folder_ops.same_path(ext_path, parent_str))
-                }
-                if not win.external_paths:
-                    win.external_timer.stop()
-        if self not in target_windows:
-            for path_set in (self._agent_open_paths, self._agent_owned_files):
-                remapped = {folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in path_set}
-                path_set.clear()
-                path_set.update(remapped)
-        with self.session._rename_state_lock:
-            self.session._remap_session_paths(old_path, new_path, is_dir=is_dir)
-            self.session._retired_persist_needed = False
-        if message and not self.retired:
-            self.message = message
-        self.session.workspace_links.invalidate()
-        self._save_positions()
-        self._preferences(notify=False)
-        for win in target_windows:
-            if win.folder and folder_ops.matches_path_prefix(win.folder, old_path, is_directory=is_dir):
-                win.folder = folder_ops.remap_path_prefix(win.folder, old_path, new_path, is_directory=is_dir)
-            win.expanded = {
-                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
-                for p in win.expanded
-            }
-            win._pinned_visible_dirs = {
-                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
-                for p in getattr(win, "_pinned_visible_dirs", ())
-            }
-            if win._pending_seeded_find and win._pending_seeded_find.get("path"):
-                seeded_path = win._pending_seeded_find["path"]
-                if folder_ops.matches_path_prefix(seeded_path, old_path, is_directory=is_dir):
-                    win._pending_seeded_find["path"] = folder_ops.remap_path_prefix(
-                        seeded_path, old_path, new_path, is_directory=is_dir
-                    )
-        if on_rebound is not None:
-            on_rebound()
-        for win in target_windows:
-            if win.retired:
-                continue
-            win._watch_notes(force=True)
-            win._recover()
-            if win.folder:
-                win._load_tree()
-            if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
-                win._start_folder_search()
-            win._emit()
-        self._invalidate_folder_index(old_path)
-        self._invalidate_folder_index(new_path)
+        studio_assets_rename.sync_path_change(
+            self, old_path, new_path, is_dir=is_dir, message=message, on_rebound=on_rebound
+        )
 
     @Slot(str)
     def notifyMessage(self, text):
@@ -4520,377 +4345,32 @@ class Studio(QObject):
 
     @Slot(str, str, str)
     def createFolderNote(self, parent_path, name, fmt="md"):
-        if not self.folder:
-            self.message = "Open a folder first."
-            self._emit(False)
-            return
-        kind = (fmt or "md").strip().lower().lstrip(".")
-        if kind not in ("md", "smd"):
-            self.message = "Choose Markdown (.md) or portable Super MD (.smd)."
-            self._emit(False)
-            return
-        try:
-            target_dir = folder_ops.resolve_within_open_folder(self.folder, parent_path or self.folder, allow_root=True, must_exist=True)
-            if not target_dir.is_dir():
-                raise ValueError("Choose an existing target folder.")
-            filename = folder_ops.validate_entry_name(name, is_directory=False, current_ext="." + kind)
-            target = target_dir / filename
-            folder_ops.resolve_within_open_folder(self.folder, target, allow_root=False, must_exist=False)
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-        self._activation_generation += 1
-        generation = self._activation_generation
-
-        def work():
-            if target.exists() or folder_ops._is_link_or_junction(target):
-                raise ValueError("An item with that name already exists.")
-            if kind == "smd":
-                write_portable(target, "", {})
-            else:
-                atomic_write(target, b"")
-            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
-            self.session.folder_note_index.invalidate(created_str)
-            return created_str
-
-        def finished(created_path, error):
-            if error or not created_path:
-                return
-            self._invalidate_folder_index(created_path)
-            self.session.workspace_links.invalidate(self.folder)
-            created = Path(created_path)
-            for win in list(self.session.windows.values()):
-                if not win.retired and win.folder:
-                    try:
-                        win_root = Path(folder_ops.canonical_path_str(win.folder))
-                        if folder_ops.matches_path_prefix(created_path, str(win_root), is_directory=True):
-                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created.parent))
-                            win._load_tree()
-                    except OSError:
-                        pass
-            existing = next((t for t in self.tabs if folder_ops.same_path(t["path"], created_path)), None)
-            if existing is None:
-                note = self._note(created.name, "", created_path, "", {}, kind == "smd")
-                self._agent_open_paths.add(created_path)
-                self.tabs.append(note)
-            else:
-                note = existing
-            if generation == self._activation_generation:
-                self.active = note["id"]
-            self.settings["welcomed"] = True
-            self.recent = [created_path] + [p for p in self.recent if not folder_ops.same_path(p, created_path)][:29]
-            self.message = f"Created {created.name}"
-            self._watch_notes(force=True)
-            self._preferences()
-            self.recovery_timer.start(800)
-            self._emit()
-            if generation == self._activation_generation:
-                self._focus_open_target(generation)
-
-        self._submit(work, finished, executor=self.writes)
+        studio_assets_rename.create_folder_note(
+            self, parent_path, name, fmt, write_portable_fn=write_portable, atomic_write_fn=atomic_write
+        )
 
     @Slot(str, str)
     def createSubfolder(self, parent_path, name):
-        if not self.folder:
-            self.message = "Open a folder first."
-            self._emit(False)
-            return
-        try:
-            target_dir = folder_ops.resolve_within_open_folder(self.folder, parent_path or self.folder, allow_root=True, must_exist=True)
-            if not target_dir.is_dir():
-                raise ValueError("Choose an existing target folder.")
-            dirname = folder_ops.validate_entry_name(name, is_directory=True)
-            target = target_dir / dirname
-            folder_ops.resolve_within_open_folder(self.folder, target, allow_root=False, must_exist=False)
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-
-        def work():
-            if target.exists() or folder_ops._is_link_or_junction(target):
-                raise ValueError("An item with that name already exists.")
-            target.mkdir(parents=False, exist_ok=False)
-            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
-            self.session.folder_note_index.invalidate(created_str)
-            return created_str
-
-        def finished(created_dir, error):
-            if error or not created_dir:
-                return
-            self._invalidate_folder_index(created_dir)
-            self.session.workspace_links.invalidate(self.folder)
-            created = Path(created_dir)
-            for win in list(self.session.windows.values()):
-                if not win.retired and win.folder:
-                    try:
-                        win_root = Path(folder_ops.canonical_path_str(win.folder))
-                        if folder_ops.matches_path_prefix(created_dir, str(win_root), is_directory=True):
-                            ancestors = folder_ops.ancestor_directories_in_folder(win_root, created)
-                            win.expanded.update(ancestors)
-                            win._pinned_visible_dirs.update(ancestors)
-                            win._recover()
-                            win._load_tree()
-                    except OSError:
-                        pass
-            self.message = f"Created folder {created.name}"
-            self._emit(False)
-
-        self._submit(work, finished, executor=self.writes)
+        studio_assets_rename.create_subfolder(self, parent_path, name)
 
     def _submit_rename(
-        self,
-        before: Path,
-        after: Path,
-        final_name: str,
-        *,
-        is_dir: bool,
-        message_builder,
-        symlink_error: str,
-        exists_error: str,
+        self, before: Path, after: Path, final_name: str, *,
+        is_dir: bool, message_builder, symlink_error: str, exists_error: str,
+        rename_fn=None,
     ):
-        if self.retired or getattr(self.writes, "_shutdown", False):
-            return
-        before_canon = folder_ops.canonical_path_str(before)
-        after_canon = folder_ops.canonical_path_str(after)
-        resume_event = self._hold_watches_for_rename(before_canon, is_dir=is_dir, new_path=after_canon)
-        session = self.session
-        token = uuid.uuid4().hex
-        state_lock = threading.Lock()
-        finalize_lock = threading.Lock()
-        suspension_released = False
-        finalized = False
-        busy_active = True
-        future_holder: list[Any] = []
-
-        def release_suspension():
-            nonlocal suspension_released
-            with state_lock:
-                if suspension_released:
-                    return False
-                suspension_released = True
-            resume_event.set()
-            with session._watch_suspension_lock:
-                session._watch_suspensions[:] = [
-                    item for item in session._watch_suspensions if not item[3].is_set()
-                ]
-            session._pending_rename_cleanups.pop(token, None)
-            with self._write_callback_lock:
-                self._pending_write_retirements.pop(token, None)
-            return True
-
-        def release_busy():
-            nonlocal busy_active
-            with state_lock:
-                if not busy_active:
-                    return
-                busy_active = False
-            if self.busy > 0:
-                self.busy -= 1
-
-        def work():
-            if folder_ops._is_link_or_junction(after):
-                raise ValueError(symlink_error)
-            if after.exists():
-                same_inode = False
-                if before.name.casefold() == final_name.casefold():
-                    try:
-                        same_inode = os.path.samestat(before.stat(), after.stat())
-                    except OSError:
-                        same_inode = False
-                if not same_inode:
-                    raise ValueError(exists_error)
-            _rename_path_with_windows_retry(before, after)
-            return before_canon, folder_ops.canonical_path_str(after.resolve(strict=True)), is_dir
-
-        def apply_without_live_windows(value, error):
-            nonlocal finalized
-            with finalize_lock:
-                if finalized:
-                    should_apply = False
-                else:
-                    finalized = True
-                    should_apply = True
-            release_busy()
-            if should_apply and value is not None and not error:
-                old_str, new_str, was_dir = value
-                with session._rename_state_lock:
-                    session._remap_session_paths(old_str, new_str, is_dir=was_dir)
-                    session._retired_persist_needed = True
-                session._enqueue_retired_persistence()
-            release_suspension()
-
-        def finalize_without_live_windows(done_future):
-            if done_future.cancelled():
-                value, error = None, "cancelled"
-            else:
-                try:
-                    value, error = done_future.result(), None
-                except Exception as reason:
-                    value, error = None, str(reason)
-            apply_without_live_windows(value, error)
-
-        def finish_on_ui(value, error):
-            nonlocal finalized
-            live_windows = [w for w in list(session.windows.values()) if not w.retired]
-            if not live_windows:
-                apply_without_live_windows(value, error)
-                return
-            with finalize_lock:
-                if finalized:
-                    release_suspension()
-                    return
-                finalized = True
-            release_busy()
-            if error or not value:
-                release_suspension()
-                for win in live_windows:
-                    win._watch_notes(force=True)
-                if not self.retired:
-                    if error:
-                        self.message = error
-                        self.pending_close = ""
-                    self._emit(False)
-                return
-            old_str, new_str, was_dir = value
-            target_win = self if not self.retired else live_windows[0]
-            target_win._sync_path_change(
-                old_str,
-                new_str,
-                is_dir=was_dir,
-                message=message_builder(new_str) if target_win is self else "",
-                on_rebound=release_suspension,
-            )
-
-        def cleanup_when_no_live_windows():
-            nonlocal finalized
-            release_busy()
-            if any(not w.retired for w in list(session.windows.values())):
-                # Keep suspension active until the worker finishes and Session
-                # rebinds paths and identities on the surviving window(s).
-                return
-            fut = future_holder[0] if future_holder else None
-            if fut is None:
-                with finalize_lock:
-                    finalized = True
-                release_suspension()
-                return
-            if fut.done():
-                finalize_without_live_windows(fut)
-
-        session._pending_rename_cleanups[token] = cleanup_when_no_live_windows
-        with self._write_callback_lock:
-            self._pending_write_retirements[token] = cleanup_when_no_live_windows
-
-        self.busy += 1
-        self._emit(False)
-        try:
-            future = self.writes.submit(work)
-        except RuntimeError:
-            with finalize_lock:
-                finalized = True
-            release_busy()
-            release_suspension()
-            for win in list(session.windows.values()):
-                if not win.retired:
-                    win._watch_notes(force=True)
-            self._emit(False)
-            return
-        future_holder.append(future)
-
-        def completed(f):
-            if not any(not w.retired for w in list(session.windows.values())):
-                finalize_without_live_windows(f)
-                return
-            if f.cancelled():
-                value, error = None, ""
-            else:
-                try:
-                    value, error = f.result(), None
-                except Exception as reason:
-                    value, error = None, str(reason)
-            if not any(not w.retired for w in list(session.windows.values())):
-                apply_without_live_windows(value, error)
-                return
-            try:
-                session.renameCompleted.emit((finish_on_ui, value, error))
-            except RuntimeError:
-                apply_without_live_windows(value, error)
-
-        future.add_done_callback(completed)
+        studio_assets_rename.submit_rename(
+            self, before, after, final_name, is_dir=is_dir, message_builder=message_builder,
+            symlink_error=symlink_error, exists_error=exists_error,
+            rename_fn=_rename_path_with_windows_retry if rename_fn is None else rename_fn,
+        )
 
     @Slot(str, str)
     def renameEntry(self, entry_path, name):
-        if not self.folder:
-            self.message = "Open a folder first."
-            self._emit(False)
-            return
-        try:
-            before = folder_ops.resolve_within_open_folder(self.folder, entry_path, allow_root=False, must_exist=True)
-            is_dir = before.is_dir()
-            final_name = folder_ops.validate_entry_name(
-                name,
-                is_directory=is_dir,
-                current_ext="" if is_dir else folder_ops.note_extension(before.name),
-                has_saved_target=True,
-            )
-            after = before.with_name(final_name)
-            if not folder_ops.same_path(after, before):
-                folder_ops.resolve_within_open_folder(self.folder, after, allow_root=False, must_exist=False)
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-        if before.name == final_name:
-            return
-        for win in list(self.session.windows.values()):
-            for tab in win.tabs:
-                if (tab["id"] in win.saving or tab["id"] in win._staging_tabs) and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
-                    self.message = "Wait for the current save to finish."
-                    self._emit(False)
-                    return
-        self._submit_rename(
-            before,
-            after,
-            final_name,
-            is_dir=is_dir,
-            message_builder=lambda new_str: f"Renamed to {Path(new_str).name}",
-            symlink_error="Symlinks are not allowed inside the open folder.",
-            exists_error="An item with that name already exists.",
-        )
+        studio_assets_rename.rename_entry(self, entry_path, name)
 
     @Slot(str, str)
     def renameNote(self, id, name):
-        tab = next((t for t in self.tabs if t["id"] == id), None)
-        if not tab or id in self.saving or id in self._staging_tabs: return
-        try:
-            has_saved = bool(tab.get("path"))
-            existing_ext = folder_ops.note_extension(tab["name"])
-            current_ext = existing_ext if has_saved else (existing_ext or (".smd" if tab.get("portable") else ".md"))
-            final_name = folder_ops.validate_entry_name(
-                name,
-                is_directory=False,
-                current_ext=current_ext,
-                has_saved_target=has_saved,
-            )
-        except ValueError as error:
-            self.message = str(error); self._emit(False); return
-        if not tab["path"]: tab["name"] = final_name; self._recover(); self._emit(False); return
-        before = Path(tab["path"]); after = before.with_name(final_name)
-        if before.name == final_name: return
-        if self.folder and folder_ops.matches_path_prefix(str(before), self.folder, is_directory=True):
-            self.renameEntry(str(before), final_name)
-            return
-        self._submit_rename(
-            before,
-            after,
-            final_name,
-            is_dir=False,
-            message_builder=lambda _new_str: f"Renamed to {final_name}",
-            symlink_error="Symlinks are not allowed.",
-            exists_error="A file with that name already exists.",
-        )
+        studio_assets_rename.rename_note(self, id, name)
 
     @staticmethod
     def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
@@ -6033,150 +5513,34 @@ class Studio(QObject):
         return tab_id, work, finalize, abort
 
     def _extra_asset_roots(self) -> list[Path]:
-        roots: list[Path] = []
-        if getattr(self, "folder", ""):
-            roots.append(Path(self.folder))
-        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
-        if location:
-            roots.append(Path(location))
-        return roots
+        return studio_portable_assets.extra_asset_roots(self)
 
     def _apply_saved_tab_assets(self, tab_id: str, path: Path, content_snapshot: str,
                                 assets_snapshot: dict, updated: dict, stamp=None) -> None:
-        if stamp and hasattr(self, "note_file_stamps"):
-            self.note_file_stamps[str(path)] = stamp
-        target = next((item for item in self.tabs if item["id"] == tab_id), None)
-        if target is not None:
-            extra = {k: v for k, v in target.get("assets", {}).items() if k not in assets_snapshot}
-            target["assets"] = {**updated, **extra} if extra else updated
-            target["saved"] = content_snapshot
-            target["saved_assets"] = dict(updated)
-            target["assets_dirty"] = bool(extra)
-            target["conflict"] = False
-            if Studio._is_dirty(self, target) and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
-                self.autosave_timer.start(900)
-        session = getattr(self, "session", None)
-        reader_assets = getattr(session, "reader_assets", None)
-        if reader_assets is not None:
-            reader_assets.revoke_tab(self.window_id, tab_id)
-        if hasattr(self, "readerCall"):
-            self.readerCall.emit("window.dispatchEvent(new Event('supermd-assets-changed'))")
-        if hasattr(self, "_recover"):
-            self._recover()
-        if hasattr(self, "_emit"):
-            self._emit()
+        studio_portable_assets.apply_saved_tab_assets(
+            self, tab_id, path, content_snapshot, assets_snapshot, updated, stamp,
+            is_dirty_fn=Studio._is_dirty,
+        )
 
     def _prepare_attach_tab_asset(self, args):
-        """Prepare attaching a bounded local or relay-supplied image to a saved portable note."""
-        tab_id = args.get("tabId")
-        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-        if not tab or tab_id != self.active:
-            raise ValueError("Attaching an asset requires the target tab to be active")
-        saving = getattr(self, "saving", None)
-        if saving is not None and tab_id in saving:
-            raise ValueError("A save is already in progress for this tab; retry after it finishes")
-        content_snapshot = tab["content"]
-        revision = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
-        if args.get("expectedRevision") != revision:
-            raise ValueError("Live tab revision changed; inspect it again before attaching an asset")
-        path = Path(tab.get("path") or "")
-        if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
-            raise ValueError("Attaching an asset requires a saved portable .smd note")
-        saved_snapshot = tab["saved"]
-        if Studio._is_dirty(self, tab):
-            raise ValueError("Save the note before attaching a portable asset")
-
-        mime = args.get("mimeType")
-        body = args.get("body")
-        asset_path = args.get("assetPath")
-        if (isinstance(body, str)) == (isinstance(asset_path, str) and bool(asset_path)):
-            raise ValueError("Provide exactly one of base64 body or local assetPath")
-        inline_mode = isinstance(body, str)
-        candidate = None
-        if inline_mode:
-            if mime not in MIMES.values() or len(body) > (MAX_IMAGE * 4 // 3 + 8):
-                raise ValueError("Inline asset type or size is invalid")
-            requested_name = args.get("assetName")
-        else:
-            candidate = _validate_local_tab_asset_path(
-                asset_path,
-                path,
-                Studio._extra_asset_roots(self),
-                unavailable_message="Asset file is unavailable",
-                outside_message="Asset must be inside the current note folder or a configured folder",
-            )
-            if candidate.stat().st_size > MAX_IMAGE:
-                raise ValueError("Asset exceeds 25 MB")
-            extension = candidate.suffix.lower().lstrip(".")
-            mime = MIMES.get(extension)
-            if mime is None:
-                raise ValueError("Asset type must be PNG, JPEG, SVG, GIF, WebP or AVIF")
-            requested_name = args.get("assetName") or candidate.name
-
-        assets_snapshot = dict(tab.get("assets", {}))
-        saved_assets_snapshot = dict(tab.get("saved_assets", assets_snapshot))
-
-        def work():
-            if inline_mode:
-                try:
-                    raw = decode_base64_chunked(body)
-                except (ValueError, TypeError, base64.binascii.Error) as error:
-                    raise ValueError("Asset body must be valid base64") from error
-                if not 1 <= len(raw) <= 1024 * 1024:
-                    raise ValueError("Relay supplied assets are limited to 1 MiB")
-            else:
-                assert candidate is not None
-                raw = candidate.read_bytes()
-                if len(raw) > MAX_IMAGE:
-                    raise ValueError("Asset exceeds 25 MB")
-
-            filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
-            if not is_valid_asset_filename(filename):
-                raise ValueError("Asset name must be a simple filename")
-            ext = Path(filename).suffix.lower().lstrip(".")
-            if not ext:
-                ext = next((item for item, kind in MIMES.items() if kind == mime), "")
-                filename += "." + ext
-                if not is_valid_asset_filename(filename):
-                    raise ValueError("Asset name must be a simple filename")
-            if MIMES.get(ext) != mime:
-                raise ValueError("Asset name extension must match the image type")
-            if not _matches_media_signature(mime, raw):
-                raise ValueError("Asset bytes do not match the declared image type")
-            asset_key = "assets/" + filename
-            if asset_key in assets_snapshot:
-                raise ValueError("An asset with that name already exists")
-            disk_content, disk_assets, portable = open_note(path)
-            if not portable or disk_content != saved_snapshot or disk_assets != saved_assets_snapshot:
-                raise ValueError("The portable note changed on disk; reopen it before attaching an asset")
-            updated = dict(assets_snapshot)
-            updated[asset_key] = f"data:{mime};base64," + encode_base64_chunked(raw)
-            write_portable(path, content_snapshot, updated)
-            try:
-                st = path.stat()
-                stamp = (st.st_mtime_ns, st.st_size)
-            except OSError:
-                stamp = None
-            sha = hashlib.sha256(raw).hexdigest()
-            record = {"name": asset_key, "mime": mime, "bytes": len(raw), "sha256": sha}
-            return {"updated": updated, "stamp": stamp,
-                    "result": {"tabId": tab_id, "assetName": asset_key, "asset": record,
-                               "mimeType": mime, "bytes": len(raw), "sha256": sha,
-                               "revision": revision, "saved": True}}
-
-        def finalize(value, error):
-            if error is not None:
-                return None
-            Studio._apply_saved_tab_assets(
-                self, tab_id, path, content_snapshot, assets_snapshot, value["updated"], value.get("stamp")
-            )
-            return value["result"]
-
-        return tab_id, work, finalize, lambda: None
+        return studio_portable_assets.prepare_attach_tab_asset(
+            self, args,
+            write_portable_fn=write_portable,
+            open_note_fn=open_note,
+            matches_signature_fn=_matches_media_signature,
+            validate_local_asset_fn=_validate_local_tab_asset_path,
+            valid_asset_filename_fn=is_valid_asset_filename,
+            is_dirty_fn=Studio._is_dirty,
+            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
+            extra_asset_roots_fn=Studio._extra_asset_roots,
+        )
 
     def _attach_tab_asset_native(self, args):
-        """Attach a bounded local or relay-supplied image to a saved portable note."""
-        return Studio._run_prepared_write_sync(self, Studio._prepare_attach_tab_asset(self, args))
+        return studio_portable_assets.attach_tab_asset_native(
+            self, args,
+            prepare_fn=Studio._prepare_attach_tab_asset,
+            run_sync_fn=Studio._run_prepared_write_sync,
+        )
 
     @staticmethod
     def _parse_media_envelope(raw: str):
@@ -6204,89 +5568,23 @@ class Studio(QObject):
         return Studio._validate_and_write_media(args, self._media_download_directory())
 
     def _prepare_replace_tab_asset(self, args):
-        tab_id = args.get("tabId")
-        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-        if not tab or tab_id != self.active:
-            raise ValueError("Asset replacement requires the target tab to be active")
-        saving = getattr(self, "saving", None)
-        if saving is not None and tab_id in saving:
-            raise ValueError("A save is already in progress for this tab; retry after it finishes")
-        content_snapshot = tab["content"]
-        current = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
-        if args.get("expectedRevision") != current:
-            raise ValueError("Live tab revision changed; inspect it again before replacing an asset")
-        path = Path(tab.get("path") or "")
-        if not tab.get("portable") or path.suffix.lower() != ".smd" or not path.is_file():
-            raise ValueError("Asset replacement requires a saved portable .smd note")
-        saved_snapshot = tab["saved"]
-        if Studio._is_dirty(self, tab):
-            raise ValueError("Save the note before replacing a portable asset")
-        asset_id, asset_path_value = args.get("assetName"), args.get("assetPath")
-        assets_snapshot = dict(tab.get("assets", {}))
-        saved_assets_snapshot = dict(tab.get("saved_assets", assets_snapshot))
-        asset_name = asset_id if asset_id in assets_snapshot else next((name for name in assets_snapshot
-            if hashlib.sha256(name.encode("utf-8")).hexdigest() == asset_id), None)
-        if not asset_name:
-            raise ValueError("Asset ID is not present in the current note")
-        candidate = _validate_local_tab_asset_path(
-            asset_path_value,
-            path,
-            Studio._extra_asset_roots(self),
-            unavailable_message="Replacement asset file is unavailable",
-            outside_message="Replacement asset must be inside the current note folder or a configured folder",
+        return studio_portable_assets.prepare_replace_tab_asset(
+            self, args,
+            write_portable_fn=write_portable,
+            open_note_fn=open_note,
+            matches_signature_fn=_matches_media_signature,
+            validate_local_asset_fn=_validate_local_tab_asset_path,
+            is_dirty_fn=Studio._is_dirty,
+            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
+            extra_asset_roots_fn=Studio._extra_asset_roots,
         )
-        if candidate.stat().st_size > MAX_IMAGE:
-            raise ValueError("Replacement asset exceeds 25 MB")
-        extension = candidate.suffix.lower().lstrip(".")
-        mime = MIMES.get(extension)
-        expected_mime = MIMES.get(asset_name.rsplit(".", 1)[-1].lower())
-        if not mime or mime != expected_mime:
-            raise ValueError("Replacement asset must keep the existing MIME type and extension")
-
-        def work():
-            raw = candidate.read_bytes()
-            if len(raw) > MAX_IMAGE:
-                raise ValueError("Replacement asset exceeds 25 MB")
-            if not _matches_media_signature(mime, raw):
-                raise ValueError("Replacement asset bytes do not match the current MIME type")
-            old_mime, old_data = image_data(assets_snapshot[asset_name])
-            if old_mime != mime:
-                raise ValueError("Stored asset MIME type does not match its extension")
-            if old_data == raw:
-                return {"changed": False, "result": {"tabId": tab_id, "assetName": asset_name, "asset": asset_name,
-                                                     "assetId": asset_name, "revision": current, "changed": False,
-                                                     "saved": False}}
-            updated = dict(assets_snapshot)
-            updated[asset_name] = f"data:{mime};base64," + encode_base64_chunked(raw)
-            disk_content, disk_assets, disk_portable = open_note(path)
-            if not disk_portable or disk_content != saved_snapshot or disk_assets != saved_assets_snapshot:
-                raise ValueError("The portable note changed on disk; reopen it before replacing an asset")
-            # The text revision is checked above; writing the existing open SMD is
-            # atomic and preserves every other asset and the exact Markdown string.
-            write_portable(path, content_snapshot, updated)
-            try:
-                st = path.stat()
-                stamp = (st.st_mtime_ns, st.st_size)
-            except OSError:
-                stamp = None
-            return {"changed": True, "updated": updated, "stamp": stamp,
-                    "result": {"tabId": tab_id, "assetName": asset_name, "asset": asset_name, "assetId": asset_name,
-                               "revision": current, "changed": True, "saved": True, "bytes": len(raw),
-                               "mimeType": mime}}
-
-        def finalize(value, error):
-            if error is not None:
-                return None
-            if value["changed"]:
-                Studio._apply_saved_tab_assets(
-                    self, tab_id, path, content_snapshot, assets_snapshot, value["updated"], value.get("stamp")
-                )
-            return value["result"]
-
-        return tab_id, work, finalize, lambda: None
 
     def _replace_tab_asset_native(self, args):
-        return Studio._run_prepared_write_sync(self, Studio._prepare_replace_tab_asset(self, args))
+        return studio_portable_assets.replace_tab_asset_native(
+            self, args,
+            prepare_fn=Studio._prepare_replace_tab_asset,
+            run_sync_fn=Studio._run_prepared_write_sync,
+        )
 
     def _agent_viewport_pending(self, request_id, tab_id):
         bridge = getattr(self.session, "agent_bridge", None)
