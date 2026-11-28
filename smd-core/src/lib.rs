@@ -679,7 +679,8 @@ fn normalize_callouts_body(input: &str) -> String {
             depth-=1;output.push_str("> ".repeat(depth).trim_end());output.push('\n');
         } else { output.push_str(&"> ".repeat(depth));output.push_str(line);output.push('\n'); }
     }
-    normalize_prose_links(&normalize_obsidian_embeds(&output))
+    let with_equations = equations::normalize_standalone_equation_blocks(&output);
+    normalize_prose_links(&normalize_obsidian_embeds(&with_equations))
 }
 
 fn encode_md_destination(value: &str) -> String {
@@ -1118,9 +1119,8 @@ impl<'a> Renderer<'a> {
                 Event::Code(value) => out.push_str(&format!("#raw({})", string(&value))),
                 Event::InlineMath(ref value) | Event::DisplayMath(ref value) => {
                     let display = matches!(&event, Event::DisplayMath(_));
-                    let mut sink_map = HashMap::new();
                     let plan = if display {
-                        equations::analyze_display_equation(value, &mut sink_map)
+                        equations::render_display_equation(value, &mut self.equations)
                     } else {
                         equations::DisplayEquationPlan { clean_tex: value.to_string(), tag: None, anchor_ids: Vec::new() }
                     };
@@ -1297,7 +1297,11 @@ impl<'a> Renderer<'a> {
                             let callout = first_line.strip_prefix("[!").and_then(|v| v.split_once(']')).map(|(kind, title)| (kind.to_lowercase(), title.trim_start_matches(['+', '-']).trim().to_string()));
                             let (body, accent) = if let Some((kind, title)) = callout {
                                 self.events.next();
-                                while !matches!(self.events.peek(), None | Some(Event::SoftBreak | Event::HardBreak | Event::End(TagEnd::Paragraph))) { self.events.next(); }
+                                while !matches!(self.events.peek(), None | Some(Event::SoftBreak | Event::HardBreak | Event::End(TagEnd::Paragraph))) {
+                                    if let Some(Event::DisplayMath(v)) = self.events.next() {
+                                        let _ = equations::render_display_equation(&v, &mut self.equations);
+                                    }
+                                }
                                 if matches!(self.events.peek(), Some(Event::SoftBreak | Event::HardBreak)) { self.events.next(); }
                                 let title = if title.is_empty() { kind.clone() } else { title };
                                 let body = self.render(Some(TagEnd::Paragraph))? + "\n\n" + &self.render(Some(close))?;
@@ -1357,7 +1361,7 @@ impl<'a> Renderer<'a> {
                                 Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
                                     let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
                                     let trimmed = decoded.trim();
-                                    if let Some(eq_target) = self.equations.get(trimmed) {
+                                    if let Some(eq_target) = equations::lookup_equation_target(&self.equations, trimmed) {
                                         format!("#link(label({}))[{body}]", string(&eq_target.anchor_id))
                                     } else {
                                         let slug = heading_slug(trimmed);

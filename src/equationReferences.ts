@@ -16,7 +16,7 @@ export interface EquationTarget {
 }
 
 interface ParsedCommand {
-  kind: "tag" | "label" | "eqref" | "ref";
+  kind: "tag" | "label" | "eqref" | "ref" | "notag";
   starred: boolean;
   arg: string;
   start: number;
@@ -267,6 +267,18 @@ function scanLatexCommands(
     let nameEnd = nameStart + 1;
     while (nameEnd < source.length && isAsciiAlpha(source.charCodeAt(nameEnd))) nameEnd++;
     const name = source.slice(nameStart, nameEnd);
+    if ((name === "notag" || name === "nonumber") && allowed.has("notag")) {
+      commands.push({
+        kind: "notag",
+        starred: false,
+        arg: "",
+        start: cmdBackslash,
+        end: nameEnd,
+        raw: source.slice(cmdBackslash, nameEnd),
+      });
+      i = nameEnd;
+      continue;
+    }
     if (
       (name === "tag" || name === "label" || name === "eqref" || name === "ref") &&
       allowed.has(name)
@@ -350,20 +362,100 @@ function normalizeKatexTagArg(raw: string): string {
   return out;
 }
 
-export function extractDisplayEquationMetadata(tex: string): {
+function skipMathTrivia(tex: string, from: number): number {
+  let i = from;
+  while (i < tex.length) {
+    const ch = tex[i];
+    if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+      i++;
+      continue;
+    }
+    if (ch === "%") {
+      const nl = tex.indexOf("\n", i);
+      return nl < 0 ? tex.length : skipMathTrivia(tex, nl + 1);
+    }
+    break;
+  }
+  return i;
+}
+
+function detectOuterEquationEnvironment(
+  tex: string,
+): { starred: boolean; closeStart: number; closeEnd: number } | null {
+  const start = skipMathTrivia(tex, 0);
+  const starred = tex.startsWith("\\begin{equation*}", start);
+  const numbered = !starred && tex.startsWith("\\begin{equation}", start);
+  if (!starred && !numbered) return null;
+
+  const envName = starred ? "equation*" : "equation";
+  const openToken = `\\begin{${envName}}`;
+  const closeToken = `\\end{${envName}}`;
+  let depth = 1;
+  let i = start + openToken.length;
+  while (i < tex.length) {
+    if (tex[i] === "%") {
+      let slashes = 0;
+      for (let j = i - 1; j >= 0 && tex[j] === "\\"; j--) slashes++;
+      if (slashes % 2 === 0) {
+        const nl = tex.indexOf("\n", i);
+        if (nl < 0) break;
+        i = nl + 1;
+        continue;
+      }
+    }
+    if (tex[i] !== "\\") {
+      i++;
+      continue;
+    }
+    let slashEnd = i;
+    while (slashEnd < tex.length && tex[slashEnd] === "\\") slashEnd++;
+    if ((slashEnd - i) % 2 === 0) {
+      i = slashEnd;
+      continue;
+    }
+    const cmdAt = slashEnd - 1;
+    if (tex.startsWith(openToken, cmdAt)) {
+      depth++;
+      i = cmdAt + openToken.length;
+      continue;
+    }
+    if (tex.startsWith(closeToken, cmdAt)) {
+      depth--;
+      const afterClose = cmdAt + closeToken.length;
+      if (depth === 0) {
+        return skipMathTrivia(tex, afterClose) === tex.length
+          ? { starred, closeStart: cmdAt, closeEnd: afterClose }
+          : null;
+      }
+      i = afterClose;
+      continue;
+    }
+    i = slashEnd;
+  }
+  return null;
+}
+
+export function extractDisplayEquationMetadata(
+  tex: string,
+  counter?: { value: number },
+): {
   tag: EquationTagInfo | null;
   labels: string[];
   katexTex: string;
 } {
-  const commands = scanLatexCommands(tex, new Set(["tag", "label"]), true);
-  if (!commands.length) {
+  const outerEq = detectOuterEquationEnvironment(tex);
+  const commands = scanLatexCommands(tex, new Set(["tag", "label", "notag"]), true);
+  if (!commands.length && (!outerEq || outerEq.starred)) {
     return { tag: null, labels: [], katexTex: tex };
   }
   let tag: EquationTagInfo | null = null;
+  let hasExplicitTag = false;
+  let hasNoTag = false;
   const labels: string[] = [];
   const edits: Array<{ start: number; end: number; replacement: string }> = [];
   for (const cmd of commands) {
     if (cmd.kind === "tag") {
+      hasExplicitTag = true;
       const parsed = formatEquationTag(cmd.arg, cmd.starred);
       if (parsed) tag = parsed;
       const normalizedArg = normalizeKatexTagArg(cmd.arg);
@@ -377,7 +469,19 @@ export function extractDisplayEquationMetadata(tex: string): {
     } else if (cmd.kind === "label") {
       labels.push(cmd.arg);
       edits.push({ start: cmd.start, end: cmd.end, replacement: "" });
+    } else if (cmd.kind === "notag") {
+      hasNoTag = true;
     }
+  }
+  if (outerEq && !outerEq.starred && !hasExplicitTag && !hasNoTag) {
+    const number = counter ? ++counter.value : 1;
+    tag = formatEquationTag(String(number), false);
+    edits.push({
+      start: outerEq.closeStart,
+      end: outerEq.closeStart,
+      replacement: `\\tag{${number}}`,
+    });
+    edits.sort((a, b) => a.start - b.start || a.end - b.end);
   }
   if (!edits.length) {
     return { tag, labels, katexTex: tex };
@@ -465,14 +569,42 @@ function isMathCodeBlock(node: any): boolean {
 }
 
 export function remarkEquationReferences() {
-  return (tree: unknown) => {
+  return (tree: unknown, file?: any) => {
+    const sourceText =
+      typeof file?.value === "string"
+        ? file.value
+        : typeof file === "string"
+          ? file
+          : undefined;
+    let lineStarts: number[] | null = null;
+    const pointAtOffset = (offset: number, fallbackLine = 1, fallbackCol = 1) => {
+      if (sourceText === undefined) {
+        return { offset, line: fallbackLine, column: fallbackCol };
+      }
+      if (!lineStarts) {
+        lineStarts = [0];
+        for (let i = 0; i < sourceText.length; i++) {
+          if (sourceText[i] === "\n") lineStarts.push(i + 1);
+        }
+      }
+      let lo = 0;
+      let hi = lineStarts.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (lineStarts[mid] <= offset) lo = mid + 1;
+        else hi = mid;
+      }
+      return { offset, line: lo, column: offset - lineStarts[lo - 1] + 1 };
+    };
+
     const equations = new Map<string, EquationTarget>();
     const nodeLabels = new WeakMap<object, { originalTex: string; katexTex: string; anchorIds: string[] }>();
+    const equationCounter = { value: 0 };
 
     visit(tree as never, (node: any) => {
       if (node.type !== "math" && !isMathCodeBlock(node)) return;
       const originalTex = String(node.value || "");
-      const meta = extractDisplayEquationMetadata(originalTex);
+      const meta = extractDisplayEquationMetadata(originalTex, equationCounter);
       const anchorIds: string[] = [];
       for (const label of meta.labels) {
         if (!equations.has(label)) {
@@ -496,7 +628,8 @@ export function remarkEquationReferences() {
         const resolved = resolveMathReferencesForKatex(baseTex, equations);
         const finalTex = resolved.tex;
         const anchorIds = stored?.anchorIds ?? [];
-        if (!anchorIds.length && finalTex === originalTex) return;
+        const isBareMath = Boolean(node.data?.bareMath);
+        if (!anchorIds.length && finalTex === originalTex && !isBareMath) return;
 
         node.value = finalTex;
         const codeElement = {
@@ -517,14 +650,20 @@ export function remarkEquationReferences() {
           properties: { id, className: ["math-equation-extra-anchor"] },
           children: [],
         }));
+        const srcStart = node.position?.start?.offset;
+        const srcEnd = node.position?.end?.offset;
+        const hasSourceBounds =
+          typeof srcStart === "number" && typeof srcEnd === "number" && srcEnd >= srcStart;
         node.data = {
           ...node.data,
           hName: "div",
           hProperties: {
             ...node.data?.hProperties,
+            ...(hasSourceBounds ? { "data-source-start": srcStart, "data-source-end": srcEnd } : {}),
             ...(anchorIds[0] ? { id: anchorIds[0] } : {}),
             className: ["math-equation-anchor"],
             "data-math-source": originalTex,
+            ...(isBareMath ? { "data-math-bare": "true" } : {}),
           },
           hChildren: [...extraAnchors, preElement],
         };
@@ -589,22 +728,64 @@ export function remarkEquationReferences() {
           const matches = scanLatexCommands(child.value, refCommands, false);
           if (matches.length > 0) {
             modified = true;
+            const childStart = child.position?.start?.offset;
+            const childEnd = child.position?.end?.offset;
+            const hasChildSpan =
+              typeof childStart === "number" &&
+              typeof childEnd === "number" &&
+              childEnd >= childStart;
+            const directSpan = hasChildSpan && childEnd - childStart === child.value.length;
+            let rawSearchCursor = hasChildSpan ? childStart : 0;
+            const makePosition = (from: number, to: number) => ({
+              start: pointAtOffset(from, child.position?.start?.line ?? 1, 1),
+              end: pointAtOffset(to, child.position?.end?.line ?? 1, 1),
+            });
             let cursor = 0;
             for (const match of matches) {
-              if (match.start > cursor) {
-                nextChildren.push({ type: "text", value: child.value.slice(cursor, match.start) });
+              let matchRawStart: number | undefined;
+              let matchRawEnd: number | undefined;
+              if (directSpan) {
+                matchRawStart = childStart + match.start;
+                matchRawEnd = childStart + match.end;
+              } else if (hasChildSpan && sourceText !== undefined) {
+                const found = sourceText.indexOf(match.raw, rawSearchCursor);
+                if (found >= rawSearchCursor && found + match.raw.length <= childEnd) {
+                  matchRawStart = found;
+                  matchRawEnd = found + match.raw.length;
+                }
               }
+              if (match.start > cursor) {
+                const textPos =
+                  matchRawStart !== undefined && rawSearchCursor <= matchRawStart
+                    ? makePosition(rawSearchCursor, matchRawStart)
+                    : undefined;
+                nextChildren.push({
+                  type: "text",
+                  value: child.value.slice(cursor, match.start),
+                  ...(textPos ? { position: textPos } : {}),
+                });
+              }
+              const refPosition =
+                matchRawStart !== undefined && matchRawEnd !== undefined
+                  ? makePosition(matchRawStart, matchRawEnd)
+                  : undefined;
+              const offsetProps =
+                matchRawStart !== undefined && matchRawEnd !== undefined
+                  ? { "data-source-start": matchRawStart, "data-source-end": matchRawEnd }
+                  : {};
               const target = equations.get(match.arg);
               if (target?.tag) {
                 const labelText = match.kind === "eqref" ? target.tag.eqrefText : target.tag.refText;
                 if (nextInsideLink) {
                   nextChildren.push({
                     type: "equationRef",
+                    ...(refPosition ? { position: refPosition } : {}),
                     data: {
                       hName: "span",
                       hProperties: {
                         className: ["equation-ref"],
                         "data-source-tex": match.raw,
+                        ...offsetProps,
                       },
                     },
                     children: [{ type: "text", value: labelText }],
@@ -613,10 +794,12 @@ export function remarkEquationReferences() {
                   nextChildren.push({
                     type: "link",
                     url: `#${target.anchorId}`,
+                    ...(refPosition ? { position: refPosition } : {}),
                     data: {
                       hProperties: {
                         className: ["equation-ref"],
                         "data-source-tex": match.raw,
+                        ...offsetProps,
                       },
                     },
                     children: [{ type: "text", value: labelText }],
@@ -626,20 +809,33 @@ export function remarkEquationReferences() {
                 const fallback = match.kind === "eqref" ? "(??)" : "??";
                 nextChildren.push({
                   type: "equationRef",
+                  ...(refPosition ? { position: refPosition } : {}),
                   data: {
                     hName: "span",
                     hProperties: {
                       className: ["equation-ref", "is-unresolved"],
                       "data-source-tex": match.raw,
+                      ...offsetProps,
                     },
                   },
                   children: [{ type: "text", value: fallback }],
                 });
               }
+              if (matchRawEnd !== undefined) {
+                rawSearchCursor = matchRawEnd;
+              }
               cursor = match.end;
             }
             if (cursor < child.value.length) {
-              nextChildren.push({ type: "text", value: child.value.slice(cursor) });
+              const tailPos =
+                hasChildSpan && rawSearchCursor <= childEnd
+                  ? makePosition(rawSearchCursor, childEnd)
+                  : undefined;
+              nextChildren.push({
+                type: "text",
+                value: child.value.slice(cursor),
+                ...(tailPos ? { position: tailPos } : {}),
+              });
             }
             continue;
           }

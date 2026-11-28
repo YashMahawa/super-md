@@ -427,3 +427,126 @@ it("filters closed callouts in unmounted windowed blocks while keeping open call
   ].join("\n"));
   selection.removeAllRanges();host.remove();
 });
+
+it("preserves bare \\begin{equation} blocks without fabricating $$, leaves fenced and indented equation literals intact, and keeps canonical source offsets across links and offscreen blocks",()=>{
+  const markdown=[
+    "Before [Guide](guide.md), \\eqref{eq:euler}, and \\eqref{eq:basel}:",
+    "",
+    "\\begin{equation}",
+    "e^{i\\pi} + 1 = 0 \\label{eq:euler}",
+    "\\end{equation}",
+    "",
+    "```latex",
+    "\\begin{equation}",
+    "x = 999 \\label{eq:fenced}",
+    "\\end{equation}",
+    "```",
+    "",
+    "    \\begin{equation}",
+    "    y = 888 \\label{eq:indented}",
+    "    \\end{equation}",
+    "",
+    "\\begin{equation}",
+    "\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6} \\label{eq:basel}",
+    "\\end{equation}",
+    "",
+    "After [[Target Note#Section]], [Appendix](appendix.md), and literals \\eqref{eq:fenced} / \\eqref{eq:indented}.",
+  ].join("\n");
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath="/notes/euler.md" python="" dark={false}/>);
+  document.body.append(host);
+  const article=host.querySelector(".markdown-body")!;
+
+  const eqAnchors=Array.from(article.querySelectorAll<HTMLElement>(".math-equation-anchor[data-source-start]"));
+  expect(eqAnchors).toHaveLength(2);
+  expect(eqAnchors.map(el=>(el.querySelector(".katex-tag, .tag")?.textContent||"").replace(/[\s\u200b]+/g," ").trim())).toEqual(["(1)","(2)"]);
+
+  // Every link and equation anchor carries exact canonical UTF-16 source offsets.
+  for(const el of Array.from(article.querySelectorAll<HTMLElement>("a[data-source-start], .math-equation-anchor[data-source-start]"))){
+    const from=Number(el.getAttribute("data-source-start"));
+    const to=Number(el.getAttribute("data-source-end"));
+    expect(to).toBeGreaterThan(from);
+    const slice=markdown.slice(from,to);
+    if(el.id==="smd-eq-eq_3a_euler"){
+      expect(slice).toBe("\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}");
+    }else if(el.id==="smd-eq-eq_3a_basel"){
+      expect(slice).toBe("\\begin{equation}\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6} \\label{eq:basel}\n\\end{equation}");
+    }else if(el.classList.contains("equation-ref")){
+      expect(slice).toBe(el.getAttribute("data-source-tex"));
+    }else if(el.textContent==="Guide"){
+      expect(slice).toBe("[Guide](guide.md)");
+    }else if(el.textContent==="Target Note#Section"){
+      expect(slice).toBe("[[Target Note#Section]]");
+    }else if(el.textContent==="Appendix"){
+      expect(slice).toBe("[Appendix](appendix.md)");
+    }
+  }
+
+  // Copying across the full rendered article preserves exact raw Markdown and literals without surrounding $$.
+  const selection=window.getSelection()!,range=document.createRange();
+  range.selectNodeContents(article);selection.removeAllRanges();selection.addRange(range);
+  const fullCopied=selectedMarkdown(selection,markdown)?.replace(/\n{3,}/g,"\n\n")||"";
+  expect(fullCopied).toContain("Before [Guide](guide.md), \\eqref{eq:euler}, and \\eqref{eq:basel}:");
+  expect(fullCopied).toContain("\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}");
+  expect(fullCopied).toContain("```latex\n\\begin{equation}\nx = 999 \\label{eq:fenced}\n\\end{equation}\n```");
+  expect(fullCopied).toContain("y = 888 \\label{eq:indented}");
+  expect(fullCopied).toContain("\\begin{equation}\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6} \\label{eq:basel}\n\\end{equation}");
+  expect(fullCopied).toContain("After [Target Note#Section](Target%20Note.md#section), [Appendix](appendix.md), and literals \\eqref{eq:fenced} / \\eqref{eq:indented}.");
+  expect(fullCopied).not.toContain("$$");
+
+  // Selecting inside KaTeX glyphs of the bare equation block expands cleanly without $$.
+  const katexGlyph=article.querySelector(".katex-display .katex-html")!;
+  range.setStart(katexGlyph,0);range.setEnd(katexGlyph,1);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe("\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}");
+
+  // Offscreen windowed placeholder slices exact canonical equation offsets.
+  const eqAnchor=article.querySelector<HTMLElement>("#smd-eq-eq_3a_basel")!;
+  const eqStart=eqAnchor.getAttribute("data-source-start")!,eqEnd=eqAnchor.getAttribute("data-source-end")!;
+  const offscreenHost=document.createElement("article");offscreenHost.className="markdown-body";
+  offscreenHost.innerHTML=`<p>Before</p><section data-windowed-mounted="false" data-source-start="${eqStart}" data-source-end="${eqEnd}"></section><p>After</p>`;
+  document.body.append(offscreenHost);
+  range.selectNodeContents(offscreenHost);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe("Before\n\n\\begin{equation}\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6} \\label{eq:basel}\n\\end{equation}\n\nAfter");
+
+  // Bare equation blocks inside callouts omit closed answer bodies until opened and never fabricate $$.
+  const calloutMd=[
+    "> [!answer] Worked equation",
+    "> \\begin{equation}",
+    "> u^2 + v^2 = 1 \\label{eq:unit}",
+    "> \\end{equation}",
+    "",
+    "> [!tip]+ Open equation",
+    "> \\begin{equation}",
+    "> a + b = c \\label{eq:sum}",
+    "> \\end{equation}",
+  ].join("\n");
+  const calloutHost=document.createElement("div");
+  calloutHost.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={calloutMd} documentPath={null} python="" dark={false}/>);
+  document.body.append(calloutHost);
+  const calloutArticle=calloutHost.querySelector(".markdown-body")!;
+  range.selectNodeContents(calloutArticle);selection.removeAllRanges();selection.addRange(range);
+  const closedCalloutCopy=selectedMarkdown(selection,calloutMd)?.replace(/\n{3,}/g,"\n\n")||"";
+  expect(closedCalloutCopy).not.toContain("u^2 + v^2");
+  expect(closedCalloutCopy).not.toContain("$$");
+  expect(closedCalloutCopy).toBe([
+    "> [!answer] Worked equation",
+    "",
+    "> [!tip]+ Open equation",
+    ">",
+    "> \\begin{equation}",
+    "> a + b = c \\label{eq:sum}",
+    "> \\end{equation}",
+  ].join("\n"));
+  const answerDetails=calloutHost.querySelector("details.callout-answer")!;
+  answerDetails.setAttribute("open","");
+  range.selectNodeContents(answerDetails);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,calloutMd)).toBe([
+    "> [!answer] Worked equation",
+    ">",
+    "> \\begin{equation}",
+    "> u^2 + v^2 = 1 \\label{eq:unit}",
+    "> \\end{equation}",
+  ].join("\n"));
+
+  selection.removeAllRanges();calloutHost.remove();offscreenHost.remove();host.remove();
+});

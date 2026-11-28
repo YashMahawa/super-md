@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { applyMathRepairs, suggestMathRepairs } from "./mathRepair";
+import { applyMathRepairs, repairPastedMath, suggestMathRepairs } from "./mathRepair";
 import katex from "katex";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
@@ -82,4 +82,19 @@ $$
 \frac{1}{2}
 $$`;
   expect(suggestMathRepairs(source)).toHaveLength(0);
+});
+it("leaves standalone \\begin{equation} and \\begin{equation*} blocks untouched and protects pastes inside them",()=>{
+  const source=[
+    "See \\eqref{eq:euler}:",
+    "",
+    "\\begin{equation}",
+    "e^{i\\pi} + 1 = 0 \\label{eq:euler}",
+    "\\end{equation}",
+    "",
+    "\\begin{equation*}",
+    "x^2 + y^2 = 1",
+    "\\end{equation*}",
+  ].join("\n");
+  expect(suggestMathRepairs(source)).toEqual([]);
+  expect(repairPastedMath(String.raw`\frac{a}{b}`, "\\begin{equation}\nx = ", "\n\\end{equation}")).toBe(String.raw`\frac{a}{b}`);
 });

@@ -1,9 +1,10 @@
 import { visit } from "unist-util-visit";
+import { findStandaloneEquationBlocks } from "./markdownSource";
 import { tableMathPipeInsertions } from "./tableMath";
 
-/** Obsidian permits TeX on the opening/closing $$ lines. remark-math's
- * flow grammar instead treats opening-line TeX as metadata and requires a
- * standalone closing fence. Normalize parser input only, never saved source. */
+/** Obsidian permits TeX on the opening/closing $$ lines, and academic Markdown
+ * permits standalone \begin{equation}...\end{equation} blocks without $$.
+ * Normalize parser input only, never saved source. */
 export function displayMathInsertions(source: string): Array<{ at: number; text: string }> {
   const edits: Array<{ at: number; text: string }> = [];
   let offset = 0, math = false, fence = "", fenceLength = 0;
@@ -30,7 +31,13 @@ export function displayMathInsertions(source: string): Array<{ at: number; text:
     }
     offset += line.length + 1;
   }
-  return edits;
+  for (const block of findStandaloneEquationBlocks(source)) {
+    edits.push(
+      { at: block.start, text: "$$\n" + block.openPrefix },
+      { at: block.end, text: "\n" + block.closePrefix + "$$" },
+    );
+  }
+  return edits.sort((a, b) => a.at - b.at);
 }
 
 export function normalizedDisplayMath(source: string): string {
@@ -44,6 +51,8 @@ export function normalizedDisplayMath(source: string): string {
 export function remarkObsidianMath(this: any) {
   const parser = this.parser;
   this.parser = (source: string, file: any) => {
+    const bareBlocks = findStandaloneEquationBlocks(source);
+    const bareStarts = new Set(bareBlocks.map((block) => block.start));
     const pipeEdits=tableMathPipeInsertions(source);
     const edits = [...displayMathInsertions(source),...pipeEdits].sort((a,b)=>a.at-b.at);
     if (!edits.length) return parser(source, file);
@@ -66,6 +75,17 @@ export function remarkObsidianMath(this: any) {
     };
     visit(tree, (node: any) => {
       if(node.position)node.position={start:originalPoint(node.position.start),end:originalPoint(node.position.end)};
+      if (node.type === "math" && node.position && bareStarts.has(node.position.start.offset)) {
+        node.data = {
+          ...node.data,
+          bareMath: true,
+          hProperties: {
+            ...node.data?.hProperties,
+            "data-math-source": String(node.value || ""),
+            "data-math-bare": "true",
+          },
+        };
+      }
       if(node.type==="inlineMath"&&pipeEdits.some(edit=>edit.at>=node.position.start.offset&&edit.at<node.position.end.offset)){
         // remark-math preserves GFM's escape as TeX \| (a double bar). Restore
         // the original formula, not a global replacement of genuine TeX norms.
