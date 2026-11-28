@@ -74,11 +74,13 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 import { handoffSharedSourceAnchorOnLoad, parseImportedAnchor, snapshotOutgoingTabOrPathAnchor, useSharedSourceAnchor, type NoteView, type PendingHeadingNavigation } from "./useSharedSourceAnchor";
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; portable?: boolean; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+export interface PortableWriteOptions { id?: string; localAssets?: string[]; omitLocalAssets?: boolean }
+type ReaderLoadPayload = Omit<ReaderState, "pendingHeading" | "content"> & { content?: string; contentUnchanged?: boolean; localAssets?: string[] | null; pendingHeading?: PendingHeadingNavigation | string | null };
+declare global { interface Window { supermdLoad?: (state: ReaderLoadPayload) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean, options?: PortableWriteOptions) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean;sourceStart?:number;sourceEnd?:number;matchText?:string}|null }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean;sourceStart?:number;sourceEnd?:number;matchText?:string;nonce?:number}|null }
 function normalizeSeedBounds(start?: unknown, end?: unknown, matchText?: unknown): { sourceStart?: number; sourceEnd?: number; matchText?: string } {
   if (typeof start === "number" && typeof end === "number" && Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end >= start) {
     return { sourceStart: start, sourceEnd: end, ...(typeof matchText === "string" && matchText ? { matchText } : {}) };
@@ -179,6 +181,7 @@ export function Reader() {
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
   const trustedHostsRef = useRef(trustedHosts); trustedHostsRef.current = trustedHosts;
   const noteImageConsent = useRef(new NoteRemoteImageConsentStore());
+  const noteLocalAssets = useRef(new Map<string, string[]>());
   const [imageConsentVersion, setImageConsentVersion] = useState(0);
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
@@ -269,7 +272,7 @@ export function Reader() {
     window.supermdLoad = (incoming) => {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
-      const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
+      const {contentUnchanged,seededFind,localAssets,...rest}=incoming;
       const applyIncomingFind=(targetContent:string)=>{
         if(seededFind&&typeof seededFind.query==='string'){
           if(willSeedNavigate(targetContent,seededFind.query,seededFind.caseSensitive,seededFind.sourceStart,seededFind.sourceEnd,seededFind.matchText)){
@@ -283,7 +286,17 @@ export function Reader() {
         }
       };
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
-      const next=(contentUnchanged?{...rest,content:old!.content}:rest) as ReaderState;
+      if(Array.isArray(localAssets)){
+        const keys=localAssets.filter((item):item is string=>typeof item==='string'&&item.length>0);
+        noteLocalAssets.current.delete(rest.id);
+        if(keys.length>0){
+          noteLocalAssets.current.set(rest.id,keys);
+          if(noteLocalAssets.current.size>40)noteLocalAssets.current.delete(noteLocalAssets.current.keys().next().value!);
+        }
+      }else if(localAssets===null||rest.portable===false||(old?.id===rest.id&&!contentUnchanged&&old.path!==rest.path)){
+        noteLocalAssets.current.delete(rest.id);
+      }
+      const next=(contentUnchanged?{...rest,content:old!.content}:{...rest,content:rest.content??""}) as ReaderState;
       const rawPending=(rest as {pendingHeading?:PendingHeadingNavigation|string|null}).pendingHeading;
       if(typeof rawPending==='string'){
         const trimmed=rawPending.trim();
@@ -560,12 +573,25 @@ export function Reader() {
       if (!latest || latest.id !== current.id) throw new Error('The export note changed');
       return latest;
     };
-    window.supermdPortable = async (save) => {
+    window.supermdPortable = async (save, options) => {
       const current = reference.current; if (!current) return;
       try {
+        if (options?.id && current.id !== options.id) throw new Error('The export note changed');
         const latest = await flushExportNote(current);
+        if (options?.id && latest.id !== options.id) throw new Error('The export note changed');
         const consentPolicy = noteImageConsent.current.policy(latest.id, trustedHostsRef.current);
-        const prepared = await prepareFmd(latest.content, latest.path, latest.portable !== undefined ? { ...consentPolicy, portable: latest.portable } : consentPolicy); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
+        const scopedLocalAssets = options?.id ? (latest.id === options.id ? noteLocalAssets.current.get(options.id) : undefined) : noteLocalAssets.current.get(latest.id);
+        const localAssets = options?.localAssets ?? scopedLocalAssets;
+        const omitLocalAssets = options?.omitLocalAssets ?? Boolean(localAssets?.length);
+        const fmdOptions = {
+          ...consentPolicy,
+          ...(latest.portable !== undefined ? { portable: latest.portable } : {}),
+          ...(localAssets !== undefined ? { localAssets } : {}),
+          ...(omitLocalAssets ? { omitLocalAssets: true } : {}),
+        };
+        const prepared = await prepareFmd(latest.content, latest.path, fmdOptions);
+        if (reference.current?.id !== latest.id || reference.current.content !== latest.content) throw new Error('The export note changed');
+        await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save, ...(omitLocalAssets ? { mergeLocalAssets: true } : {}) }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
     window.supermdExport = async (options) => {
