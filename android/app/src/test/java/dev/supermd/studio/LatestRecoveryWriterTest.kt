@@ -238,6 +238,25 @@ class LatestRecoveryWriterTest {
             val failedOutcome = writer.flushAndAwaitExact("staged-fail")
             assertEquals(LatestRecoveryWriter.ExactFlushResult.FAILED, failedOutcome.result)
             assertEquals("staged-committed", committed.last())
+
+            // 5. flushAndAwaitExact bypasses debounceMillis (60s debounce completes immediately)
+            val debouncedCommitted = mutableListOf<String>()
+            val debouncedWriter = LatestRecoveryWriter<String, String>(
+                scope = scope,
+                debounceMillis = 60_000,
+                signature = { it },
+                write = { value, commit -> commit { debouncedCommitted += value } },
+            )
+            try {
+                val startedAt = System.nanoTime()
+                val immediateOutcome = debouncedWriter.flushAndAwaitExact("bypass-debounce")
+                val elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000.0
+                assertEquals(LatestRecoveryWriter.ExactFlushResult.COMMITTED, immediateOutcome.result)
+                assertEquals(listOf("bypass-debounce"), debouncedCommitted)
+                assertTrue("flushAndAwaitExact must bypass 60s debounce (took ${elapsedMillis}ms)", elapsedMillis < 5_000.0)
+            } finally {
+                debouncedWriter.closeAfterLatest("bypass-debounce").join()
+            }
         } finally {
             releaseInFlight.complete(Unit)
             releaseMidWrite.complete(Unit)

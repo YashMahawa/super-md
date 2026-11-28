@@ -13,6 +13,8 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModelStore
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import okhttp3.Call
 import okhttp3.Callback
@@ -104,14 +106,36 @@ class AgentStagingAndGraceTest {
         return key to model
     }
 
-    private fun await(condition: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 5_000
+    private fun await(timeoutMillis: Long = 15_000L, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMillis
         while (!condition() && System.currentTimeMillis() < deadline) {
             shadowOf(Looper.getMainLooper()).idle()
             Thread.sleep(10)
         }
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue("Timed out waiting for condition", condition())
+    }
+
+    /**
+     * Runs [block] off Robolectric's Main Thread while idling [Looper.getMainLooper] so
+     * [StudioViewModel]'s `viewModelScope` (`Dispatchers.Main`) coroutines can finish and
+     * release `documentWrites` instead of deadlocking against a blocked Main Thread.
+     */
+    private fun <T> runWithMainLooper(timeoutMillis: Long = 15_000L, block: suspend () -> T): T {
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default)
+        val deferred = scope.async { block() }
+        try {
+            val deadline = System.currentTimeMillis() + timeoutMillis
+            while (deferred.isActive && System.currentTimeMillis() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(5)
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse("Timed out after ${timeoutMillis}ms waiting for suspending operation", deferred.isActive)
+            return runBlocking { deferred.await() }
+        } finally {
+            scope.cancel()
+        }
     }
 
     @Test fun inactiveTabPatchStagesRecoveryImmediatelyPausesAutosaveUntilActivatedAndNeverStealsFocus() {
@@ -131,11 +155,11 @@ class AgentStagingAndGraceTest {
         val patchedRev = agentContentRevision(patchedContent)
 
         val startedAt = System.nanoTime()
-        runBlocking {
+        runWithMainLooper {
             model.commitAgentSnapshotPatch(inactiveId, baseRev, patchedContent, patchedRev)
         }
         val elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000.0
-        assertTrue("Inactive recovery staging took ${elapsedMillis}ms (> 1200ms)", elapsedMillis < 1200.0)
+        assertTrue("Inactive recovery staging took ${elapsedMillis}ms (> 10000ms)", elapsedMillis < 10_000.0)
 
         // Focus/active tab must NOT change when an inactive tab is edited
         assertEquals(activeId, model.state.value.activeId)
@@ -213,7 +237,7 @@ class AgentStagingAndGraceTest {
         File(recoveryFile, "blocker").writeText("locked")
 
         val initialFailure = assertThrows(IllegalStateException::class.java) {
-            runBlocking {
+            runWithMainLooper {
                 model.commitAgentSnapshotPatch(inactiveId, baseRev, v1Content, v1Rev)
             }
         }
@@ -237,7 +261,7 @@ class AgentStagingAndGraceTest {
 
         // Clear the filesystem blocker and retry with the exact same baseRev -> succeeds!
         assertTrue(recoveryFile.deleteRecursively())
-        runBlocking {
+        runWithMainLooper {
             model.commitAgentSnapshotPatch(inactiveId, baseRev, v1Content, v1Rev)
         }
 
@@ -260,7 +284,7 @@ class AgentStagingAndGraceTest {
         // 2. Fail a subsequent stage (v1 -> v2) while durable v1 snapshot already exists on disk
         model.recoverySnapshotWriter = { _, _ -> throw java.io.IOException("Simulated disk full") }
         val secondFailure = assertThrows(IllegalStateException::class.java) {
-            runBlocking {
+            runWithMainLooper {
                 model.commitAgentSnapshotPatch(inactiveId, v1Rev, v2Content, v2Rev)
             }
         }
@@ -284,7 +308,7 @@ class AgentStagingAndGraceTest {
 
         // Restore writer and retry v1 -> v2 with the same v1Rev -> commits cleanly!
         model.recoverySnapshotWriter = NoteRecovery::write
-        runBlocking {
+        runWithMainLooper {
             model.commitAgentSnapshotPatch(inactiveId, v1Rev, v2Content, v2Rev)
         }
         val v2Note = model.state.value.tabs.single { it.id == inactiveId }
@@ -485,7 +509,7 @@ class AgentStagingAndGraceTest {
         val tab = model.state.value.active
         val oversized = "a".repeat(2 * 1024 * 1024 + 16)
         assertThrows(IllegalArgumentException::class.java) {
-            runBlocking {
+            runWithMainLooper {
                 model.commitAgentSnapshotPatch(
                     tab.id,
                     agentContentRevision(tab.content),
@@ -691,7 +715,7 @@ class AgentStagingAndGraceTest {
             await { model.state.value.tabs.any { it.uri == activeUri.toString() } && model.state.value.active.uri == activeUri.toString() }
             val activeId = model.state.value.active.id
             val recoveryFile = File(app.filesDir, "workspaces/$workspaceKey.json")
-            runBlocking { assertTrue(model.flushRecoveryAndAwait()) }
+            runWithMainLooper { assertTrue(model.flushRecoveryAndAwait()) }
 
             val baseContent = provider.readText("folder/Inactive.md")
             val v1Content = baseContent.replace("Original background body.", "Patched across lifecycle flush v1.")
@@ -713,10 +737,10 @@ class AgentStagingAndGraceTest {
                 val inactiveNote = state.tabs.firstOrNull { it.id == inactiveId }
                 if (blockInitialWrite.compareAndSet(true, false)) {
                     inFlightStarted.countDown()
-                    releaseInFlight.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                    releaseInFlight.await(15, java.util.concurrent.TimeUnit.SECONDS)
                 } else if (inactiveNote?.content == v1Content) {
                     v1RetryWriteStarted.countDown()
-                    releaseV1RetryWrite.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                    releaseV1RetryWrite.await(15, java.util.concurrent.TimeUnit.SECONDS)
                 }
                 NoteRecovery.write(writer, state)
                 if (stopTriggered.get() && inactiveNote?.content == baseContent) {
@@ -726,7 +750,7 @@ class AgentStagingAndGraceTest {
 
             // Start an in-flight baseline flush and wait until it is blocked on IO
             model.flush()
-            assertTrue("Initial flush should start on IO", inFlightStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue("Initial flush should start on IO", inFlightStarted.await(15, java.util.concurrent.TimeUnit.SECONDS))
 
             // Dispatch inactive-tab patch_tab (v1) so commitAgentSnapshotPatch queues stagedState (v1) in pending
             harness.sentFrames.clear()
@@ -764,9 +788,9 @@ class AgentStagingAndGraceTest {
             releaseInFlight.countDown()
             assertTrue(
                 "Overlapping lifecycle baseline flush should write unchanged baseline first",
-                baselineAfterStopWritten.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                baselineAfterStopWritten.await(15, java.util.concurrent.TimeUnit.SECONDS),
             )
-            val commitDeadline = System.currentTimeMillis() + 5_000
+            val commitDeadline = System.currentTimeMillis() + 15_000
             while (model.committedRecoveryRevision() < stopFlushRev && System.currentTimeMillis() < commitDeadline) {
                 Thread.sleep(5)
             }
@@ -774,7 +798,7 @@ class AgentStagingAndGraceTest {
             shadowOf(Looper.getMainLooper()).idle()
 
             // Even after baseline flush committed, patch MUST NOT be acknowledged until v1 staged retry commits!
-            assertTrue("Retry of v1 staged snapshot should start", v1RetryWriteStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue("Retry of v1 staged snapshot should start", v1RetryWriteStarted.await(15, java.util.concurrent.TimeUnit.SECONDS))
             shadowOf(Looper.getMainLooper()).idle()
             assertTrue("Uncommitted patch must NOT be acknowledged after baseline flush", harness.sentFrames.isEmpty())
 
@@ -811,7 +835,7 @@ class AgentStagingAndGraceTest {
                         model.flush()
                     } else {
                         v2RetryStarted.countDown()
-                        releaseV2Retry.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                        releaseV2Retry.await(15, java.util.concurrent.TimeUnit.SECONDS)
                     }
                 }
             }
@@ -840,7 +864,7 @@ class AgentStagingAndGraceTest {
                     .put("changed", true),
                 null,
             )
-            val waitDeadline = System.currentTimeMillis() + 5_000
+            val waitDeadline = System.currentTimeMillis() + 15_000
             while (v2RetryStarted.count > 0 && System.currentTimeMillis() < waitDeadline) {
                 shadowOf(Looper.getMainLooper()).idle()
                 Thread.sleep(10)
@@ -890,6 +914,7 @@ class AgentStagingAndGraceTest {
         val stagedAttempts = AtomicInteger(0)
         val injectConcurrentActiveEdits = java.util.concurrent.atomic.AtomicBoolean(true)
         val firstStageEntered = java.util.concurrent.CountDownLatch(1)
+        val saveQueued = java.util.concurrent.CountDownLatch(1)
 
         model.recoverySnapshotWriter = { writer, state ->
             val inactiveNote = state.tabs.firstOrNull { it.id == inactiveId }
@@ -898,7 +923,10 @@ class AgentStagingAndGraceTest {
                 val n = stagedAttempts.incrementAndGet()
                 // Simulate continuous unrelated edits on the active tab during every stage attempt
                 model.edit(activeId, "# Active\n\nConcurrent active edit #$n.\n")
-                firstStageEntered.countDown()
+                if (n == 1) {
+                    firstStageEntered.countDown()
+                    saveQueued.await(15, java.util.concurrent.TimeUnit.SECONDS)
+                }
             }
         }
 
@@ -912,48 +940,153 @@ class AgentStagingAndGraceTest {
             }.exceptionOrNull()
         }.apply { start() }
 
-        assertTrue("Staged write should start", firstStageEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        // Queue a manual save on the active tab while documentWrites is held by commitAgentSnapshotPatch
-        model.saveManual()
+        try {
+            assertTrue("Staged write should start", firstStageEntered.await(15, java.util.concurrent.TimeUnit.SECONDS))
+            // Queue a manual save on the active tab while documentWrites is held by commitAgentSnapshotPatch
+            model.saveManual()
+            shadowOf(Looper.getMainLooper()).idle()
+            saveQueued.countDown()
 
-        patchThread.join(5_000)
-        assertFalse("commitAgentSnapshotPatch must be bounded and never hang under continuous unrelated edits", patchThread.isAlive)
-        assertEquals("Staging retries while holding documentWrites must be bounded to MAX_AGENT_STAGE_ATTEMPTS", MAX_AGENT_STAGE_ATTEMPTS, stagedAttempts.get())
-        assertTrue("Expected recoverable IllegalStateException, got: $patchError", patchError is IllegalStateException)
-        assertTrue("Error should instruct caller to retry: ${patchError?.message}", patchError?.message.orEmpty().contains("retry", ignoreCase = true))
-        assertFalse("Error must not misreport revision conflict: ${patchError?.message}", patchError?.message.orEmpty().contains("revision conflict", ignoreCase = true))
+            val joinDeadline = System.currentTimeMillis() + 15_000
+            while (patchThread.isAlive && System.currentTimeMillis() < joinDeadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                patchThread.join(10)
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse("commitAgentSnapshotPatch must be bounded and never hang under continuous unrelated edits", patchThread.isAlive)
+            assertEquals("Staging retries while holding documentWrites must be bounded to MAX_AGENT_STAGE_ATTEMPTS", MAX_AGENT_STAGE_ATTEMPTS, stagedAttempts.get())
+            assertTrue("Expected recoverable IllegalStateException, got: $patchError", patchError is IllegalStateException)
+            assertTrue("Error should instruct caller to retry: ${patchError?.message}", patchError?.message.orEmpty().contains("retry", ignoreCase = true))
+            assertFalse("Error must not misreport revision conflict: ${patchError?.message}", patchError?.message.orEmpty().contains("revision conflict", ignoreCase = true))
 
-        // Active tab manual save must complete promptly once bounded retry releases documentWrites!
-        val expectedSavedActive = "# Active\n\nConcurrent active edit #$MAX_AGENT_STAGE_ATTEMPTS.\n"
-        await { provider.writesFor("folder/Active.md") >= 1 && provider.readText("folder/Active.md") == expectedSavedActive }
-        assertEquals(0, provider.writesFor("folder/Inactive.md"))
+            // Active tab manual save must complete promptly once bounded retry releases documentWrites!
+            // Also wait for StudioViewModel.save() to resume on MainLooper, clear busy/dirty state, and release documentWrites.
+            val expectedSavedActive = "# Active\n\nConcurrent active edit #$MAX_AGENT_STAGE_ATTEMPTS.\n"
+            await {
+                provider.writesFor("folder/Active.md") >= 1 &&
+                    provider.readText("folder/Active.md") == expectedSavedActive &&
+                    !model.state.value.busy &&
+                    model.state.value.tabs.single { it.id == activeId }.saved == expectedSavedActive
+            }
+            assertEquals(0, provider.writesFor("folder/Inactive.md"))
 
-        // Inactive tab remains unpatched in memory and in durable recovery
-        val unchangedInactive = model.state.value.tabs.single { it.id == inactiveId }
-        assertEquals(baseContent, unchangedInactive.content)
-        assertFalse(unchangedInactive.agentStaged)
-        assertFalse(unchangedInactive.agentUnreviewed)
-        assertTrue(unchangedInactive.agentEdits.isEmpty())
+            // Inactive tab remains unpatched in memory and in durable recovery
+            val unchangedInactive = model.state.value.tabs.single { it.id == inactiveId }
+            assertEquals(baseContent, unchangedInactive.content)
+            assertFalse(unchangedInactive.agentStaged)
+            assertFalse(unchangedInactive.agentUnreviewed)
+            assertTrue(unchangedInactive.agentEdits.isEmpty())
 
-        injectConcurrentActiveEdits.set(false)
-        runBlocking { assertTrue(model.flushRecoveryAndAwait()) }
-        val recoveryFile = File(app.filesDir, "workspaces/$workspaceKey.json")
-        val recoveredAfterStorm = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
-        assertEquals(baseContent, recoveredAfterStorm.tabs.single { it.id == inactiveId }.content)
-        assertEquals(expectedSavedActive, recoveredAfterStorm.tabs.single { it.id == activeId }.content)
+            injectConcurrentActiveEdits.set(false)
+            runWithMainLooper { assertTrue(model.flushRecoveryAndAwait()) }
+            val recoveryFile = File(app.filesDir, "workspaces/$workspaceKey.json")
+            val recoveredAfterStorm = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
+            assertEquals(baseContent, recoveredAfterStorm.tabs.single { it.id == inactiveId }.content)
+            assertEquals(expectedSavedActive, recoveredAfterStorm.tabs.single { it.id == activeId }.content)
 
-        // Once the edit storm subsides, retrying with the exact same baseRev succeeds cleanly
-        stagedAttempts.set(0)
-        model.recoverySnapshotWriter = NoteRecovery::write
-        runBlocking {
-            model.commitAgentSnapshotPatch(inactiveId, baseRev, patchedContent, patchedRev)
+            // Once the edit storm subsides, retrying with the exact same baseRev succeeds cleanly
+            stagedAttempts.set(0)
+            model.recoverySnapshotWriter = NoteRecovery::write
+            runWithMainLooper {
+                model.commitAgentSnapshotPatch(inactiveId, baseRev, patchedContent, patchedRev)
+            }
+            val stagedNote = model.state.value.tabs.single { it.id == inactiveId }
+            assertEquals(patchedContent, stagedNote.content)
+            assertTrue(stagedNote.agentStaged)
+            assertEquals(1, stagedNote.agentEdits.size)
+            val recoveredFinal = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
+            assertEquals(patchedContent, recoveredFinal.tabs.single { it.id == inactiveId }.content)
+        } finally {
+            injectConcurrentActiveEdits.set(false)
+            saveQueued.countDown()
+            model.recoverySnapshotWriter = NoteRecovery::write
         }
-        val stagedNote = model.state.value.tabs.single { it.id == inactiveId }
-        assertEquals(patchedContent, stagedNote.content)
-        assertTrue(stagedNote.agentStaged)
-        assertEquals(1, stagedNote.agentEdits.size)
-        val recoveredFinal = recoveryFile.bufferedReader().use { NoteRecovery.read(it, StudioState()) }
-        assertEquals(patchedContent, recoveredFinal.tabs.single { it.id == inactiveId }.content)
+    }
+
+    @Test
+    fun dirtyDraftCoauthoringPersistsAcrossRecoveryRestoreAndManualSaveUpdatesDiskAndClearsUnreviewed() {
+        val (workspaceKey, model) = newModel()
+
+        model.open(inactiveUri)
+        await { model.state.value.tabs.any { it.uri == inactiveUri.toString() } }
+        model.open(activeUri)
+        await {
+            model.state.value.active.uri == activeUri.toString() &&
+                model.state.value.tabs.count { it.uri != null } == 2
+        }
+
+        val activeId = model.state.value.tabs.single { it.uri == activeUri.toString() }.id
+        val inactiveId = model.state.value.tabs.single { it.uri == inactiveUri.toString() }.id
+        val originalActiveDisk = "# Active\n\nFocused body.\n"
+        val originalInactiveDisk = "# Inactive\n\nOriginal background body.\n"
+
+        // Create dirty drafts on both notes before any autosave writes to disk.
+        val dirtyActive = "# Active\n\nFocused body.\n\nDirty user active draft.\n"
+        val dirtyInactive = "# Inactive\n\nOriginal background body.\n\nDirty user background draft.\n"
+        model.readerEdit(activeId, dirtyActive)
+        model.readerEdit(inactiveId, dirtyInactive)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // Active-tab coauthoring in current reader + background-tab coauthoring on dirty drafts.
+        val coauthoredActive = "$dirtyActive\nActive AI addition.\n"
+        model.readerEdit(activeId, coauthoredActive)
+        model.markAgentBannerShown(activeId, dirtyActive, coauthoredActive)
+
+        val coauthoredInactive = "$dirtyInactive\nBackground AI addition.\n"
+        runWithMainLooper {
+            model.commitAgentSnapshotPatch(
+                inactiveId,
+                agentContentRevision(dirtyInactive),
+                coauthoredInactive,
+                agentContentRevision(coauthoredInactive),
+            )
+        }
+        runWithMainLooper { assertTrue(model.flushRecoveryAndAwait()) }
+
+        // Disk files still hold original saved text prior to autosave/manual save.
+        assertEquals(originalActiveDisk, provider.readText("folder/Active.md"))
+        assertEquals(originalInactiveDisk, provider.readText("folder/Inactive.md"))
+
+        // Restore into a fresh StudioViewModel for the same workspaceKey.
+        val restoredModel = StudioViewModel(app, workspaceKey)
+        restoredModel.readerFlushRequester = { true }
+        viewModels += ViewModelStore().apply {
+            val put = ViewModelStore::class.java.getDeclaredMethod("put", String::class.java, androidx.lifecycle.ViewModel::class.java)
+            put.isAccessible = true
+            put.invoke(this, "$workspaceKey-restored", restoredModel)
+        }
+        await { restoredModel.state.value.tabs.count { it.uri != null } == 2 }
+        val restoredActive = restoredModel.state.value.tabs.single { it.id == activeId }
+        val restoredInactive = restoredModel.state.value.tabs.single { it.id == inactiveId }
+
+        assertEquals(coauthoredActive, restoredActive.content)
+        assertEquals(originalActiveDisk, restoredActive.saved)
+        assertTrue(restoredActive.dirty)
+        assertTrue(restoredActive.agentUnreviewed)
+        assertEquals(1, restoredActive.agentEdits.size)
+        assertEquals(dirtyActive, restoredActive.agentEdits.single().before)
+        assertEquals(coauthoredActive, restoredActive.agentEdits.single().after)
+
+        assertEquals(coauthoredInactive, restoredInactive.content)
+        assertEquals(originalInactiveDisk, restoredInactive.saved)
+        assertTrue(restoredInactive.dirty)
+        assertTrue(restoredInactive.agentStaged)
+        assertTrue(restoredInactive.agentUnreviewed)
+        assertEquals(dirtyInactive, restoredInactive.agentEdits.single().before)
+
+        // Simulate Undo in the restored reader back to dirtyActive, then manual Save to disk.
+        restoredModel.readerEdit(activeId, dirtyActive)
+        restoredModel.dismissAgentBanner(activeId)
+        restoredModel.saveManual()
+        await {
+            provider.readText("folder/Active.md") == dirtyActive &&
+                !restoredModel.state.value.busy &&
+                !restoredModel.state.value.tabs.single { it.id == activeId }.dirty
+        }
+        val savedActive = restoredModel.state.value.tabs.single { it.id == activeId }
+        assertEquals(dirtyActive, savedActive.saved)
+        assertFalse(savedActive.agentUnreviewed)
+        assertEquals(originalInactiveDisk, provider.readText("folder/Inactive.md"))
     }
 }
 

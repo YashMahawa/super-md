@@ -11,21 +11,31 @@ if __package__:
     from . import pending_python, python_runtime, studio_exports, studio_saves
     from .documents import MIMES, atomic_json, image_data, open_note, write_portable
     from .reader_assets import resolve_source
-    from .workspace_links import resolve_workspace_link
+    from .workspace_links import NOTE_EXTENSIONS, resolve_workspace_link
 else:
     import pending_python, python_runtime, studio_exports, studio_saves
     from documents import MIMES, atomic_json, image_data, open_note, write_portable
     from reader_assets import resolve_source
-    from workspace_links import resolve_workspace_link
+    from workspace_links import NOTE_EXTENSIONS, resolve_workspace_link
 
 _EXPECTED_EXPORT_SUFFIXES = {"export_pdf_native": (".pdf",), "export_markdown_native": (".md", ".markdown", ".txt", ".zip"), "export_fmd_native": (".smd",)}
 
-def _set_agent_banner_unreviewed(studio_obj: Any, request_id: str, tab_id: Any, unreviewed: bool) -> None:
-    target = next((t for t in studio_obj.tabs if t["id"] == tab_id), None)
-    if target and bool(target.get("agent_unreviewed")) != unreviewed:
-        target["agent_unreviewed"] = unreviewed
-        studio_obj.recovery_timer.start(800)
-        studio_obj._emit(False)
+def _is_searchable_note_name(name: str) -> bool:
+    return bool(name and not name.startswith(".") and (dot := name.rfind(".")) > 0 and name[dot:].lower() in NOTE_EXTENSIONS)
+
+def _set_agent_banner_unreviewed(studio_obj: Any, request_id: str, args: dict, unreviewed: bool) -> None:
+    target = next((t for t in studio_obj.tabs if t["id"] == args.get("id")), None)
+    if target:
+        before, after = args.get("before"), args.get("after")
+        recorded = bool(unreviewed and isinstance(before, str) and isinstance(after, str) and before != after)
+        if recorded:
+            studio_obj._append_agent_edit(target, before, after)
+            if target.get("agent_edits") and (seq_map := getattr(studio_obj, "_last_reader_agent_seq", None)) is not None:
+                seq_map[target["id"]] = target["agent_edits"][-1]["seq"]
+        if bool(target.get("agent_unreviewed")) != unreviewed or recorded:
+            target["agent_unreviewed"] = unreviewed
+            studio_obj.recovery_timer.start(800)
+            studio_obj._emit(False)
     studio_obj.replied.emit(request_id, "true", "")
 
 def _handle_immediate_command(
@@ -66,7 +76,7 @@ def _handle_immediate_command(
         studio_obj._emit()
         studio_obj.replied.emit(request_id, "true", "")
     elif command in ("agent_banner_shown", "agent_banner_dismissed"):
-        _set_agent_banner_unreviewed(studio_obj, request_id, args.get("id"), command == "agent_banner_shown")
+        _set_agent_banner_unreviewed(studio_obj, request_id, args, command == "agent_banner_shown")
     elif command == "reader_chrome":
         action = args.get("action")
         if action not in ("show", "hide", "toggle"): raise ValueError("Invalid reading chrome action")
@@ -340,6 +350,7 @@ def _finish_worker_command(
     studio_obj: Any, request_id: str, command: str, args: dict, captured: dict, result: Any, error: Any,
     *, output: str, save_as: str, save_as_tab: str, is_portable_tab_save: bool, saving_tab_id: str,
     agent_export_info: dict | None, preserve_unchanged_assets_fn=studio_saves.preserve_unchanged_assets,
+    is_searchable_note_name_fn=_is_searchable_note_name,
     studio_exports_mod=studio_exports, studio_saves_mod=studio_saves,
 ) -> None:
     if is_portable_tab_save: studio_obj.saving.discard(saving_tab_id)
@@ -371,10 +382,13 @@ def _finish_worker_command(
             preserve_unchanged_assets_fn=preserve_unchanged_assets_fn,
             clear_agent_staging_fn=getattr(studio_obj, "_clear_agent_staging", None),
             is_dirty_fn=getattr(studio_obj, "_is_dirty", None),
+            invalidate_folder_index_fn=getattr(studio_obj, "_invalidate_folder_index", None),
             refresh_open_folder_trees_fn=getattr(studio_obj, "_refresh_open_folder_trees", None),
         )
     elif command.startswith("export_"):
         studio_exports_mod.finalize_standalone_export(studio_obj, result["path"])
+        if is_searchable_note_name_fn(Path(result["path"]).name) and callable(inv := getattr(studio_obj, "_invalidate_folder_index", None)):
+            inv(result["path"])
     if agent_export_info:
         studio_exports_mod.complete_agent_export(studio_obj, request_id, agent_export_info, result)
     if not agent_export_info:
@@ -386,6 +400,7 @@ def post_message(
     atomic_json_fn=atomic_json, image_data_fn=image_data, mimes=MIMES, open_note_fn=open_note,
     write_portable_fn=write_portable, preserve_unchanged_assets_fn=studio_saves.preserve_unchanged_assets,
     resolve_source_fn=resolve_source, asset_identity_fn=id, resolve_workspace_link_fn=resolve_workspace_link,
+    is_searchable_note_name_fn=_is_searchable_note_name,
     pending_python_mod=pending_python, python_runtime_mod=python_runtime,
     studio_exports_mod=studio_exports, studio_saves_mod=studio_saves,
     parse_media_envelope_fn=None, validate_and_write_media_fn=None,
@@ -459,6 +474,7 @@ def post_message(
             studio_obj, id, command, args, captured, result, error, output=output, save_as=save_as,
             save_as_tab=save_as_tab, is_portable_tab_save=is_portable_tab_save, saving_tab_id=saving_tab_id,
             agent_export_info=agent_export_info, preserve_unchanged_assets_fn=preserve_unchanged_assets_fn,
+            is_searchable_note_name_fn=is_searchable_note_name_fn,
             studio_exports_mod=studio_exports_mod, studio_saves_mod=studio_saves_mod,
         )
         if is_portable_tab_save and (studio_obj.retired or getattr(studio_obj.writes, "_shutdown", False)):

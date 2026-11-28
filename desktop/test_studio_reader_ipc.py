@@ -131,9 +131,12 @@ class StudioReaderIpcTests(unittest.TestCase):
             self.studio.post("ab-1", "agent_banner_shown", json.dumps({"id": tab["id"]}))
             self.studio.post("ab-2", "agent_banner_shown", json.dumps({"id": tab["id"]}))
             self.assertEqual((tab["agent_unreviewed"], emit_spy.call_count), (True, 1))
+            self.studio.post("ab-edit", "agent_banner_shown", json.dumps({"id": tab["id"], "before": "old", "after": "new"}))
+            self.assertEqual((len(tab["agent_edits"]), emit_spy.call_count), (1, 2))
+            self.assertEqual(self.studio._last_reader_agent_seq[tab["id"]], tab["agent_edits"][-1]["seq"])
             self.studio.post("ab-3", "agent_banner_dismissed", json.dumps({"id": tab["id"]}))
             self.studio.post("ab-4", "agent_banner_dismissed", json.dumps({"id": tab["id"]}))
-            self.assertEqual((tab["agent_unreviewed"], emit_spy.call_count), (False, 2))
+            self.assertEqual((tab["agent_unreviewed"], emit_spy.call_count), (False, 3))
 
         chrome_actions: list[str] = []
         self.studio.chromeRequested.connect(chrome_actions.append)
@@ -245,33 +248,36 @@ class StudioReaderIpcTests(unittest.TestCase):
             self.assertEqual(self._wait_reply("py-cancel"), ("null", "Python cell cancelled"))
 
         md_out, zip_out, smd_out, pdf_out = (self.root / n for n in ("out.md", "out.zip", "out.smd", "out.pdf"))
-        self.studio.pending_export = str(md_out)
-        self.studio.post("ex-md", "export_markdown_native", json.dumps({"id": tab["id"], "content": "# Out\n", "assets": {}}))
-        self.assertEqual(self._norm(json.loads(self._wait_reply("ex-md")[0])["path"]), self._norm(md_out))
+        invalidated: list[str] = []
+        with patch.object(self.studio, "_invalidate_folder_index", side_effect=lambda p=None: invalidated.append(self._norm(p))):
+            self.studio.pending_export = str(md_out)
+            self.studio.post("ex-md", "export_markdown_native", json.dumps({"id": tab["id"], "content": "# Out\n", "assets": {}}))
+            self.assertEqual(self._norm(json.loads(self._wait_reply("ex-md")[0])["path"]), self._norm(md_out))
 
-        self.studio.pending_export = str(zip_out)
-        self.studio.post("ex-zip", "export_markdown_native", json.dumps({"id": tab["id"], "content": "![a](assets/a.svg)\n", "assets": {"assets/a.svg": SVG_DATA}, "archive": True}))
-        self._wait_reply("ex-zip")
-        with zipfile.ZipFile(zip_out) as zf:
-            self.assertTrue(any(name.endswith(".md") for name in zf.namelist()))
+            self.studio.pending_export = str(zip_out)
+            self.studio.post("ex-zip", "export_markdown_native", json.dumps({"id": tab["id"], "content": "![a](assets/a.svg)\n", "assets": {"assets/a.svg": SVG_DATA}, "archive": True}))
+            self._wait_reply("ex-zip")
+            with zipfile.ZipFile(zip_out) as zf:
+                self.assertTrue(any(name.endswith(".md") for name in zf.namelist()))
 
-        portable_calls: list[Path] = []
-        with patch("studio.write_portable", side_effect=lambda p, c, a: (portable_calls.append(Path(p)), documents.write_portable(p, c, a))[1]):
-            self.studio.pending_export = str(smd_out)
-            self.studio.post("ex-smd", "export_fmd_native", json.dumps({"id": tab["id"], "content": "# Portable\n", "assets": {}, "save": False}))
-            self.assertEqual(self._norm(json.loads(self._wait_reply("ex-smd")[0])["path"]), self._norm(smd_out))
-        self.assertEqual(len(portable_calls), 1)
+            portable_calls: list[Path] = []
+            with patch("studio.write_portable", side_effect=lambda p, c, a: (portable_calls.append(Path(p)), documents.write_portable(p, c, a))[1]):
+                self.studio.pending_export = str(smd_out)
+                self.studio.post("ex-smd", "export_fmd_native", json.dumps({"id": tab["id"], "content": "# Portable\n", "assets": {}, "save": False}))
+                self.assertEqual(self._norm(json.loads(self._wait_reply("ex-smd")[0])["path"]), self._norm(smd_out))
+            self.assertEqual(len(portable_calls), 1)
 
-        class FakePopen:
-            pid, returncode = 9999, 0
-            def __init__(self, cmd, **_kw): Path(cmd[2]).write_bytes(b"%PDF-1.7\n%%EOF\n")
-            def wait(self, timeout=None): return 0
+            class FakePopen:
+                pid, returncode = 9999, 0
+                def __init__(self, cmd, **_kw): Path(cmd[2]).write_bytes(b"%PDF-1.7\n%%EOF\n")
+                def wait(self, timeout=None): return 0
 
-        with patch.object(self.studio, "_engine", return_value=self.root / "fake-engine"), patch("studio.subprocess.Popen", side_effect=FakePopen):
-            self.studio.pending_export = str(pdf_out)
-            self.studio.post("ex-pdf", "export_pdf_native", json.dumps({"id": tab["id"], "content": "# PDF\n", "assets": {}, "options": dict(DEFAULT_PDF)}))
-            self.assertEqual(self._norm(json.loads(self._wait_reply("ex-pdf")[0])["path"]), self._norm(pdf_out))
-        self.assertTrue(pdf_out.read_bytes().startswith(b"%PDF-"))
+            with patch.object(self.studio, "_engine", return_value=self.root / "fake-engine"), patch("studio.subprocess.Popen", side_effect=FakePopen):
+                self.studio.pending_export = str(pdf_out)
+                self.studio.post("ex-pdf", "export_pdf_native", json.dumps({"id": tab["id"], "content": "# PDF\n", "assets": {}, "options": dict(DEFAULT_PDF)}))
+                self.assertEqual(self._norm(json.loads(self._wait_reply("ex-pdf")[0])["path"]), self._norm(pdf_out))
+            self.assertTrue(pdf_out.read_bytes().startswith(b"%PDF-"))
+        self.assertEqual(invalidated, [self._norm(md_out), self._norm(smd_out)])
 
         reserved_async, reserved_sync = self.root / "reserved-async.smd", self.root / "reserved-sync.smd"
         reserved_async.write_bytes(b"")
