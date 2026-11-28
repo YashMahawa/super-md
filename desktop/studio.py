@@ -9,12 +9,10 @@ import io
 import json
 import ipaddress
 import math
-import mimetypes
 import os
 import platform
 import shutil
 import re
-import secrets
 import socket
 import stat
 import subprocess
@@ -39,7 +37,7 @@ from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCur
 from documents import (
     atomic_write, atomic_json, stage_atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, is_valid_asset_filename,
-    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    materialize_assets, open_note, stage_atomic_json, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
@@ -81,7 +79,7 @@ try:
 except ImportError:
     import studio_chrome
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
+from workspace_links import WorkspaceLinkCache, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 from core.paths import DESKTOP_DIR, resource_root
 
@@ -192,7 +190,7 @@ def _directory_has_visible_note(
 
 
 ROOT = resource_root()
-DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
+DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.5, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
 DEFAULTS.update(restorePosition=True, centerLock=True, startup="restore", imageAppearance="original", svgAppearance="original", imageContrast=1.25, fullDocumentAccessibility=False)
@@ -1053,6 +1051,7 @@ class Studio(QObject):
         self._folder_search_include_diagrams = False
         self._folder_search_matches: list[dict] = []
         self._folder_search_scanning = False
+        self._folder_search_pending = False
         self._folder_search_scanned_files = 0
         self._folder_search_truncated = False
         self._folder_search_generation = 0
@@ -1875,6 +1874,7 @@ class Studio(QObject):
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
         self._cancel_subfolder_search()
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
+        self._folder_search_pending = False
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         if self._python_pool is not None:
             self._python_pool.shutdown(wait=False, cancel_futures=True)
@@ -2161,7 +2161,8 @@ class Studio(QObject):
             "caseSensitive": self._folder_search_case_sensitive,
             "includeDiagrams": self._folder_search_include_diagrams,
             "matches": self._folder_search_matches,
-            "scanning": self._folder_search_scanning or sync_pending,
+            "pending": self._folder_search_pending,
+            "scanning": self._folder_search_scanning or self._folder_search_pending or sync_pending,
             "scannedFiles": self._folder_search_scanned_files,
             "truncated": self._folder_search_truncated,
             "hasFolder": bool(self.folder),
@@ -2191,27 +2192,52 @@ class Studio(QObject):
         folder_path = Path(self.folder) if self.folder else None
         return tabs_snap, recent_snap, folder_path, self.active
 
-    def _cancel_folder_search(self, close: bool = False):
+    def _cancel_folder_search(self, close: bool = False) -> int:
         if self._folder_search_cancel is not None:
             self._folder_search_cancel.set()
             self._folder_search_cancel = None
         self._folder_search_generation += 1
         self._folder_search_scanning = False
+        self._folder_search_pending = False
+        self._folder_search_matches = []
+        self._folder_search_scanned_files = 0
+        self._folder_search_truncated = False
+        self._folder_search_tabs_sig = None
         if close:
             self._folder_search_open = False
-            self._folder_search_matches = []
-            self._folder_search_scanned_files = 0
-            self._folder_search_truncated = False
-            self._folder_search_tabs_sig = None
             if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
                 self.flush_operation = None
                 self.flush_timer.stop()
+        return self._folder_search_generation
+
+    def _apply_folder_search_query(
+        self,
+        query: str,
+        case_sensitive: bool = False,
+        include_diagrams: bool = False,
+        *,
+        pending: bool = False,
+    ) -> None:
+        if self.retired:
+            return
+        self._folder_search_query = query if isinstance(query, str) else ""
+        self._folder_search_case_sensitive = bool(case_sensitive)
+        self._folder_search_include_diagrams = bool(include_diagrams)
+        if not self._folder_search_open:
+            self._folder_search_open = True
+        if pending and self._folder_search_query.strip():
+            self._cancel_folder_search(close=False)
+            self._folder_search_pending = True
+            self.workspaceSearchChanged.emit()
+            return
+        self._start_folder_search()
 
     @Slot()
     def openFolderSearch(self):
         if self.retired:
             return
         self._folder_search_open = True
+        self._folder_search_pending = False
         self._folder_search_tabs_sig = None
         if self.ready and self.tabs and not self.flush_operation:
             self._flush("sync_for_search")
@@ -2222,29 +2248,17 @@ class Studio(QObject):
                 self._start_folder_search()
 
     @Slot(str, bool, bool)
+    def prepareFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=True)
+
+    @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
-        if self.retired:
-            return
-        self._folder_search_query = query if isinstance(query, str) else ""
-        self._folder_search_case_sensitive = bool(case_sensitive)
-        self._folder_search_include_diagrams = bool(include_diagrams)
-        if not self._folder_search_open:
-            self._folder_search_open = True
-        self._start_folder_search()
+        self._apply_folder_search_query(query, case_sensitive, include_diagrams, pending=False)
 
     def _start_folder_search(self):
-        if self._folder_search_cancel is not None:
-            self._folder_search_cancel.set()
-            self._folder_search_cancel = None
-        self._folder_search_generation += 1
-        generation = self._folder_search_generation
-        self._folder_search_matches = []
-        self._folder_search_scanned_files = 0
-        self._folder_search_truncated = False
+        generation = self._cancel_folder_search(close=False)
         query = self._folder_search_query
         if not query or not query.strip():
-            self._folder_search_scanning = False
-            self._folder_search_tabs_sig = None
             self.workspaceSearchChanged.emit()
             return
         cancel_event = threading.Event()
@@ -2294,14 +2308,14 @@ class Studio(QObject):
 
     @Slot()
     def closeFolderSearch(self):
-        if not self._folder_search_open and not self._folder_search_scanning:
+        if not self._folder_search_open and not self._folder_search_scanning and not self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
 
     @Slot()
     def cancelWorkspaceSearch(self):
-        changed = self._folder_search_open or self._folder_search_scanning
+        changed = self._folder_search_open or self._folder_search_scanning or self._folder_search_pending
         self._cancel_folder_search(close=True)
         if changed:
             self.workspaceSearchChanged.emit()
@@ -2319,7 +2333,7 @@ class Studio(QObject):
         source_end: int = -1,
         match_text: str = "",
     ):
-        if self.retired:
+        if self.retired or self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
@@ -3356,6 +3370,7 @@ class Studio(QObject):
                     self.active=existing["id"]
                     self._activate_tab_state(existing)
             else:
+                note["agent_staged"] = bool(note.get("agent_staged", False))
                 self.tabs.append(note)
                 if note.get("path"):
                     try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
@@ -3801,11 +3816,14 @@ class Studio(QObject):
         elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
-                current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
-                if current_sig != self._folder_search_tabs_sig:
-                    self._start_folder_search()
-                else:
+                if self._folder_search_pending:
                     self.workspaceSearchChanged.emit()
+                else:
+                    current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
+                    if current_sig != self._folder_search_tabs_sig:
+                        self._start_folder_search()
+                    else:
+                        self.workspaceSearchChanged.emit()
         elif operation["action"] == "open_search_match":
             request = json.loads(operation["target"])
             tab_id = request.get("tabId") or ""
@@ -4154,7 +4172,7 @@ class Studio(QObject):
     def _autosave(self):
         if not self.settings["autosave"]: return
         for tab in self.tabs:
-            if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and not tab.get("agent_staged") and tab["id"] not in self.saving and tab["id"] not in self._staging_tabs:
+            if tab["path"] and self._is_dirty(tab) and not tab.get("agent_staged") and not tab.get("conflict") and tab["id"] not in self.saving and tab["id"] not in self._staging_tabs:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = "", on_rebound=None):
@@ -4226,7 +4244,7 @@ class Studio(QObject):
             win._recover()
             if win.folder:
                 win._load_tree()
-            if win._folder_search_open and win._folder_search_query.strip():
+            if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
                 win._start_folder_search()
             win._emit()
 
@@ -4844,7 +4862,7 @@ class Studio(QObject):
         elif action == "window": self.newWindowRequested.emit()
 
     def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
-        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
+        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}[format]
         selected = filename or Path(tab["name"]).stem or "Super MD export"
         if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
             raise ValueError("Export filename must be a basename")
@@ -4879,11 +4897,11 @@ class Studio(QObject):
     def _agent_export_chunk(self, job_id, offset=0, limit=262_144):
         return studio_exports.agent_export_chunk(self, job_id, offset, limit)
 
-    _RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot for the agent patch; retry the patch"
-    _RECOVERY_ERROR_SUPERSEDED = "Could not confirm draft recovery snapshot for the agent patch because the recovery write was superseded; retry the patch"
+    _RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot; the edit was not applied. Retry patch_tab."
+    _RECOVERY_ERROR_SUPERSEDED = "Draft recovery write was superseded before staging completed; retry patch_tab."
     _RECOVERY_NOTICE = "Couldn't save draft recovery data. Keep Super MD open and retry."
 
-    def _validate_and_compute_patch_tab(self, args, *, bridge_revision_json: bool = False):
+    def _validate_and_compute_patch_tab(self, args: dict, *, bridge_revision_json: bool = False):
         tab_id = args.get("tabId")
         tab = next((item for item in self.tabs if item["id"] == tab_id), None)
         if tab is None or tab_id in getattr(self, "_closing_tabs", ()):
@@ -5583,14 +5601,7 @@ class Studio(QObject):
             saving.discard(tab_id)
         return finalize(value, None)
 
-    def _agent_document_action_async(
-        self,
-        args,
-        on_complete,
-        *,
-        register_cancel=None,
-        is_cancelled=None,
-    ):
+    def _agent_document_action_async(self, args, on_complete, *, register_cancel=None, is_cancelled=None):
         action = args.get("action")
         if action == "patch_tab":
             self._stage_inactive_patch_tab_async(
@@ -5644,6 +5655,9 @@ class Studio(QObject):
         tab = next((item for item in self.tabs if item["id"] == tab_id), None)
         if not tab:
             raise ValueError("Save requires a target tab that is still open")
+        staging = getattr(self, "_staging_tabs", None)
+        if staging is not None and tab_id in staging:
+            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
         saving = getattr(self, "saving", None)
         if saving is not None and tab_id in saving:
             raise ValueError("A save is already in progress for this tab; retry after it finishes")

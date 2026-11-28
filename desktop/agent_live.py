@@ -15,7 +15,6 @@ import re
 import secrets
 import sys
 import threading
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -35,6 +34,11 @@ MAX_EXPORT_CHUNK_BYTES = 524_288
 
 class LiveBridgeError(RuntimeError):
     """The desktop is unavailable or rejected a live-tab request."""
+
+
+def _valid_diagram_id(value: Any) -> bool:
+    return (isinstance(value, str) and value.startswith("diagram:")
+            and 9 <= len(value) <= 128 and value.isprintable())
 
 
 def read_discovery(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -158,6 +162,8 @@ class LiveTabClient:
             raise LiveBridgeError("limit must be between 1 and 25")
         if not isinstance(context, int) or isinstance(context, bool) or not 0 <= context <= MAX_SEARCH_CONTEXT:
             raise LiveBridgeError("context must be between 0 and 500")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise LiveBridgeError("offset must be a nonnegative integer")
         return self._call("search_tab", tabId=tab_id, query=query, limit=limit, context=context, offset=offset,
                           caseSensitive=case_sensitive, wholeWord=whole_word, regex=regex, excludeDiagrams=exclude_diagrams,
                           **self._window_params(window_id))
@@ -187,7 +193,7 @@ class LiveTabClient:
     def get_diagram(self, tab_id: str, diagram_id: str, expected_revision: str,
                     offset: int = 0, limit: int = 12_000,
                     window_id: str | None = None) -> dict[str, Any]:
-        if not isinstance(diagram_id, str) or not diagram_id.startswith("diagram:") or len(diagram_id) > 100:
+        if not _valid_diagram_id(diagram_id):
             raise LiveBridgeError("diagram_id must be a diagram source reference")
         if not isinstance(expected_revision, str) or len(expected_revision) != 64:
             raise LiveBridgeError("expected_revision must be the current SHA-256 revision")
@@ -201,6 +207,10 @@ class LiveTabClient:
 
     def get_diagram_image(self, tab_id: str, diagram_id: str, expected_revision: str,
                           window_id: str | None = None, width: int = 1600) -> dict[str, Any]:
+        if not _valid_diagram_id(diagram_id):
+            raise LiveBridgeError("diagram_id must be a diagram source reference")
+        if not isinstance(expected_revision, str) or len(expected_revision) != 64:
+            raise LiveBridgeError("expected_revision must be the current SHA-256 revision")
         if not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600:
             raise LiveBridgeError("width must be between 64 and 1,600 pixels")
         return self._call("get_diagram_image", tabId=tab_id, diagramId=diagram_id,
@@ -239,7 +249,7 @@ class LiveTabClient:
                     window_id: str | None = None) -> dict[str, Any]:
         if not isinstance(expected_revision, str) or len(expected_revision) != 64:
             raise LiveBridgeError("expected_revision must be the current SHA-256 revision")
-        if (not isinstance(repair_indices, list) or len(repair_indices) > 40
+        if (not isinstance(repair_indices, list) or not 1 <= len(repair_indices) <= 40
                 or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in repair_indices)
                 or len(set(repair_indices)) != len(repair_indices)):
             raise LiveBridgeError("repair_indices must be up to 40 unique nonnegative repair indexes")
@@ -249,8 +259,8 @@ class LiveTabClient:
     def export_document(self, tab_id: str, format: str = "pdf", options: dict[str, Any] | None = None,
                         filename: str | None = None, expected_revision: str | None = None,
                         window_id: str | None = None) -> dict[str, Any]:
-        if format not in ("pdf", "smd", "md"):
-            raise LiveBridgeError("format must be pdf, smd, or md")
+        if format not in ("pdf", "smd", "md", "mdzip"):
+            raise LiveBridgeError("export format must be pdf, smd, md, or mdzip")
         if not isinstance(expected_revision, str) or len(expected_revision) != 64:
             raise LiveBridgeError("expected_revision must be the current SHA-256 revision")
         if options is not None:
@@ -794,7 +804,7 @@ def _qt_bridge_class():
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
             if action in ("get_diagram", "get_diagram_image"):
                 diagram_id, revision = payload.get("diagramId"), payload.get("expectedRevision")
-                if not isinstance(diagram_id, str) or not diagram_id.startswith("diagram:") or len(diagram_id) > 100:
+                if not _valid_diagram_id(diagram_id):
                     raise ValueError("diagramId is invalid")
                 if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
@@ -855,13 +865,13 @@ def _qt_bridge_class():
                 revision, indices = payload.get("expectedRevision"), payload.get("repairIndices")
                 if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
-                if (not isinstance(indices, list) or len(indices) > 40
+                if (not isinstance(indices, list) or not 1 <= len(indices) <= 40
                         or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in indices)
                         or len(set(indices)) != len(indices)):
                     raise ValueError("repairIndices must be up to 40 unique nonnegative repair indexes")
             elif action == "export_document":
-                if payload.get("format") not in ("pdf", "smd", "md"):
-                    raise ValueError("format must be pdf, smd, or md")
+                if payload.get("format") not in ("pdf", "smd", "md", "mdzip"):
+                    raise ValueError("export format must be pdf, smd, md, or mdzip")
                 revision = payload.get("expectedRevision")
                 if not isinstance(revision, str) or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
                     raise ValueError("expectedRevision must be the current SHA-256 revision")
@@ -1224,9 +1234,9 @@ def _qt_bridge_class():
             action = args.get("assetAction")
             try:
                 try:
-                    from .documents import image_data, open_note, write_portable, MIMES
+                    from .documents import image_data
                 except ImportError:
-                    from documents import image_data, open_note, write_portable, MIMES
+                    from documents import image_data
             except ImportError as error:
                 raise ValueError("Portable asset handling is unavailable") from error
 
