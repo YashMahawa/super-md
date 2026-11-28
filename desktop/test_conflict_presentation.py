@@ -1,60 +1,158 @@
 """760px Desktop conflict banner, background tab indicator, active-tab reveal, and reload recovery."""
+from __future__ import annotations
+
 import json
 import os
+from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import textwrap
 import time
+import traceback
 import unittest
-from pathlib import Path
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QUrl
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtQml import QQmlComponent, QQmlEngine
-from PySide6.QtQuick import QQuickItem
-from PySide6.QtQuickControls2 import QQuickStyle
-from PySide6.QtTest import QTest
+DESKTOP = Path(__file__).resolve().parent
+if str(DESKTOP) not in sys.path:
+    sys.path.insert(0, str(DESKTOP))
 
-from documents import open_note, write_portable
-from studio import Session
-from test_studio import QuietStudio
+_ISOLATED_HARNESS_ENV = "SUPERMD_CONFLICT_PRESENTATION_ISOLATED"
+_IS_ISOLATED_SUBPROCESS = os.environ.get(_ISOLATED_HARNESS_ENV) == "1"
+
+if _IS_ISOLATED_SUBPROCESS:
+    os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
+    os.environ.pop("QT_STYLE_OVERRIDE", None)
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ.setdefault("QT_QUICK_BACKEND", "software")
+
+    from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QUrl
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtQml import QQmlComponent, QQmlEngine, QQmlProperty
+    from PySide6.QtQuick import QQuickItem
+    from PySide6.QtQuickControls2 import QQuickStyle
+    from PySide6.QtTest import QTest
+
+    if QGuiApplication.instance() is not None:
+        raise RuntimeError("Isolated conflict presentation QML harness requires a fresh process before QGuiApplication startup")
+    QQuickStyle.setStyle("Material")
+
+    from documents import open_note, write_portable
+    from studio import Session, Studio
+
+    class QuietStudio(Studio):
+        def _choose_default_python(self, emit=True):
+            self.python_status = "No Python interpreter configured."
 
 
 class ConflictPresentationDesktopTest(unittest.TestCase):
+    _CASE_NAMES = (
+        "test_760px_desktop_conflict_banner_actions_and_reload_recovery",
+        "test_overflowing_760px_tab_strip_reveals_active_tab_when_background_tabs_gain_conflict",
+    )
+    _isolated_suite_outcomes: dict[str, dict[str, object]] | None = None
+    _isolated_suite_output: tuple[int, str, str] = (0, "", "")
+
     @classmethod
     def setUpClass(cls):
+        if not _IS_ISOLATED_SUBPROCESS:
+            cls._isolated_suite_outcomes = None
+            cls._isolated_suite_output = (0, "", "")
+            return
         if QGuiApplication.instance() is None:
             QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["Conflict presentation 760px tests"])
+        if QQuickStyle.name().lower() != "material":
+            raise AssertionError(f"Expected Qt Quick Material style, got {QQuickStyle.name()!r}")
+
+    @classmethod
+    def _ensure_isolated_suite_ran(cls) -> None:
+        if cls._isolated_suite_outcomes is not None:
+            return
+        env = os.environ.copy()
+        env[_ISOLATED_HARNESS_ENV] = "1"
+        env["QT_QUICK_CONTROLS_STYLE"] = "Material"
+        env.pop("QT_STYLE_OVERRIDE", None)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env.setdefault("QT_QUICK_BACKEND", "software")
+        with tempfile.TemporaryDirectory(prefix="supermd-conflict-isolated-") as tmp_dir:
+            report_path = Path(tmp_dir) / "outcomes.json"
+            proc = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--isolated-suite", str(report_path)],
+                cwd=str(DESKTOP.parent),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            cls._isolated_suite_output = (proc.returncode, proc.stdout, proc.stderr)
+            if report_path.is_file():
+                cls._isolated_suite_outcomes = json.loads(report_path.read_text(encoding="utf-8"))
+            else:
+                cls._isolated_suite_outcomes = {}
+
+    def _run_isolated_case(self, case_name: str) -> None:
+        type(self)._ensure_isolated_suite_ran()
+        outcomes = type(self)._isolated_suite_outcomes or {}
+        returncode, stdout, stderr = type(self)._isolated_suite_output
+        outcome = outcomes.get(case_name)
+        if outcome is None or not outcome.get("ok"):
+            details = outcome.get("details", "") if isinstance(outcome, dict) else ""
+            self.fail(
+                f"Isolated Material QML harness failed for {case_name} (exit {returncode}):\n"
+                f"{details}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+            )
+        if returncode != 0 and all(item.get("ok") for item in outcomes.values()):
+            self.fail(
+                f"Isolated Material QML harness exited non-zero ({returncode}) after {case_name}:\n"
+                f"--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+            )
 
     def setUp(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            return
         self.temp_dir = Path(tempfile.mkdtemp(prefix="supermd-conflict-ui-760-"))
         self.session = Session(True)
         self.session.settings.update(theme="dark", accent="sky", motion=False, welcomed=True)
         self.studio = QuietStudio(True, self.session)
+        self.qml_warnings: list[str] = []
         self.engine = QQmlEngine()
+        self.engine.warnings.connect(
+            lambda warnings: self.qml_warnings.extend(w.toString() for w in warnings)
+        )
+        self.engine.addImportPath(str(DESKTOP / "qml"))
         self.engine.rootContext().setContextProperty("studio", self.studio)
         self.window = self._create_760_window()
 
     def tearDown(self):
-        if self.window is not None:
-            self.window.close()
-            self.window.deleteLater()
+        if not _IS_ISOLATED_SUBPROCESS:
+            return
+        data_dir = self.studio.data
+        try:
+            if self.window is not None:
+                self.window.close()
+                self.window.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            if getattr(self, "component", None) is not None:
+                self.component.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.engine.deleteLater()
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        if getattr(self, "component", None) is not None:
-            self.component.deleteLater()
-            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        self.engine.deleteLater()
-        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        self.studio.stop()
-        self.studio.pool.shutdown(wait=True)
-        self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
-        self.session.writes.shutdown(wait=True)
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+            self.studio.external_timer.stop()
+            self.studio.external_paths.clear()
+            if not self.studio.retired:
+                self.studio.stop()
+            self.studio.pool.shutdown(wait=True, cancel_futures=True)
+            self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
+            self.session.writes.shutdown(wait=True)
+            self.app.processEvents()
+            self.assertEqual(self.qml_warnings, [], f"Unexpected QML warnings: {self.qml_warnings}")
+        finally:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            shutil.rmtree(data_dir, ignore_errors=True)
 
     def _create_760_window(self):
-        qml_path = Path(__file__).parent / "qml/Main.qml"
+        qml_path = DESKTOP / "qml/Main.qml"
         qml = qml_path.read_text(encoding="utf-8")
         banner_start = qml.index("                Pane {\n                    id: conflictBanner")
         banner_end = qml.index("                Loader {\n                    id: readerLoader", banner_start)
@@ -79,6 +177,8 @@ ApplicationWindow {
     visible: true
     color: viewState.colors.surface
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var shortcutLabels: ({})
     property bool sidebar: true
@@ -94,8 +194,6 @@ ApplicationWindow {
 
     Connections {
         target: studio
-        function onChanged() { window.viewState = JSON.parse(studio.snapshot) }
-        function onSidebarChanged() { window.sidebarState = JSON.parse(studio.sidebarSnapshot) }
         function onSaveConflictRequested(noteName) {
             saveConflictDialog.title = (noteName || viewState.name) + " changed on disk"
             saveConflictDialog.open()
@@ -136,6 +234,8 @@ ApplicationWindow {
         TabStrip {
             width: parent.width
             viewState: window.viewState
+            tabs: window.tabsState
+            activeTabId: window.activeTabId
             shortcutLabels: window.shortcutLabels
         }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
@@ -229,11 +329,13 @@ ApplicationWindow {
 """ % (textwrap.indent(banner_code, "                "), textwrap.indent(dialog_code, "    "))).encode("utf-8")
 
         self.component = QQmlComponent(self.engine)
-        self.component.setData(harness, QUrl.fromLocalFile(str(Path(__file__).parent / "qml/conflict-760-test.qml")))
+        self.component.setData(harness, QUrl.fromLocalFile(str(DESKTOP / "qml/conflict-760-test.qml")))
         self.assertFalse(self.component.isError(), str(self.component.errors()))
         win = self.component.create()
         self.assertIsNotNone(win, str(self.component.errors()))
-        QTest.qWait(60)
+        QTest.qWaitForWindowExposed(win, 200)
+        QTest.qWait(40)
+        self.app.processEvents()
         return win
 
     def _wait_until(self, predicate, timeout=5.0):
@@ -243,6 +345,7 @@ ApplicationWindow {
             if predicate():
                 return
             QTest.qWait(15)
+        self.app.processEvents()
         self.assertTrue(predicate())
 
     def _walk_items(self, root=None, seen=None):
@@ -324,7 +427,6 @@ ApplicationWindow {
             self.assertLessEqual(rx2, bx2 + 0.5, f"{expected_text} clipped right ({context_label}): {rx2} > {bx2}")
             self.assertGreaterEqual(ry1, by1 - 0.5, f"{expected_text} clipped top ({context_label})")
             self.assertLessEqual(ry2, by2 + 0.5, f"{expected_text} clipped bottom ({context_label}): {ry2} > {by2}")
-            # Warning text must not overlap action buttons
             overlaps_label = not (rx2 <= lx1 + 0.5 or rx1 >= lx2 - 0.5 or ry2 <= ly1 + 0.5 or ry1 >= ly2 - 0.5)
             self.assertFalse(overlaps_label, f"{expected_text} overlaps warning label ({context_label})")
             rects.append((expected_text, rx1, ry1, rx2, ry2))
@@ -341,6 +443,9 @@ ApplicationWindow {
         self.assertGreaterEqual(dy2 - dy1, 200.0, f"Document viewport squeezed ({context_label}): h={dy2 - dy1}")
 
     def test_760px_desktop_conflict_banner_actions_and_reload_recovery(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            self._run_isolated_case("test_760px_desktop_conflict_banner_actions_and_reload_recovery")
+            return
         md_one = self.temp_dir / "01_Eigenvalues.md"
         md_two = self.temp_dir / "03_Spectral_Theorem.md"
         smd_bg = self.temp_dir / "04_Cholesky.smd"
@@ -379,7 +484,11 @@ ApplicationWindow {
         )
         # Keep 03_Spectral_Theorem.md active while 04_Cholesky.smd is a conflicted background tab.
         self.studio.selectTab(t_active["id"])
-        QTest.qWait(80)
+        self._wait_until(
+            lambda: bool(self._named("conflictBanner").property("visible"))
+            and len([item for item in self._walk_items() if item.objectName() == "noteTab" and item.isVisible()]) == 3
+        )
+        QTest.qWait(40)
         img_760 = self.window.grabWindow()
         self.assertFalse(img_760.isNull())
 
@@ -395,31 +504,39 @@ ApplicationWindow {
         self.assertIn("closed tabs", str(label.property("text")))
         self._assert_banner_and_three_actions_unclipped("760px sidebar open")
 
-        # 2. Verify background conflicted tab indicator is visible while clean tab indicator is hidden.
-        note_tabs = [item for item in self._walk_items() if item.objectName() == "noteTab"]
+        # 2. Verify background conflicted tab indicator is visible on #250's tabModel delegates while keeping delegates stable.
+        note_tabs = [item for item in self._walk_items() if item.objectName() == "noteTab" and item.isVisible()]
         self.assertEqual(len(note_tabs), 3)
-        by_id = {item.property("modelData")["id"]: item for item in note_tabs}
+        by_id = {str(item.property("tabId")): item for item in note_tabs}
+        destroyed_tabs: list[str] = []
+        for tid, tab_item in by_id.items():
+            tab_item.destroyed.connect(lambda _obj=None, tid=tid: destroyed_tabs.append(tid))
         for tid, expected_conflict in ((t0["id"], False), (t_active["id"], True), (t_bg["id"], True)):
             indicator = by_id[tid].findChild(QObject, "tabConflictIndicator")
             self.assertIsNotNone(indicator)
             self.assertEqual(bool(indicator.property("visible")), expected_conflict)
+            self.assertEqual(bool(by_id[tid].property("tabConflict")), expected_conflict)
+            self.assertEqual(float(QQmlProperty.read(by_id[tid], "border.width")), 1.0 if expected_conflict else 0.0)
 
-        # 3. Verify 760px with sidebar hidden (760px full-width pane) and wide 1120px single-row layout.
+        # 3. Verify 760px with sidebar hidden (760px full-width pane), wide 1120px single-row layout, and saveConflictDialog width clamping.
         self.window.setProperty("sidebar", False)
-        QTest.qWait(60)
+        self._wait_until(lambda: float(self._named("conflictBanner").width()) >= 740.0)
         self.window.grabWindow()
         self._assert_banner_and_three_actions_unclipped("760px sidebar closed")
 
         self.window.setProperty("sidebar", True)
         self.window.resize(1120, 640)
-        QTest.qWait(60)
+        self._wait_until(lambda: float(self._named("conflictBanner").width()) >= 840.0)
         self.window.grabWindow()
         self._assert_banner_and_three_actions_unclipped("1120px wide single-row")
 
         self.window.resize(760, 560)
-        QTest.qWait(60)
+        self._wait_until(lambda: float(self._named("conflictBanner").width()) <= 510.0)
         self.window.grabWindow()
         self._assert_banner_and_three_actions_unclipped("760px restored")
+        conflict_dialog = self._named("saveConflictDialog")
+        self.assertIsNotNone(conflict_dialog)
+        self.assertLessEqual(float(conflict_dialog.property("width")), 760.0 - 48.0)
 
         # 4. Verify all three conflict actions are interactively clickable at 760px:
         # Action A: Save as triggers save_as resolution (saveAsSafely).
@@ -430,30 +547,33 @@ ApplicationWindow {
             save_as_btn = self._named("conflictSaveAsButton")
             pt = save_as_btn.mapToScene(QPointF(save_as_btn.width() / 2, save_as_btn.height() / 2)).toPoint()
             QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pt)
-            QTest.qWait(40)
-            self.assertEqual(save_as_calls, ["save_as"])
+            self._wait_until(lambda: save_as_calls == ["save_as"])
         finally:
             self.studio.saveAsSafely = orig_save_as
 
-        # Action B: Overwrite writes local draft to disk and clears conflict on active tab only.
+        # Action B: Overwrite writes local draft to disk and clears conflict on active tab only without destroying noteTab delegates.
         md_two.write_text("# Spectral Theorem\n\nExternal disk edit.\n", encoding="utf-8")
         overwrite_btn = self._named("conflictOverwriteButton")
         pt = overwrite_btn.mapToScene(QPointF(overwrite_btn.width() / 2, overwrite_btn.height() / 2)).toPoint()
         QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pt)
-        self._wait_until(lambda: not t_active.get("conflict") and not self.studio.saving)
+        self._wait_until(
+            lambda: not t_active.get("conflict")
+            and not self.studio.saving
+            and not bool(self._named("conflictBanner").property("visible"))
+            and not bool(by_id[t_active["id"]].findChild(QObject, "tabConflictIndicator").property("visible"))
+        )
         self.assertEqual(md_two.read_text(encoding="utf-8"), "# Spectral Theorem\n\nUnsaved local proof draft.\n")
-        self.assertFalse(bool(self._named("conflictBanner").property("visible")))
+        self.assertEqual(destroyed_tabs, [], "Clearing conflict/dirty must keep #250 noteTab delegates alive")
         # Background tab 04_Cholesky.smd is still conflicted!
         self.assertTrue(bool(t_bg.get("conflict")))
 
         # Click the background tab's conflict indicator to reveal and activate 04_Cholesky.smd, then test Reload from disk + #122 recovery!
-        note_tabs = [item for item in self._walk_items() if item.objectName() == "noteTab"]
-        bg_tab_item = next(item for item in note_tabs if item.property("modelData")["id"] == t_bg["id"])
-        bg_indicator = bg_tab_item.findChild(QQuickItem, "tabConflictIndicator")
+        bg_indicator = by_id[t_bg["id"]].findChild(QQuickItem, "tabConflictIndicator")
         self.assertTrue(bg_indicator.isVisible())
         ind_pt = bg_indicator.mapToScene(QPointF(bg_indicator.width() / 2, bg_indicator.height() / 2)).toPoint()
         QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, ind_pt)
         self._wait_until(lambda: self.studio.active == t_bg["id"] and bool(self._named("conflictBanner").property("visible")))
+        self.assertEqual(destroyed_tabs, [])
 
         # Action C: Reload from disk on dirty portable .smd archives draft + assets to closed tabs (#122) and loads disk version.
         svg_external = "data:image/svg+xml;base64,PHN2ZyBpZD0iZXh0ZXJuYWwiLz4="
@@ -461,20 +581,37 @@ ApplicationWindow {
         reload_btn = self._named("conflictReloadButton")
         pt = reload_btn.mapToScene(QPointF(reload_btn.width() / 2, reload_btn.height() / 2)).toPoint()
         QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pt)
-        self._wait_until(lambda: not t_bg.get("conflict") and self.studio.busy == 0)
+        self._wait_until(
+            lambda: not t_bg.get("conflict")
+            and self.studio.busy == 0
+            and len(self.studio.closed_tabs) == 1
+        )
         self.assertEqual(t_bg["content"], "# Cholesky\n\nExternal portable v2.\n")
         self.assertEqual(t_bg["assets"], {"assets/diagram.svg": svg_external})
         self.assertFalse(bool(self._named("conflictBanner").property("visible")))
+        self.assertEqual(destroyed_tabs, [])
 
-        # Reopening closed tab restores the archived dirty draft and its portable SVG asset!
+        # Reopening closed tab restores the archived dirty draft and its portable SVG asset asynchronously without touching disk!
         self.studio.reopenTab()
-        QTest.qWait(50)
+        self._wait_until(
+            lambda: len(self.studio.tabs) == 4
+            and not self.studio.closed_tabs
+            and self.studio.busy == 0
+        )
         reopened = self.studio._current()
+        self.assertEqual(reopened["path"], "")
+        self.assertTrue(self.studio._is_dirty(reopened))
         self.assertEqual(reopened["content"], "# Cholesky\n\nUnsaved portable draft.\n")
         self.assertEqual(reopened["assets"], {"assets/diagram.svg": svg_draft})
         self.assertEqual(open_note(smd_bg)[:2], ("# Cholesky\n\nExternal portable v2.\n", {"assets/diagram.svg": svg_external}))
+        self.assertEqual(destroyed_tabs, [])
 
     def test_overflowing_760px_tab_strip_reveals_active_tab_when_background_tabs_gain_conflict(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            self._run_isolated_case(
+                "test_overflowing_760px_tab_strip_reveals_active_tab_when_background_tabs_gain_conflict"
+            )
+            return
         # Create overflowing tabs across the 760px strip.
         for idx in range(6):
             if idx > 0:
@@ -488,50 +625,91 @@ ApplicationWindow {
                 conflict=False,
             )
         self.studio._emit(False)
-        QTest.qWait(60)
+        self._wait_until(
+            lambda: len([item for item in self._walk_items() if item.objectName() == "noteTab" and item.isVisible()]) == 6
+        )
 
-        def assert_active_revealed(context):
+        initial_delegates = [item for item in self._walk_items() if item.objectName() == "noteTab" and item.isVisible()]
+        destroyed: list[str] = []
+        for item in initial_delegates:
+            tid = str(item.property("tabId"))
+            item.destroyed.connect(lambda _obj=None, tid=tid: destroyed.append(tid))
+
+        def active_revealed():
             strip = self._named("tabStrip")
             flickable = strip.property("contentItem")
             content_x = float(flickable.property("contentX"))
             viewport_w = float(strip.property("availableWidth") or strip.width())
-            active_item = next(
+            active_items = [
                 item for item in self._walk_items()
-                if item.objectName() == "noteTab" and bool(item.property("isActive"))
-            )
-            self.assertGreaterEqual(
-                active_item.x() + 0.5,
-                content_x,
-                f"Active tab clipped left ({context}): x={active_item.x()}, contentX={content_x}",
-            )
-            self.assertLessEqual(
-                active_item.x() + active_item.width() - 0.5,
-                content_x + viewport_w,
-                f"Active tab clipped right ({context}): right={active_item.x() + active_item.width()}, viewRight={content_x + viewport_w}",
+                if item.objectName() == "noteTab" and item.isVisible() and bool(item.property("isActive"))
+            ]
+            if not active_items:
+                return False
+            active_item = active_items[0]
+            return (
+                active_item.x() + 0.5 >= content_x
+                and active_item.x() + active_item.width() - 0.5 <= content_x + viewport_w
             )
 
         # Select tab 1 (leftmost), then select tab 3 (near right edge of initial viewport).
         self.studio.selectTab(self.studio.tabs[0]["id"])
-        QTest.qWait(60)
-        assert_active_revealed("after selecting tab 1")
+        self._wait_until(active_revealed)
 
         self.studio.selectTab(self.studio.tabs[2]["id"])
-        QTest.qWait(60)
-        assert_active_revealed("after selecting tab 3 near right edge")
+        self._wait_until(active_revealed)
 
-        # Mark tabs 0, 1, and 2 as conflicted so each widens by +24px; active tab 3 must remain completely revealed.
+        # Mark tabs 0, 1, and 2 as conflicted so each widens by +24px; active tab 3 must remain completely revealed without recreating delegates.
         for idx in (0, 1, 2):
             self.studio.tabs[idx]["conflict"] = True
         self.studio._emit(False)
-        QTest.qWait(80)
-        assert_active_revealed("after preceding and active tabs widen with conflict indicator")
+        self._wait_until(
+            lambda: active_revealed()
+            and all(
+                bool(item.property("tabConflict"))
+                for item in initial_delegates
+                if str(item.property("tabId")) in {self.studio.tabs[0]["id"], self.studio.tabs[1]["id"], self.studio.tabs[2]["id"]}
+            )
+        )
+        self.assertEqual(destroyed, [])
 
         # Selecting the rightmost conflicted tab also reveals its full pill and indicator.
         self.studio.tabs[-1]["conflict"] = True
         self.studio.selectTab(self.studio.tabs[-1]["id"])
-        QTest.qWait(80)
-        assert_active_revealed("after selecting rightmost conflicted tab")
+        self._wait_until(
+            lambda: active_revealed()
+            and any(
+                str(item.property("tabId")) == self.studio.tabs[-1]["id"] and bool(item.property("tabConflict"))
+                for item in initial_delegates
+            )
+        )
+        self.assertEqual(destroyed, [])
+
+
+def _run_isolated_suite(report_path: Path) -> int:
+    ConflictPresentationDesktopTest.setUpClass()
+    outcomes: dict[str, dict[str, object]] = {}
+    exit_code = 0
+    try:
+        for name in ConflictPresentationDesktopTest._CASE_NAMES:
+            single_result = unittest.TestResult()
+            ConflictPresentationDesktopTest(name)(single_result)
+            if single_result.wasSuccessful():
+                outcomes[name] = {"ok": True, "details": ""}
+            else:
+                exit_code = 1
+                problems = [tb for _case, tb in single_result.failures + single_result.errors]
+                outcomes[name] = {"ok": False, "details": "\n".join(problems)}
+    except Exception:
+        exit_code = 1
+        outcomes.setdefault("__runner__", {"ok": False, "details": traceback.format_exc()})
+    finally:
+        ConflictPresentationDesktopTest.tearDownClass()
+        report_path.write_text(json.dumps(outcomes), encoding="utf-8")
+    return exit_code
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--isolated-suite":
+        raise SystemExit(_run_isolated_suite(Path(sys.argv[2])))
     unittest.main()

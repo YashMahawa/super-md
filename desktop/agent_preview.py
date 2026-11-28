@@ -20,13 +20,13 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
     os.environ.setdefault('QT_QUICK_BACKEND','software')
     flags=os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS','')
     os.environ['QTWEBENGINE_CHROMIUM_FLAGS']=flags+' --disable-gpu'
-    from PySide6.QtCore import QObject, Signal, Slot, QFile, QIODevice, QUrl, QTimer, Qt
+    from PySide6.QtCore import QObject, Signal, Slot, QFile, QIODevice, QTimer, Qt
     from PySide6.QtWidgets import QApplication
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings, QWebEnginePage, QWebEngineProfile
     from PySide6.QtWebChannel import QWebChannel
     from PySide6.QtGui import QFontDatabase
-    from documents import MIMES, atomic_write
+    from documents import MIMES
     from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
     root=resource_root()
     reader=root/'dist'/'qt-reader.html'
@@ -97,6 +97,12 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
         if time.monotonic()-state['started']>40:timer.stop();fail('Offline reader preview timed out');return
         if state['ready']:view.page().runJavaScript("!!document.querySelector('.markdown-body') && document.fonts.status==='loaded' && [...document.images].every(i=>i.complete) && !document.querySelector('.mermaid-loading,.reader-loading')",inspected)
     timer=QTimer();timer.setInterval(150);timer.timeout.connect(poll);timer.start();view.load(reader_bundle_url());view.show()
-    code=app.exec();view.close();view.deleteLater();app.processEvents()
+    code=app.exec()
+    page=view.page()
+    view.close()
+    if page is not None:page.deleteLater()
+    profile.deleteLater()
+    view.deleteLater()
+    app.processEvents()
     if code or state['error']:raise ValueError(state['error'] or 'Preview failed')
     return {'output':str(output),'width':width,'height':height,'renderer':'super-md-offline-reader','sourceUnchanged':True,'revision':hashlib.sha256(raw).hexdigest()}
