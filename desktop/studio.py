@@ -43,6 +43,10 @@ import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
 import offline_view
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
+if __package__:
+    from . import studio_snapshots
+else:
+    import studio_snapshots
 from fonts import FontStore
 if __package__:
     from . import studio_agent_setup
@@ -1046,299 +1050,14 @@ class Studio(QObject):
 
     def __init__(self, isolated: bool = False, session: Session | None = None):
         super().__init__()
-        self.setObjectName("studio")
-        self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
-        self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
-        self._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
-        self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
-        self.quickSwitcherIndexed.connect(self._on_quick_switcher_indexed)
-        self.session = session or Session(isolated)
-        weak_self = weakref.ref(self)
-        def _on_session_changed():
-            inst = weak_self()
-            if inst is not None and not inst.retired:
-                inst._emit()
-        def _on_location_changed(old, new):
-            inst = weak_self()
-            if inst is not None and not inst.retired:
-                inst._location_changed(old, new)
-        self._session_changed_slot = _on_session_changed
-        self._location_changed_slot = _on_location_changed
-        self.session.changed.connect(self._session_changed_slot)
-        self.session.locationChanged.connect(self._location_changed_slot)
-        self.writes = self.session.writes
-        self.window_id = uuid.uuid4().hex
-        self.session.windows[self.window_id] = self
-        self.host_window = None
-        self._retired = False
-        self._write_callback_lock = threading.Lock()
-        self._pending_write_retirements: dict[str, Any] = {}
-        self.completed.connect(self._complete)
-        self.backgroundWriteCompleted.connect(self._complete_background_write)
-        self.data = self.session.data
-        self.settings = self.session.settings
-        self._defer_reader_activation = False
-        self._agent_error = ""
-        self._agent_cloud_error = ""
-        self._agent_cloud_config_path = self.data / "agent-cloud.json"
-        self._cloud_started_local_bridge = False
-        self._cloud_revocation_pending = False
-        self.cloudRevocationFinished.connect(self._finish_cloud_revocation)
-        self._agent_viewport_capture = None
-        self._preview_jobs = offline_view.PreviewJobRegistry()
-        agent_bridge = getattr(self.session, "agent_bridge", None)
-        if agent_bridge is not None:
-            agent_bridge.enabledChanged.connect(lambda: self._emit(False))
-            agent_bridge.cloudStatusChanged.connect(self._cloud_status_changed)
-        self.update_status=""
-        self.update_info=None
-        self.update_path=""
-        self.update_running=False
-        self._storage_report = json.dumps({"status":"idle","cancelled":False,"truncated":False,"scannedEntries":0,"categories":[]})
-        self.storage_busy = False
-        self.storage_cleanup_busy = False
-        self.storage_cleanup_status = ""
-        self._storage_cancel_event = None
-        self.python_status=""
-        self.python_choices=[]
-        self.python_busy=False
-        self.pythonProgress.connect(self._python_progress)
-        if not self.settings.get("python"):
-            self._choose_default_python(emit=False)
-        if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
-        self.tabs: list[dict] = []
-        self.closed_tabs = self.session.closed_tabs
-        self._closing_tabs: set[str] = set()
-        self._staging_tabs: set[str] = set()
-        self._max_agent_stage_attempts = 3
-        self.note_watcher = QFileSystemWatcher(self)
-        self.note_watcher.fileChanged.connect(self._external_note_changed)
-        self.note_watcher.directoryChanged.connect(self._external_note_changed)
-        self.external_paths = set()
-        self.note_watch_paths = None
-        self._watch_suspensions = self.session._watch_suspensions
-        with self.session._rename_state_lock:
-            self.session._retired_persist_needed = False
-        self.note_file_stamps = {}
-        self.note_identities = {}
-        self.external_timer = QTimer(self)
-        self.external_timer.setSingleShot(True)
-        self.external_timer.timeout.connect(self._refresh_external_notes)
-        self.active = ""
-        self.folder = ""
-        self._files: list[dict] = []
-        self._files_revision = 0
-        self._outline_revision = 0
-        self.expanded: set[str] = set()
-        self._pinned_visible_dirs: set[str] = set()
-        self.folder_filter = ""
-        self._folder_searching = False
-        self._search_generation = 0
-        self._search_cancel: threading.Event | None = None
-        self.filter_timer = QTimer(self)
-        self.filter_timer.setSingleShot(True)
-        self.filter_timer.timeout.connect(self._start_subfolder_search)
-        self._folder_search_open = False
-        self._folder_search_query = ""
-        self._folder_search_case_sensitive = False
-        self._folder_search_include_diagrams = False
-        self._folder_search_matches: list[dict] = []
-        self._folder_search_scanning = False
-        self._folder_search_pending = False
-        self._folder_search_scanned_files = 0
-        self._folder_search_truncated = False
-        self._folder_search_generation = 0
-        self._folder_search_cancel: threading.Event | None = None
-        self._folder_search_tabs_sig: list[tuple[str, str, bool]] | None = None
-        self._quick_switcher_open = False
-        self._quick_switcher_query = ""
-        self._quick_switcher_items: list[dict] = []
-        self._quick_switcher_candidates: list[dict] = []
-        self._quick_switcher_loading = False
-        self._quick_switcher_generation = 0
-        self._quick_switcher_cancel: threading.Event | None = None
-        self._pending_seeded_find: dict | None = None
-        self.mode = self.settings.get("readingMode", "live")
-        self.fullscreen = False
-        self.reader_overlay = False
-        self.image_overlay = False
-        self.busy = 0
-        self._message = ""
-        self._message_revision = 0
-        self.message = ("Closed-note recovery index could not be read; historical snapshots were left untouched. "+self.session.closed_note_error) if self.session.closed_note_error else ""
-        self.ready = False
-        self._last_reader_text = None
-        self._last_reader_agent_seq: dict[str, int] = {}
-        self._agent_edit_seq = 0
-        self._agent_jump_tab_id = ""
-        self._export_jobs = ExportJobRegistry()
-        self._python_jobs = python_runtime.PythonJobRegistry()
-        self._agent_exports: dict[str, dict] = {}
-        self._agent_owned_files: set[str] = getattr(self.session, "agent_owned_files", None) or set()
-        self.session.agent_owned_files = self._agent_owned_files
-        self._agent_open_paths: set[str] = getattr(self.session, "agent_open_paths", None) or set()
-        self.session.agent_open_paths = self._agent_open_paths
-        self._agent_job_records = {}
-        self.reader_edits = ReaderEdits()
-        self.system_dark = None
-        self.system_mode, self.system_colors = read_system_palette()
-        self._theme_result = None
-        self._theme_running = False
-        self._theme_pending = False
-        self.theme_debounce = QTimer(self)
-        self.theme_debounce.setSingleShot(True)
-        self.theme_debounce.timeout.connect(self._refresh_theme)
-        def _on_color_scheme_changed(*args):
-            inst = weak_self()
-            if inst is not None and not inst.retired:
-                inst._schedule_theme(*args)
-        self._color_scheme_slot = _on_color_scheme_changed
-        QGuiApplication.styleHints().colorSchemeChanged.connect(self._color_scheme_slot)
-        self.palette_watcher = QFileSystemWatcher(self)
-        self.palette_watcher.fileChanged.connect(self._palette_changed)
-        self.palette_watcher.directoryChanged.connect(self._palette_changed)
-        self._watch_palette()
-        self.custom_theme_watcher=QFileSystemWatcher(self)
-        self.custom_theme_timer=QTimer(self)
-        self.custom_theme_timer.setSingleShot(True)
-        self.custom_theme_timer.setInterval(250)
-        self.custom_theme_timer.timeout.connect(self._custom_theme_event)
-        self.custom_theme_stamp=None
-        self.custom_theme_watcher.fileChanged.connect(lambda *_:self.custom_theme_timer.start())
-        self.custom_theme_watcher.directoryChanged.connect(lambda *_:self.custom_theme_timer.start())
-        QTimer.singleShot(0,self._restore_custom_theme)
-        self.system_preferences = QProcess(self)
-        if sys.platform.startswith("linux") and shutil.which("gsettings"):
-            self.system_preferences.readyReadStandardOutput.connect(self._system_setting_changed)
-            self.system_preferences.start("gsettings",["monitor","org.gnome.desktop.interface"])
-        self.theme_timer = QTimer(self)
-        # Live notifications handle ordinary changes; this is only a fallback for
-        # environments without portal/Qt preference events. No four-second spawning.
-        self.theme_timer.setInterval(60000)
-        self.theme_timer.timeout.connect(self._refresh_theme)
-        self.theme_timer.start()
-        self.pending_close = ""
-        self.pending_export = ""
-        self.pending_save_as = ""
-        self.pending_save_as_tab = ""
-        self._force_overwrite_ids: set[str] = set()
-        self.flush_operation = None
-        self.flush_timer = QTimer(self)
-        self.flush_timer.setSingleShot(True)
-        self.flush_timer.timeout.connect(self._on_flush_timeout)
-        self.recovery_timer = QTimer(self)
-        self.recovery_timer.setSingleShot(True)
-        self.recovery_timer.timeout.connect(self._recover)
-        self.autosave_timer = QTimer(self)
-        self.autosave_timer.setSingleShot(True)
-        self.autosave_timer.timeout.connect(self._autosave)
-        self.preference_timer = QTimer(self)
-        self.preference_timer.setSingleShot(True)
-        self.preference_timer.timeout.connect(self._preferences)
-        self.position_timer=QTimer(self);self.position_timer.setSingleShot(True);self.position_timer.timeout.connect(self._save_positions)
-        self.saving = set()
-        restore_enabled = self.settings.get("startup", "restore") == "restore"
-        if not restore_enabled:
-            self.session._pending_startup_windows.clear()
-            self.session.startup_folder = ""
-            self.session.startup_expanded = []
-            self.session.startup_paths = []
-            self.session.startup_entries = []
-        win_spec = self.session._pending_startup_windows.pop(0) if restore_enabled and self.session._pending_startup_windows else None
-        if win_spec is not None and self.session._pending_startup_windows:
-            spec_ids = {entry["id"] for entry in win_spec["tabs"]}
-            claimed = [tab for tab in self.session.initial_recovery if tab.get("id") in spec_ids]
-            self.session.initial_recovery = [tab for tab in self.session.initial_recovery if tab.get("id") not in spec_ids]
-        else:
-            claimed = list(self.session.initial_recovery)
-            self.session.initial_recovery = []
-        self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in claimed]
-        for tab in self.tabs:
-            tab.setdefault("saved_assets", dict(tab.get("assets", {})))
-            tab.setdefault("assets_dirty", False)
-            tab.setdefault("conflict", False)
-            tab["agent_staged"] = bool(tab.get("agent_staged", False))
-            tab["agent_unreviewed"] = bool(tab.get("agent_unreviewed", False))
-            raw_edits = tab.get("agent_edits")
-            valid_edits = []
-            if isinstance(raw_edits, list):
-                for entry in raw_edits[-60:]:
-                    if isinstance(entry, dict) and isinstance(entry.get("seq"), int) and isinstance(entry.get("before"), str) and isinstance(entry.get("after"), str):
-                        valid_edits.append({"seq": entry["seq"], "before": entry["before"], "after": entry["after"]})
-                        if entry["seq"] > self._agent_edit_seq:
-                            self._agent_edit_seq = entry["seq"]
-            tab["agent_edits"] = self._bound_agent_edits(valid_edits)
-        self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
-        with self.session._rename_state_lock:
-            self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
-        self._startup_placeholder_ids = set()
-        self._welcome_placeholder_id = None
-        self._touched_tab_ids = set()
-        self._opening_paths: dict[str, int] = {}
-        if not self.tabs:
-            if self.settings["welcomed"]:
-                placeholder = self._note("Untitled.md")
-                self.tabs.append(placeholder)
-                self._startup_placeholder_ids.add(placeholder["id"])
-            else:
-                placeholder = self._note("Welcome.md", SAMPLE, saved=SAMPLE)
-                self.tabs.append(placeholder)
-                self._welcome_placeholder_id = placeholder["id"]
-        elif self.settings["startup"]=="new":
-            placeholder = self._note("Untitled.md")
-            self.tabs.insert(0, placeholder)
-            self._startup_placeholder_ids.add(placeholder["id"])
-        self.active = self.tabs[0]["id"]
-        target_active_id = win_spec["activeId"] if win_spec is not None else self.session.startup_active_id
-        if restore_enabled and any(t["id"]==target_active_id for t in self.tabs):self.active=target_active_id
-        self._activation_generation = 0
-        self._restoring_paths=set()
-        self._startup_order=[]
-        if win_spec is not None:
-            self._startup_entries = list(win_spec["tabs"])
-            self._startup_active = win_spec["active"]
-            restore_paths = list(win_spec["paths"])
-            restore_folder = win_spec["folder"]
-            restore_expanded = list(win_spec["expanded"])
-            if not self.session._pending_startup_windows:
-                self.session.startup_paths = []
-                self.session.startup_entries = []
-                self.session.startup_folder = ""
-                self.session.startup_expanded = []
-        else:
-            self._startup_entries = self.session.startup_entries
-            self.session.startup_entries = []
-            self._startup_active = self.session.startup_active
-            restore_paths = list(self.session.startup_paths)
-            self.session.startup_paths = []
-            restore_folder = self.session.startup_folder
-            restore_expanded = list(self.session.startup_expanded)
-            self.session.startup_folder = ""
-            self.session.startup_expanded = []
-        pending_active_restore = bool(
-            restore_enabled
-            and self._startup_active
-            and not any(t["id"] == target_active_id for t in self.tabs)
-            and any(folder_ops.same_path(p, self._startup_active) for p in restore_paths)
+        studio_snapshots.init_studio_window(
+            self, isolated=isolated, session=session, root=ROOT, session_cls=Session, sample=SAMPLE,
+            timer_cls=QTimer, watcher_cls=QFileSystemWatcher, export_jobs_cls=ExportJobRegistry,
+            reader_edits_cls=ReaderEdits, python_runtime_mod=python_runtime,
+            offline_view_mod=offline_view, folder_ops_mod=folder_ops,
+            read_system_palette_fn=read_system_palette, gui_app_cls=QGuiApplication,
+            process_cls=QProcess, sys_platform=sys.platform, which_fn=shutil.which,
         )
-        if not pending_active_restore:
-            self._activate_tab_state(self._current())
-        if restore_enabled and restore_paths:
-            self._startup_order = restore_paths
-            self._restoring_paths = set(self._startup_order)
-            restore_generation = self._activation_generation
-            QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
-        if restore_enabled and restore_folder:
-            self._restore_workspace_folder(restore_folder, restore_expanded)
-        self._emitted_sidebar_key = self._sidebar_slice_key()
-        self._emitted_tabs_key = self._tabs_slice_key()
-        self._emitted_active_tab_id = self.active if self.tabs else ""
-        self._refresh_theme()
-        # Only the first real desktop window may restore the user's opted-in
-        # cloud connection. The cloud client handles network retry/backoff.
-        if not isolated and len(self.session.windows) == 1 and self.settings.get("cloudAgentEnabled"):
-            QTimer.singleShot(0, self._restore_cloud_connection)
 
     def _restore_cloud_connection(self):
         studio_agent_setup._restore_cloud_connection(self)
@@ -1576,58 +1295,13 @@ class Studio(QObject):
         return seeded
 
     def _notify_sidebar(self):
-        if self.retired:
-            return
-        key = self._sidebar_slice_key()
-        if key != getattr(self, "_emitted_sidebar_key", None):
-            self._emitted_sidebar_key = key
-            self.sidebarChanged.emit()
+        return studio_snapshots.notify_sidebar(self)
 
     def _notify_tabs(self):
-        if self.retired:
-            return
-        tabs_key = self._tabs_slice_key()
-        if tabs_key != getattr(self, "_emitted_tabs_key", None):
-            self._emitted_tabs_key = tabs_key
-            self.tabsChanged.emit()
-        active_id = self.active if self.tabs else ""
-        if active_id != getattr(self, "_emitted_active_tab_id", None):
-            self._emitted_active_tab_id = active_id
-            self.activeTabChanged.emit()
+        return studio_snapshots.notify_tabs(self)
 
     def _emit(self, load=True):
-        if self.retired: return
-        self._preview_jobs.retain_tabs(tab["id"] for tab in self.tabs)
-        self._watch_notes()
-        self._notify_sidebar()
-        self._notify_tabs()
-        self.changed.emit()
-        if load and self.ready and self.tabs:
-            tab = self._current()
-            colors = self._colors()
-            reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
-            reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "portable": bool(tab.get("portable", False)), "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
-            pending_heading = tab.pop("pendingHeading", None)
-            if pending_heading:
-                payload["pendingHeading"] = pending_heading
-            seeded_find = self._consume_seeded_find(tab)
-            if seeded_find is not None:
-                payload["seededFind"] = seeded_find
-            payload["editProtocol"]=1
-            if tab.get("agent_unreviewed"):
-                payload["agentUnreviewed"] = True
-            edits = tab.get("agent_edits") or []
-            last_sent = self._last_reader_agent_seq.get(tab["id"], 0)
-            unseen_edits = [item for item in edits if isinstance(item, dict) and item.get("seq", 0) > last_sent]
-            if unseen_edits:
-                payload["pendingAgentEdits"] = unseen_edits
-                self._last_reader_agent_seq[tab["id"]] = unseen_edits[-1]["seq"]
-            previous=self._last_reader_text
-            if previous and previous[0]==tab["id"] and previous[1] is tab["content"]:payload["contentUnchanged"]=True
-            else:payload["content"]=tab["content"]
-            self._last_reader_text=(tab["id"],tab["content"])
-            self.readerLoad.emit(json.dumps(payload))
+        return studio_snapshots.emit_state(self, load=load, custom_theme_mod=custom_theme)
 
     def _tokens(self): return studio_chrome.tokens_for(self, tokens_fn=tokens)
 
@@ -2229,285 +1903,61 @@ class Studio(QObject):
     def _refresh_theme(self): studio_chrome.refresh_theme(self, detect_dark_fn=detect_system_dark, read_palette_fn=read_system_palette)
 
     def stop(self):
-        if self.retired: return
-        if self._storage_cancel_event is not None:self._storage_cancel_event.set()
-        self._cancel_subfolder_search()
-        self._cancel_quick_switcher(close=True)
-        if self._folder_search_cancel is not None:self._folder_search_cancel.set()
-        self._folder_search_pending = False
-        self._search_pool.shutdown(wait=False, cancel_futures=True)
-        if self._python_pool is not None:
-            self._python_pool.shutdown(wait=False, cancel_futures=True)
-        self._export_jobs.cancel_all()
-        self._python_jobs.cancel_all(retire=True)
-        self._preview_jobs.cancel_all(retire=True)
-        for agent_export in tuple(self._agent_exports.values()):
-            try:
-                reserved = Path(agent_export["path"])
-                if reserved.exists() and reserved.stat().st_size == 0:
-                    reserved.unlink()
-            except (OSError, TypeError, KeyError):
-                pass
-        self._agent_exports.clear()
-        self._opening_paths.clear()
-        if self.position_timer.isActive():self._save_positions()
-        self.position_timer.stop()
-        if self.preference_timer.isActive():self._preferences(False)
-        self.preference_timer.stop()
-        self.theme_timer.stop()
-        self.theme_debounce.stop()
-        self.custom_theme_timer.stop()
-        self.recovery_timer.stop()
-        self.autosave_timer.stop()
-        self.flush_timer.stop()
-        self.external_timer.stop()
-        self.filter_timer.stop()
-        for attr in ("note_watcher", "palette_watcher", "custom_theme_watcher"):
-            watcher = getattr(self, attr, None)
-            if watcher is None or watcher is _STOPPED_WATCHER:
-                continue
-            watched = watcher.files() + watcher.directories()
-            if watched:
-                watcher.removePaths(watched)
-            setattr(self, attr, _STOPPED_WATCHER)
-            if shiboken6 is not None and shiboken6.isValid(watcher):
-                watcher.setParent(None)
-                shiboken6.delete(watcher)
-            else:
-                watcher.deleteLater()
-        for signal, slot in (
-            (QGuiApplication.styleHints().colorSchemeChanged, getattr(self, "_color_scheme_slot", None)),
-            (self.session.changed, getattr(self, "_session_changed_slot", None)),
-            (self.session.locationChanged, getattr(self, "_location_changed_slot", None)),
-        ):
-            if slot is not None:
-                try:
-                    signal.disconnect(slot)
-                except (RuntimeError, TypeError):
-                    pass
-        self._recover()
-        self.session.reader_assets.revoke_owner(self.window_id)
-        self._retired = True
-        self.session.windows.pop(self.window_id, None)
-        with self._write_callback_lock:
-            retired_callbacks = list(self._pending_write_retirements.values())
-            self._pending_write_retirements.clear()
-        for callback in retired_callbacks:
-            try:
-                callback()
-            except Exception:
-                pass
-        if not any(not w.retired for w in self.session.windows.values()):
-            for cleanup in list(self.session._pending_rename_cleanups.values()):
-                try:
-                    cleanup()
-                except Exception:
-                    pass
-        if not self.session.is_quitting() and self.session.windows:
-            with self.session._rename_state_lock:
-                self.session.workspace.pop(self.window_id,None)
-                self.session.window_workspaces.pop(self.window_id,None)
-            next(iter(self.session.windows.values()))._recover()
-        if self.system_preferences.state() != QProcess.ProcessState.NotRunning:
-            self.system_preferences.terminate()
-            if not self.system_preferences.waitForFinished(300):
-                self.system_preferences.kill()
-                self.system_preferences.waitForFinished(100)
+        return studio_snapshots.stop_window(
+            self, stopped_watcher=_STOPPED_WATCHER, shiboken_mod=shiboken6,
+            gui_app_cls=QGuiApplication, process_cls=QProcess,
+        )
 
     def _folder_slice_key(self, files):
-        return (
-            self.folder,
-            self.folder_filter,
-            bool(self._folder_searching),
-            getattr(self, "_files_revision", 0),
-            id(files),
-            len(files),
-        )
+        return studio_snapshots.folder_slice_key(self, files)
 
-    _EMPTY_OUTLINE = ()
+    _EMPTY_OUTLINE = studio_snapshots.EMPTY_OUTLINE
 
     def _tab_outline(self, tab):
-        outline = tab.get("outline")
-        return outline if isinstance(outline, list) and outline else self._EMPTY_OUTLINE
+        return studio_snapshots.tab_outline(self, tab)
 
     def _outline_slice_key(self, active_id, outline):
-        return (
-            active_id,
-            getattr(self, "_outline_revision", 0),
-            id(outline),
-            len(outline),
-        )
+        return studio_snapshots.outline_slice_key(self, active_id, outline)
 
     def _sidebar_slice_key(self):
-        tab = self._current()
-        active_id = self.active if self.tabs else ""
-        outline = self._tab_outline(tab)
-        files = self.files
-        return (
-            self._folder_slice_key(files),
-            self._outline_slice_key(active_id, outline),
-            (tuple(self.recent), tuple(self.session.pinned)),
-        )
+        return studio_snapshots.sidebar_slice_key(self)
 
     def _cached_folder_slice_json(self, folder_key, files):
-        cached = getattr(self, "_folder_slice_cache", None)
-        if cached is not None and cached[0] == folder_key:
-            return cached[1]
-        encoded = json.dumps({
-            "folder": self.folder,
-            "folderFilter": self.folder_filter,
-            "folderSearching": bool(self._folder_searching),
-            "files": files,
-        })[1:-1]
-        self._folder_slice_cache = (folder_key, encoded)
-        return encoded
+        return studio_snapshots.cached_folder_slice_json(self, folder_key, files)
 
     def _cached_outline_slice_json(self, outline_key, outline):
-        cached = getattr(self, "_outline_slice_cache", None)
-        if cached is not None and cached[0] == outline_key:
-            return cached[1]
-        encoded = json.dumps(outline)
-        self._outline_slice_cache = (outline_key, encoded)
-        return encoded
+        return studio_snapshots.cached_outline_slice_json(self, outline_key, outline)
 
     def _cached_recent_slice_json(self, recent_tuple):
-        cached = getattr(self, "_recent_slice_cache", None)
-        if cached is not None and cached[0] == recent_tuple:
-            return cached[1]
-        encoded = json.dumps(list(recent_tuple))
-        self._recent_slice_cache = (recent_tuple, encoded)
-        return encoded
+        return studio_snapshots.cached_recent_slice_json(self, recent_tuple)
 
     def _cached_pinned_slice_json(self, pinned_tuple):
-        cached = getattr(self, "_pinned_slice_cache", None)
-        if cached is not None and cached[0] == pinned_tuple:
-            return cached[1]
-        encoded = json.dumps(list(pinned_tuple))
-        self._pinned_slice_cache = (pinned_tuple, encoded)
-        return encoded
+        return studio_snapshots.cached_pinned_slice_json(self, pinned_tuple)
 
     def _tabs_slice_key(self):
-        active_id = self.active if self.tabs else ""
-        return tuple(
-            (
-                t["id"],
-                t["name"],
-                t["path"],
-                self._is_dirty(t),
-                bool(t.get("conflict")),
-                bool(t["id"] != active_id and (t.get("agent_staged") or t.get("agent_unreviewed"))),
-            )
-            for t in self.tabs
-        )
+        return studio_snapshots.tabs_slice_key(self)
 
     def _cached_tabs_slice_json(self, tabs_key=None):
-        if tabs_key is None:
-            tabs_key = self._tabs_slice_key()
-        cached = getattr(self, "_tabs_slice_cache", None)
-        if cached is not None and cached[0] == tabs_key:
-            return cached[1]
-        encoded = json.dumps([
-            {
-                "id": tid,
-                "name": name,
-                "path": path,
-                "dirty": dirty,
-                "conflict": conflict,
-                "agentEdited": agent_edited,
-            }
-            for tid, name, path, dirty, conflict, agent_edited in tabs_key
-        ])
-        self._tabs_slice_cache = (tabs_key, encoded)
-        return encoded
+        return studio_snapshots.cached_tabs_slice_json(self, tabs_key)
 
     @Property(str, notify=tabsChanged)
     def tabsSnapshot(self):
-        return self._cached_tabs_slice_json()
+        return studio_snapshots.tabs_snapshot(self)
 
     @Property(str, notify=activeTabChanged)
     def activeTabId(self):
-        return self.active if self.tabs else ""
+        return studio_snapshots.active_tab_id(self)
 
     def _cached_colors_slice_json(self):
-        dark, palette = self._tokens()
-        token_key = getattr(self, "_token_key", None)
-        cached = getattr(self, "_colors_slice_cache", None)
-        if token_key is not None and cached is not None and cached[0] == token_key:
-            return dark, cached[1]
-        encoded = json.dumps(dict(palette))
-        self._colors_slice_cache = (token_key, encoded)
-        return dark, encoded
+        return studio_snapshots.cached_colors_slice_json(self)
 
     @Property(str, notify=sidebarChanged)
     def sidebarSnapshot(self):
-        tab = self._current()
-        active_id = self.active if self.tabs else ""
-        outline = self._tab_outline(tab)
-        files = self.files
-        folder_key = self._folder_slice_key(files)
-        outline_key = self._outline_slice_key(active_id, outline)
-        recent_tuple = tuple(self.recent)
-        pinned_tuple = tuple(self.session.pinned)
-        sidebar_key = (folder_key, outline_key, (recent_tuple, pinned_tuple))
-        cached = getattr(self, "_sidebar_snapshot_cache", None)
-        if cached is not None and cached[0] == sidebar_key:
-            return cached[1]
-        folder_fragment = self._cached_folder_slice_json(folder_key, files)
-        outline_json = self._cached_outline_slice_json(outline_key, outline)
-        recent_json = self._cached_recent_slice_json(recent_tuple)
-        pinned_json = self._cached_pinned_slice_json(pinned_tuple)
-        encoded = (
-            '{"active": ' + json.dumps(active_id)
-            + ", " + folder_fragment
-            + ', "outline": ' + outline_json
-            + ', "recent": ' + recent_json
-            + ', "pinned": ' + pinned_json
-            + "}"
-        )
-        self._sidebar_snapshot_cache = (sidebar_key, encoded)
-        return encoded
+        return studio_snapshots.sidebar_snapshot(self)
 
     @Property(str, notify=changed)
     def snapshot(self):
-        tab = self._current()
-        active_id = self.active if self.tabs else ""
-        outline = self._tab_outline(tab)
-        files = self.files
-        tabs_json = self._cached_tabs_slice_json()
-        folder_fragment = self._cached_folder_slice_json(self._folder_slice_key(files), files)
-        outline_json = self._cached_outline_slice_json(self._outline_slice_key(active_id, outline), outline)
-        recent_json = self._cached_recent_slice_json(tuple(self.recent))
-        dark, colors_json = self._cached_colors_slice_json()
-        head_fragment = json.dumps({
-            "active": active_id,
-            "name": tab["name"],
-            "portable": tab["portable"],
-            "conflict": bool(tab.get("conflict")),
-            "closedCount": len(self.closed_tabs),
-            "settings": self.settings,
-            "mode": self.mode,
-            "fullscreen": self.fullscreen,
-            "readerOverlay": self.reader_overlay,
-            "imageOverlay": self.image_overlay,
-            "readerReady": self.ready,
-            "dark": dark,
-            "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"],
-            "busy": self.busy > 0,
-            "message": self.message,
-            "messageRevision": getattr(self, "_message_revision", 0),
-            "agentConnection": self._agent_connection_snapshot(),
-            "agentJumpTab": self._agent_jump_snapshot(),
-            "activeAgentUnreviewed": bool(tab.get("agent_unreviewed")),
-        })[1:-1]
-        return (
-            '{"tabs": ' + tabs_json
-            + ", " + head_fragment
-            + ', "outline": ' + outline_json
-            + ", " + folder_fragment
-            + ', "recent": ' + recent_json
-            + ', "colors": ' + colors_json
-            + "}"
-        )
+        return studio_snapshots.window_snapshot(self)
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
     def folderSearchState(self):
