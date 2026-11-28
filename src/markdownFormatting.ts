@@ -400,6 +400,8 @@ function lineIndexAt(lines: DocLine[], offset: number): number {
 interface LeadingQuotePrefix {
   depth: number;
   raw: string;
+  col: number;
+  baseCol: number;
 }
 
 function scanLeadingQuotePrefix(line: string): LeadingQuotePrefix {
@@ -430,10 +432,26 @@ function scanLeadingQuotePrefix(line: string): LeadingQuotePrefix {
       baseCol = col;
     }
   }
-  return { depth, raw: depth > 0 ? line.slice(0, pos) : "" };
+  return { depth, raw: depth > 0 ? line.slice(0, pos) : "", col, baseCol };
 }
 
-const THEMATIC_BREAK_AFTER_QUOTE = /^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/;
+const THEMATIC_BREAK_BODY = /^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/;
+
+function isThematicBreakAfterQuote(quote: LeadingQuotePrefix, afterQuote: string): boolean {
+  let pos = 0;
+  let col = quote.col;
+  while (pos < afterQuote.length && (afterQuote[pos] === " " || afterQuote[pos] === "\t")) {
+    col += afterQuote[pos] === "\t" ? 4 - (col % 4) : 1;
+    pos++;
+  }
+  if (col - quote.baseCol > 3) return false;
+  return THEMATIC_BREAK_BODY.test(afterQuote.slice(pos));
+}
+
+function isThematicBreakLine(line: string): boolean {
+  const quote = scanLeadingQuotePrefix(line);
+  return isThematicBreakAfterQuote(quote, line.slice(quote.raw.length));
+}
 
 function isBlankForBlockAction(line: string, action: "heading" | "list" | "quote"): boolean {
   if (action === "quote") return line.trim().length === 0;
@@ -446,7 +464,7 @@ function hasBlockPrefix(line: string, action: "heading" | "list" | "quote"): boo
   const quote = scanLeadingQuotePrefix(line);
   const afterQuote = line.slice(quote.raw.length);
   if (action === "heading") return /^([ \t]{0,3})#{1,6}(?:[ \t]+|$)/.test(afterQuote);
-  if (THEMATIC_BREAK_AFTER_QUOTE.test(afterQuote)) return false;
+  if (isThematicBreakAfterQuote(quote, afterQuote)) return false;
   // list: `- item`, `* item`, `+ item`, or an empty list marker `- ` / `-` (not `---` or `**bold**`)
   return /^([ \t]*)[-*+][ \t]+/.test(afterQuote) || /^([ \t]*)[-*+]$/.test(afterQuote);
 }
@@ -486,9 +504,8 @@ function toggleBlockPrefixOnLine(
   }
 
   // action === "list"
-  const bulletMatch = THEMATIC_BREAK_AFTER_QUOTE.test(afterQuote)
-    ? null
-    : afterQuote.match(/^([ \t]*)([-*+][ \t]+|[-*+]$)/);
+  if (isThematicBreakAfterQuote(quote, afterQuote)) return null;
+  const bulletMatch = afterQuote.match(/^([ \t]*)([-*+][ \t]+|[-*+]$)/);
   if (remove) {
     if (!bulletMatch) return null;
     const prefixStart = line.from + quoteLen + bulletMatch[1].length;
@@ -545,12 +562,14 @@ function toggleBlockFormat(
   }
 
   const orderedLines = [...touchedIndices].sort((a, b) => a - b).map((idx) => lines[idx]);
-  const nonEmptyLines = orderedLines.filter((line) => !isBlankForBlockAction(line.text, action));
-  const checkPool = nonEmptyLines.length > 0 ? nonEmptyLines : orderedLines;
+  const eligibleLines =
+    action === "list" ? orderedLines.filter((line) => !isThematicBreakLine(line.text)) : orderedLines;
+  const nonEmptyLines = eligibleLines.filter((line) => !isBlankForBlockAction(line.text, action));
+  const checkPool = nonEmptyLines.length > 0 ? nonEmptyLines : eligibleLines;
   const shouldRemove = checkPool.length > 0 && checkPool.every((line) => hasBlockPrefix(line.text, action));
 
   const changes: TextChangeSpec[] = [];
-  for (const line of orderedLines) {
+  for (const line of eligibleLines) {
     if (!shouldRemove && orderedLines.length > 1 && isBlankForBlockAction(line.text, action)) continue;
     const change = toggleBlockPrefixOnLine(line, action, shouldRemove);
     if (change && (change.from !== change.to || change.insert.length > 0)) {

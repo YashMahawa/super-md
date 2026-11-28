@@ -15,6 +15,7 @@ import Editor, {
   formatEditorSession,
 } from "./components/Editor";
 import LiveEditor from "./components/LiveEditor";
+import MarkdownPreview from "./components/MarkdownPreview";
 import { toggleMarkdownFormat } from "./markdownFormatting";
 import { setTypewriterScroll } from "./typewriterScroll";
 
@@ -129,9 +130,33 @@ describe("quoted-block heading and list prefix toggling (unit)", () => {
       ranges: [{ anchor: 2, head: 2 }],
     });
 
-    // Thematic break inside quote is not treated as an existing bullet list
-    const quotedRule = "> - - -";
-    expect(toggleMarkdownFormat(quotedRule, [{ anchor: 2, head: 7 }], "list").doc).toBe("> - - - -");
+    // Quoted thematic breaks are preserved across single and repeated list toggles
+    for (const quotedRule of ["> - - -", "> ---", "> ***", "> ___", "> > * * *", ">>___", ">\t- - -", ">    - - -"]) {
+      const ruleRange = [{ anchor: Math.min(2, quotedRule.length), head: quotedRule.length }];
+      const once = toggleMarkdownFormat(quotedRule, ruleRange, "list");
+      expect(once).toMatchObject({ doc: quotedRule, changes: [], ranges: ruleRange });
+      const twice = toggleMarkdownFormat(once.doc, once.ranges, "list");
+      expect(twice).toMatchObject({ doc: quotedRule, changes: [], ranges: ruleRange });
+    }
+
+    // Selection with an ordinary quoted line next to a quoted thematic break skips the rule when choosing and applying list toggle
+    const lineBeforeRule = "> Ordinary quoted line\n> - - -";
+    const beforeRange = [{ anchor: 2, head: lineBeforeRule.length }];
+    const beforeOn = toggleMarkdownFormat(lineBeforeRule, beforeRange, "list");
+    expect(beforeOn.doc).toBe("> - Ordinary quoted line\n> - - -");
+    expect(beforeOn.ranges).toEqual([{ anchor: 4, head: beforeOn.doc.length }]);
+    const beforeOff = toggleMarkdownFormat(beforeOn.doc, beforeOn.ranges, "list");
+    expect(beforeOff.doc).toBe(lineBeforeRule);
+    expect(beforeOff.ranges).toEqual(beforeRange);
+
+    const ruleBeforeLine = "> - - -\n> Ordinary quoted line";
+    const afterRange = [{ anchor: 2, head: ruleBeforeLine.length }];
+    const afterOn = toggleMarkdownFormat(ruleBeforeLine, afterRange, "list");
+    expect(afterOn.doc).toBe("> - - -\n> - Ordinary quoted line");
+    expect(afterOn.ranges).toEqual([{ anchor: 2, head: afterOn.doc.length }]);
+    const afterOff = toggleMarkdownFormat(afterOn.doc, afterOn.ranges, "list");
+    expect(afterOff.doc).toBe(ruleBeforeLine);
+    expect(afterOff.ranges).toEqual(afterRange);
 
     // CRLF line endings stay intact
     const crlf = "> First\r\n> > Second";
@@ -438,5 +463,140 @@ describe("quoted-block heading and list toggling in mounted Source and Live edit
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.querySelector("blockquote > h2")?.textContent).toBe("Outer insight");
     expect(container.querySelector("blockquote blockquote ul li")?.textContent).toBe("Nested theorem");
+  });
+
+  it("preserves quoted thematic breaks and renders list + thematic break cleanly when toggling an ordinary quoted line next to the rule", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    hostContainer = container;
+    hostRoot = root;
+
+    const sessionId = "quoted-rule-split-session";
+    const initialDoc = "# Axioms\n\n> Ordinary quoted line\n> - - -\n\nClosing note.";
+    let latestDoc = initialDoc;
+
+    function SplitHarness() {
+      const [value, setValue] = useState(initialDoc);
+      return (
+        <div>
+          <Editor
+            sessionId={sessionId}
+            value={value}
+            onChange={(next) => {
+              latestDoc = next;
+              setValue(next);
+            }}
+            dark={false}
+            focusMode={false}
+          />
+          <MarkdownPreview markdown={value} documentPath={null} python="" dark={false} />
+        </div>
+      );
+    }
+
+    await act(async () => {
+      root.render(<SplitHarness />);
+    });
+
+    expect(container.querySelector(".markdown-body blockquote > p")?.textContent).toBe("Ordinary quoted line");
+    expect(container.querySelectorAll(".markdown-body blockquote > hr")).toHaveLength(1);
+    expect(container.querySelectorAll(".markdown-body blockquote ul")).toHaveLength(0);
+
+    // 1. Selecting only `> - - -` and toggling list twice preserves the source and rendered `<hr>` without creating a list or adding hyphens
+    const ruleStart = initialDoc.indexOf("> - - -") + 2;
+    const ruleEnd = initialDoc.indexOf("> - - -") + "> - - -".length;
+    act(() => {
+      editorFindRange(sessionId, ruleStart, ruleEnd);
+    });
+    await act(async () => {
+      expect(formatEditorSession(sessionId, "list")).toBe(true);
+      expect(formatEditorSession(sessionId, "list")).toBe(true);
+    });
+    expect(latestDoc).toBe(initialDoc);
+    expect(querySourceInsertionPoint()).toEqual({ from: ruleStart, to: ruleEnd });
+    expect(container.querySelectorAll(".markdown-body blockquote > hr")).toHaveLength(1);
+    expect(container.querySelectorAll(".markdown-body blockquote ul")).toHaveLength(0);
+
+    // 2. Selecting the ordinary quoted line together with `> - - -` toggles only the ordinary line into a list and back
+    const ordinaryStart = initialDoc.indexOf("Ordinary");
+    act(() => {
+      editorFindRange(sessionId, ordinaryStart, ruleEnd);
+    });
+    await act(async () => {
+      expect(formatEditorSession(sessionId, "list")).toBe(true);
+    });
+    expect(latestDoc).toBe("# Axioms\n\n> - Ordinary quoted line\n> - - -\n\nClosing note.");
+    expect(querySourceInsertionPoint()).toEqual({ from: ordinaryStart + 2, to: ruleEnd + 2 });
+    expect(container.querySelector(".markdown-body blockquote > ul > li")?.textContent).toBe("Ordinary quoted line");
+    expect(container.querySelectorAll(".markdown-body blockquote > hr")).toHaveLength(1);
+
+    await act(async () => {
+      expect(formatEditorSession(sessionId, "list")).toBe(true);
+    });
+    expect(latestDoc).toBe(initialDoc);
+    expect(querySourceInsertionPoint()).toEqual({ from: ordinaryStart, to: ruleEnd });
+    expect(container.querySelector(".markdown-body blockquote > p")?.textContent).toBe("Ordinary quoted line");
+    expect(container.querySelectorAll(".markdown-body blockquote > hr")).toHaveLength(1);
+    expect(container.querySelectorAll(".markdown-body blockquote ul")).toHaveLength(0);
+
+    // 3. Verify the same rendered regression in Live mode when editing the blockquote directly
+    function LiveRuleHarness() {
+      const [markdown, setMarkdown] = useState(initialDoc);
+      return (
+        <LiveEditor
+          markdown={markdown}
+          documentPath={null}
+          dark={false}
+          python=""
+          onChange={(next) => {
+            latestDoc = next;
+            setMarkdown(next);
+          }}
+        />
+      );
+    }
+
+    await act(async () => {
+      root.render(<LiveRuleHarness />);
+    });
+
+    const openBlockquote = () => {
+      const blockquote = container.querySelector("blockquote")!;
+      expect(blockquote).not.toBeNull();
+      act(() => {
+        blockquote.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      });
+      return container.querySelector<HTMLTextAreaElement>("textarea")!;
+    };
+
+    let area = openBlockquote();
+    expect(area.value).toBe("> Ordinary quoted line\n> - - -");
+
+    act(() => {
+      area.focus();
+      area.setSelectionRange(2, area.value.length, "forward");
+      window.dispatchEvent(new CustomEvent("supermd-format", { detail: { action: "list" } }));
+    });
+    expect(area.value).toBe("> - Ordinary quoted line\n> - - -");
+    expect([area.selectionStart, area.selectionEnd]).toEqual([4, area.value.length]);
+
+    act(() => {
+      area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(container.querySelector("blockquote > ul > li")?.textContent).toBe("Ordinary quoted line");
+    expect(container.querySelectorAll("blockquote > hr")).toHaveLength(1);
+
+    area = openBlockquote();
+    act(() => {
+      area.focus();
+      area.setSelectionRange(4, area.value.length, "forward");
+      window.dispatchEvent(new CustomEvent("supermd-format", { detail: { action: "list" } }));
+      area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(latestDoc).toBe(initialDoc);
+    expect(container.querySelector("blockquote > p")?.textContent).toBe("Ordinary quoted line");
+    expect(container.querySelectorAll("blockquote > hr")).toHaveLength(1);
+    expect(container.querySelectorAll("blockquote ul")).toHaveLength(0);
   });
 });
