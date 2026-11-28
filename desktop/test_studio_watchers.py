@@ -95,6 +95,7 @@ class StudioWatchersUnitTests(unittest.TestCase):
         old_path, new_path = self.temp_dir / "draft.md", self.temp_dir / "renamed.md"
         new_path.write_text("# Saved\n", encoding="utf-8")
         invalidated: list[str | None] = []
+        index_invalidated: list[str] = []
         tab = {
             "id": "t1", "name": "draft.md", "path": str(old_path), "content": "# Saved\n", "saved": "# Saved\n",
             "assets": {"assets/a.png": "data:image/png;base64,AA=="}, "saved_assets": {"assets/a.png": "data:image/png;base64,AA=="},
@@ -103,6 +104,7 @@ class StudioWatchersUnitTests(unittest.TestCase):
         session = SimpleNamespace(
             locations={str(old_path): {"top": 4}}, pinned=[str(old_path)], drafts={},
             workspace={"w1": [{"path": str(old_path)}]}, workspace_links=SimpleNamespace(invalidate=lambda folder=None: invalidated.append(folder)),
+            folder_note_index=SimpleNamespace(invalidate=lambda target=None: index_invalidated.append(target)),
         )
         double = SimpleNamespace(
             tabs=[tab], active="t1", recent=[str(old_path)], folder="",
@@ -127,6 +129,7 @@ class StudioWatchersUnitTests(unittest.TestCase):
         self.assertEqual((len(recovered), recovered[0]["name"], recovered[0]["path"]), (1, "Recovered renamed.md", ""))
         self.assertEqual(recovered[0]["assets"]["assets/a.png"], "data:image/png;base64,AQ==")
         self.assertEqual(invalidated, [None, None])
+        self.assertEqual(index_invalidated, [str(old_path), str(new_path), str(new_path)])
 
     def test_studio_wrappers_forward_collaborators_for_watch_external_refresh_and_reload(self):
         smd = self.temp_dir / "note.smd"
@@ -172,10 +175,19 @@ class StudioWatchersUnitTests(unittest.TestCase):
         self.assertIs(tab["assets"]["assets/keep.svg"], url_keep)
         self.assertEqual((revoked, emitted[-1]), ([("win-1", "t1")], ((), {"load": True})))
 
-        rec_calls = []
+        rec_calls, idx_calls = [], []
+        double._invalidate_folder_index = lambda p=None: idx_calls.append(p)
         with patch.object(studio, "file_events", SimpleNamespace(reconcile=lambda k, c: (rec_calls.append((k, c)), {})[1])):
             Studio._refresh_external_notes(double)
-        self.assertEqual(len(rec_calls), 1)
+        self.assertEqual((len(rec_calls), idx_calls), (1, [str(smd)]))
+
+        dead_double = SimpleNamespace(
+            retired=False, note_watch_paths=("keep",),
+            note_watcher=SimpleNamespace(files=lambda: (_ for _ in ()).throw(RuntimeError("deleted C++ watcher"))),
+        )
+        with patch.object(studio, "_watcher_alive", return_value=False) as spy_alive:
+            Studio._watch_notes(dead_double, force=True)
+        self.assertEqual((spy_alive.call_count, dead_double.note_watch_paths), (1, ("keep",)))
 
         write_portable(smd, "# V3 external\n", {"assets/keep.svg": url_keep, "assets/pic.png": url_v2})
         double._staging_tabs = {"t1"}

@@ -65,15 +65,17 @@ def _fallback_submit(_studio_obj: Any, action, done, _busy: bool = True) -> None
         value, error = None, str(reason)
     done(value, error)
 
+def _invalidate_index(studio_obj: Any, target_path: str) -> None:
+    if callable(fn := getattr(studio_obj, "_invalidate_folder_index", None)): return fn(target_path)
+    session = getattr(studio_obj, "session", None)
+    if callable(inv := getattr(session, "invalidate_workspace_caches", None)): inv(target_path)
+    elif (idx := getattr(session, "folder_note_index", None)) is not None: idx.invalidate(target_path)
+
 def _matches_watch_suspension(candidate: str, items, *, include_parent: bool = False, folder_ops_mod: Any = folder_ops) -> bool:
-    if not candidate:
-        return False
+    if not candidate or not items: return False
     for item in items:
-        susp_target, susp_parent, susp_is_dir = item[0], item[1], item[2]
-        susp_new = item[4] if len(item) > 4 else ""
-        if folder_ops_mod.matches_path_prefix(candidate, susp_target, is_directory=susp_is_dir):
-            return True
-        if susp_new and folder_ops_mod.matches_path_prefix(candidate, susp_new, is_directory=susp_is_dir):
+        susp_target, susp_parent, susp_is_dir, susp_new = item[0], item[1], item[2], item[4] if len(item) > 4 else ""
+        if folder_ops_mod.matches_path_prefix(candidate, susp_target, is_directory=susp_is_dir) or (susp_new and folder_ops_mod.matches_path_prefix(candidate, susp_new, is_directory=susp_is_dir)):
             return True
         if include_parent and susp_parent and folder_ops_mod.same_path(candidate, susp_parent):
             return True
@@ -124,8 +126,9 @@ def has_session_path_reference(studio_obj: Any, candidate: str, *, folder_ops_mo
     workspace = getattr(session, "workspace", None)
     return any(entry.get("path") and folder_ops_mod.same_path(entry["path"], candidate) for entries in (workspace.values() if isinstance(workspace, dict) else ()) for entry in entries)
 
-def watch_notes(studio_obj: Any, force: bool = False, *, local_path_fn: Callable[[str], Path] = _default_local_path, file_events_mod: Any = file_events, folder_ops_mod: Any = folder_ops) -> None:
-    if getattr(studio_obj, "retired", False): return
+def watch_notes(studio_obj: Any, force: bool = False, *, local_path_fn: Callable[[str], Path] = _default_local_path, file_events_mod: Any = file_events, folder_ops_mod: Any = folder_ops, watcher_alive_fn: Callable[[Any], bool] | None = None) -> None:
+    watcher = getattr(studio_obj, "note_watcher", _STOPPED_WATCHER)
+    if getattr(studio_obj, "retired", False) or (watcher_alive_fn is not None and not watcher_alive_fn(watcher)): return
     active_suspensions = _call_method(studio_obj, "_active_watch_suspensions", _active_suspensions)
     tabs, recent = getattr(studio_obj, "tabs", ()), getattr(studio_obj, "recent", ())
     folder, expanded = getattr(studio_obj, "folder", ""), getattr(studio_obj, "expanded", ())
@@ -142,7 +145,6 @@ def watch_notes(studio_obj: Any, force: bool = False, *, local_path_fn: Callable
     targets.update(str(resolved) for raw in ({folder} | set(expanded)) if raw and not _target_suspended(studio_obj, raw, active_suspensions, folder_ops_mod=folder_ops_mod) and (resolved := to_path(raw)).is_dir())
     if active_suspensions:
         targets = {c for c in targets if not _target_suspended(studio_obj, c, active_suspensions, folder_ops_mod=folder_ops_mod)}
-    watcher = getattr(studio_obj, "note_watcher", _STOPPED_WATCHER)
     watched = set(watcher.files() + watcher.directories())
     if watched - targets: watcher.removePaths(list(watched - targets))
     if targets - watched: watcher.addPaths(list(targets - watched))
@@ -180,6 +182,8 @@ def refresh_external_notes(studio_obj: Any, *, file_events_mod: Any = file_event
         effective = {p for p in changed if not _target_suspended(studio_obj, p, current_suspensions, folder_ops_mod=folder_ops_mod)}
         reload_fn = getattr(studio_obj, "_reload_changed_content", None)
         reload_fn(effective) if callable(reload_fn) else reload_changed_content(studio_obj, effective, folder_ops_mod=folder_ops_mod)
+        for changed_path in effective:
+            _invalidate_index(studio_obj, changed_path)
         folder = getattr(studio_obj, "folder", "")
         if folder and (effective or emitted_location_change) and (wl := getattr(session, "workspace_links", None)) is not None:
             wl.invalidate(folder)
@@ -242,23 +246,20 @@ def location_changed(studio_obj: Any, old: str, new: str, *, folder_ops_mod: Any
                 tab.update(path="", name=draft["name"], conflict=False)
             _call_method(studio_obj, "_remove_tab", _fallback_remove_tab, tab["id"])
         studio_obj.message = "File deleted: " + Path(old).name + ". Its tab was closed; unsaved changes remain recoverable."
-    if (wl := getattr(session, "workspace_links", None)) is not None:
-        wl.invalidate()
+    _invalidate_index(studio_obj, old)
+    if new: _invalidate_index(studio_obj, new)
+    if (wl := getattr(session, "workspace_links", None)) is not None: wl.invalidate()
     _call_method(studio_obj, "_preferences", None)
     _call_method(studio_obj, "_recover", None)
     _call_method(studio_obj, "_emit", None)
 
-def reload_changed_content(
-    studio_obj: Any, changed, *, open_note_fn: Callable[[Path], Any] = open_note, folder_ops_mod: Any = folder_ops,
-    preserve_assets_fn: Callable[[dict[str, str], dict[str, str]], dict[str, str]] = _default_preserve_unchanged_assets,
-) -> None:
+def reload_changed_content(studio_obj: Any, changed, *, open_note_fn: Callable[[Path], Any] = open_note, folder_ops_mod: Any = folder_ops, preserve_assets_fn: Callable[[dict[str, str], dict[str, str]], dict[str, str]] = _default_preserve_unchanged_assets) -> None:
     watch_fn = getattr(studio_obj, "_watch_notes", None)
     watch_fn(force=True) if callable(watch_fn) else watch_notes(studio_obj, force=True, folder_ops_mod=folder_ops_mod)
     active_suspensions = _call_method(studio_obj, "_active_watch_suspensions", _active_suspensions)
     changed_set = changed if isinstance(changed, (set, frozenset)) else set(changed)
     saving, staging = getattr(studio_obj, "saving", None) or (), getattr(studio_obj, "_staging_tabs", None) or ()
-    if getattr(studio_obj, "note_file_stamps", None) is None:
-        studio_obj.note_file_stamps = {}
+    if getattr(studio_obj, "note_file_stamps", None) is None: studio_obj.note_file_stamps = {}
     for tab in getattr(studio_obj, "tabs", ()):
         path = tab.get("path", "")
         if not path or _path_suspended(studio_obj, path, active_suspensions, folder_ops_mod=folder_ops_mod) or not ({path, str(Path(path).parent)} & changed_set) or tab["id"] in saving or tab["id"] in staging:
@@ -267,10 +268,8 @@ def reload_changed_content(
         try:
             st = Path(path).stat()
             stamp = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            continue
-        if not was_dirty and studio_obj.note_file_stamps.get(path) == stamp:
-            continue
+        except OSError: continue
+        if not was_dirty and studio_obj.note_file_stamps.get(path) == stamp: continue
         tab_id, expected = tab["id"], tab["saved"]
 
         def finished(result, error, id=tab_id, expected=expected, path=path, stamp=stamp, was_dirty=was_dirty):

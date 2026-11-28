@@ -60,7 +60,10 @@ def active_watch_suspensions(session: Any) -> list[tuple[str, str, bool, threadi
         return list(active)
 
 
-def suspend_watches_for_prefix(studio_obj: Any, target_path: str, *, is_dir: bool, new_path: str = "") -> None:
+def suspend_watches_for_prefix(
+    studio_obj: Any, target_path: str, *, is_dir: bool, new_path: str = "",
+    watcher_alive_fn: Callable[[Any], bool] | None = None,
+) -> None:
     parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
     entry_list = [(target_path, parent_str, is_dir, threading.Event(), new_path)]
     fallback_hit = lambda p: (
@@ -69,14 +72,15 @@ def suspend_watches_for_prefix(studio_obj: Any, target_path: str, *, is_dir: boo
         or bool(parent_str and folder_ops.same_path(p, parent_str))
     )
     for win in _session_windows(studio_obj):
-        if getattr(win, "retired", False):
+        watcher = getattr(win, "note_watcher", None)
+        if getattr(win, "retired", False) or watcher is None or (watcher_alive_fn is not None and not watcher_alive_fn(watcher)):
             continue
         win.note_watch_paths = None
         check = getattr(win, "_is_watch_target_suspended", None)
         hit = (lambda p, fn=check: fn(p, entry_list)) if callable(check) else fallback_hit
-        to_remove = [p for p in (win.note_watcher.files() + win.note_watcher.directories()) if hit(p)]
+        to_remove = [p for p in (watcher.files() + watcher.directories()) if hit(p)]
         if to_remove:
-            win.note_watcher.removePaths(to_remove)
+            watcher.removePaths(to_remove)
         if win.external_paths:
             win.external_paths = {p for p in win.external_paths if not hit(p)}
             if not win.external_paths and hasattr(win, "external_timer"):
@@ -93,8 +97,7 @@ def hold_watches_for_rename(studio_obj: Any, target_path: str, *, is_dir: bool, 
         with susp_lock:
             session._watch_suspensions[:] = [item for item in session._watch_suspensions if not item[3].is_set()]
             session._watch_suspensions.append(entry)
-    suspend_fn = getattr(studio_obj, "_suspend_watches_for_prefix", None)
-    if callable(suspend_fn):
+    if callable(suspend_fn := getattr(studio_obj, "_suspend_watches_for_prefix", None)):
         suspend_fn(target_path, is_dir=is_dir, new_path=new_path)
     else:
         suspend_watches_for_prefix(studio_obj, target_path, is_dir=is_dir, new_path=new_path)
@@ -237,6 +240,9 @@ def sync_path_change(studio_obj: Any, old_path: str, new_path: str, *, is_dir: b
         if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
             win._start_folder_search()
         win._emit()
+    if callable(inv_fn := getattr(studio_obj, "_invalidate_folder_index", None)):
+        inv_fn(old_path)
+        inv_fn(new_path)
 
 
 def _resolve_new_folder_child(open_folder: str, parent_path: str, raw_name: str, *, is_directory: bool, current_ext: str = "") -> Path:
@@ -251,6 +257,18 @@ def _resolve_new_folder_child(open_folder: str, parent_path: str, raw_name: str,
 def _ensure_new_target_free(target: Path) -> None:
     if target.exists() or folder_ops._is_link_or_junction(target):
         raise ValueError("An item with that name already exists.")
+
+
+def _invalidate_created_entry(studio_obj: Any, created_path: str, *, in_worker: bool) -> None:
+    session = getattr(studio_obj, "session", None)
+    if in_worker:
+        if (idx := getattr(session, "folder_note_index", None)) is not None:
+            idx.invalidate(created_path)
+        return
+    if callable(inv_fn := getattr(studio_obj, "_invalidate_folder_index", None)):
+        inv_fn(created_path)
+    if (workspace_links := getattr(session, "workspace_links", None)) is not None:
+        workspace_links.invalidate(studio_obj.folder)
 
 
 def _expand_created_in_windows(studio_obj: Any, created_path: str, expand_target: Path, *, recover: bool = False) -> None:
@@ -287,14 +305,14 @@ def create_folder_note(studio_obj: Any, parent_path: str, name: str, fmt: str = 
             write_portable_fn(target, "", {})
         else:
             atomic_write_fn(target, b"")
-        return folder_ops.canonical_path_str(target.resolve(strict=True))
+        created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+        _invalidate_created_entry(studio_obj, created_str, in_worker=True)
+        return created_str
 
     def finished(created_path, error):
         if error or not created_path:
             return
-        workspace_links = getattr(getattr(studio_obj, "session", None), "workspace_links", None)
-        if workspace_links is not None:
-            workspace_links.invalidate(studio_obj.folder)
+        _invalidate_created_entry(studio_obj, created_path, in_worker=False)
         created = Path(created_path)
         _expand_created_in_windows(studio_obj, created_path, created.parent, recover=False)
         existing = next((t for t in studio_obj.tabs if folder_ops.same_path(t["path"], created_path)), None)
@@ -330,14 +348,14 @@ def create_subfolder(studio_obj: Any, parent_path: str, name: str) -> None:
     def work():
         _ensure_new_target_free(target)
         target.mkdir(parents=False, exist_ok=False)
-        return folder_ops.canonical_path_str(target.resolve(strict=True))
+        created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+        _invalidate_created_entry(studio_obj, created_str, in_worker=True)
+        return created_str
 
     def finished(created_dir, error):
         if error or not created_dir:
             return
-        workspace_links = getattr(getattr(studio_obj, "session", None), "workspace_links", None)
-        if workspace_links is not None:
-            workspace_links.invalidate(studio_obj.folder)
+        _invalidate_created_entry(studio_obj, created_dir, in_worker=False)
         created = Path(created_dir)
         _expand_created_in_windows(studio_obj, created_dir, created, recover=True)
         _fail_message(studio_obj, f"Created folder {created.name}")
@@ -500,24 +518,13 @@ def submit_rename(
     future.add_done_callback(completed)
 
 
-def _dispatch_rename(
-    studio_obj: Any, before: Path, after: Path, final_name: str, *,
-    rename_fn: Callable[[Path, Path], None] | None = None,
-    **kwargs: Any,
-) -> None:
+def _dispatch_rename(studio_obj: Any, before: Path, after: Path, final_name: str, *, rename_fn: Callable[[Path, Path], None] | None = None, **kwargs: Any) -> None:
     if rename_fn is None and callable(fn := getattr(studio_obj, "_submit_rename", None)):
         return fn(before, after, final_name, **kwargs)
-    return submit_rename(
-        studio_obj, before, after, final_name,
-        rename_fn=rename_path_with_windows_retry if rename_fn is None else rename_fn,
-        **kwargs,
-    )
+    return submit_rename(studio_obj, before, after, final_name, rename_fn=rename_path_with_windows_retry if rename_fn is None else rename_fn, **kwargs)
 
 
-def rename_entry(
-    studio_obj: Any, entry_path: str, name: str, *,
-    rename_fn: Callable[[Path, Path], None] | None = None,
-) -> None:
+def rename_entry(studio_obj: Any, entry_path: str, name: str, *, rename_fn: Callable[[Path, Path], None] | None = None) -> None:
     if not studio_obj.folder:
         return _fail_message(studio_obj, "Open a folder first.")
     try:
@@ -544,10 +551,7 @@ def rename_entry(
     )
 
 
-def rename_note(
-    studio_obj: Any, note_id: str, name: str, *,
-    rename_fn: Callable[[Path, Path], None] | None = None,
-) -> None:
+def rename_note(studio_obj: Any, note_id: str, name: str, *, rename_fn: Callable[[Path, Path], None] | None = None) -> None:
     tab = next((t for t in studio_obj.tabs if t["id"] == note_id), None)
     if not tab or note_id in getattr(studio_obj, "saving", ()) or note_id in getattr(studio_obj, "_staging_tabs", ()):
         return
