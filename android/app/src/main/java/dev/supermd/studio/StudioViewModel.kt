@@ -1827,27 +1827,84 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(!accepted)readerBarrierFailed()
         }
     }
+    private val readerConflictDrafts = ReaderConflictDraftStore(app.filesDir)
+    private sealed interface SelectedDraftRecovery {
+        data class Conflict(val candidate: ReaderConflictCandidate) : SelectedDraftRecovery
+        data class Deleted(val note: Note) : SelectedDraftRecovery
+    }
     fun recoverDeletedDraft() {
         openRequests.invalidate()
-        val expectedActiveId = mutable.value.active.id
         viewModelScope.launch {
-            val note=withContext(Dispatchers.IO){deletedDrafts.latest(mutable.value.tabs.map {it.id}.toSet())}
-            if(note==null)change {it.copy(message="No additional deleted drafts to recover.")}
-            else {
-                val ref=closedNoteRefs.firstOrNull {it.id==note.id}
-                val legacy=mutable.value.closedTabs.find {it.id==note.id}
-                // Never let a lightweight placeholder mask the complete deleted
-                // draft. A failed snapshot read falls back to that durable source.
-                val restored=if(ref!=null)withContext(Dispatchers.IO){closedNoteStore.loadForRecovery(ref,note)}
-                    else legacy?.takeIf {it.content.isNotEmpty() || it.saved.isNotEmpty() || it.assetDirectory!=null} ?: note
-                val accepted=performReaderBarrier(expectedActiveId) {
-                    closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
-                    change {s->
-                        if(s.tabs.any {it.id==note.id})s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
-                        else s.copy(tabs=s.tabs+restored,activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
+            ReaderConflictDraftStore.recoveryMutex.withLock {
+                val expectedActiveId = mutable.value.active.id
+                val activeTabIds = mutable.value.tabs.map { it.id }.toSet()
+                val selection = withContext(Dispatchers.IO) {
+                    val conflict = readerConflictDrafts.latestCandidate(activeTabIds)
+                    val deleted = deletedDrafts.latestCandidate(activeTabIds)
+                    when {
+                        conflict != null && (deleted == null || conflict.lastModifiedMillis >= deleted.lastModified) ->
+                            SelectedDraftRecovery.Conflict(conflict)
+                        deleted != null ->
+                            SelectedDraftRecovery.Deleted(deleted.note)
+                        else -> null
                     }
                 }
-                if(!accepted)readerBarrierFailed()
+                when (selection) {
+                    null -> change { it.copy(message = "No additional deleted drafts to recover.") }
+                    is SelectedDraftRecovery.Conflict -> {
+                        val candidate = selection.candidate
+                        val restored = candidate.note
+                        var barrierAccepted = false
+                        readerActionMutex.withLock {
+                            if (!flushActiveNoteLocked(expectedActiveId)) return@withLock
+                            barrierAccepted = true
+                            var baseState: StudioState
+                            var nextState: StudioState
+                            do {
+                                baseState = mutable.value
+                                nextState = if (baseState.tabs.any { it.id == restored.id }) {
+                                    baseState.copy(activeId = restored.id)
+                                } else {
+                                    baseState.copy(tabs = baseState.tabs + restored, activeId = restored.id)
+                                }
+                                if (!recoveryWriter.flushAndAwait(nextState)) return@withLock
+                            } while (mutable.value !== baseState)
+                            withContext(kotlinx.coroutines.NonCancellable) {
+                                withContext(Dispatchers.IO) { readerConflictDrafts.retire(candidate) }
+                                if (mutable.value === baseState) {
+                                    mutable.value = nextState
+                                    syncNoteAssetScopes(baseState, nextState)
+                                    observeActive()
+                                } else {
+                                    change { s ->
+                                        if (s.tabs.any { it.id == restored.id }) s.copy(activeId = restored.id)
+                                        else s.copy(tabs = s.tabs + restored, activeId = restored.id)
+                                    }
+                                    flushRecoveryAndAwait()
+                                }
+                            }
+                        }
+                        if (!barrierAccepted) readerBarrierFailed()
+                    }
+                    is SelectedDraftRecovery.Deleted -> {
+                        val note = selection.note
+                        val ref = closedNoteRefs.firstOrNull { it.id == note.id }
+                        val legacy = mutable.value.closedTabs.find { it.id == note.id }
+                        // Never let a lightweight placeholder mask the complete deleted
+                        // draft. A failed snapshot read falls back to that durable source.
+                        val restored = if (ref != null) withContext(Dispatchers.IO) { closedNoteStore.loadForRecovery(ref, note) }
+                        else legacy?.takeIf { it.content.isNotEmpty() || it.saved.isNotEmpty() || it.assetDirectory != null } ?: note
+                        val accepted = performReaderBarrier(expectedActiveId) {
+                            closedNoteRefs = closedNoteRefs.filterNot { it.id == note.id }
+                            change { s ->
+                                if (s.tabs.any { it.id == note.id }) s.copy(activeId = note.id, closedTabs = s.closedTabs.filter { it.id != note.id })
+                                else s.copy(tabs = s.tabs + restored, activeId = note.id, closedTabs = s.closedTabs.filter { it.id != note.id })
+                            }
+                        }
+                        if (!accepted) readerBarrierFailed()
+                        else flushRecoveryAndAwait()
+                    }
+                }
             }
         }
     }
