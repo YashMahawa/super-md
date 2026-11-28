@@ -549,11 +549,12 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             }
         }
     }
+    val findSyncGen = remember { java.util.concurrent.atomic.AtomicInteger(0) }
     DisposableEffect(activity, web) {
         model.assetAccessRestored = { document, source ->
             web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
         }
-        activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
+        activity.dismissDocument = { findSyncGen.incrementAndGet(); web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
         activity.openReaderFind = { replace ->
             menu = false
@@ -581,26 +582,36 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
         findRequest = 0
         findReplace = false
-        focusManager.clearFocus(force = true)
-        reader.requestFocus(View.FOCUS_DOWN)
-        fun syncFindInput(attempt: Int) {
-            if (reader !== web || reader.getTag(R.id.reader_destroyed_tag) == true) return
+        val syncToken = findSyncGen.incrementAndGet()
+        if (!reader.hasFocus()) {
             focusManager.clearFocus(force = true)
+            reader.requestFocus(View.FOCUS_DOWN)
+        }
+        var shownExplicitIme = false
+        var hidImeAfterEditorReady = false
+        fun syncFindInput(attempt: Int) {
+            if (syncToken != findSyncGen.get() || reader !== web || reader.getTag(R.id.reader_destroyed_tag) == true) return
+            if (attempt > 6 && !model.state.value.readerOverlay) return
             if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
             val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
             val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
             val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            val editorReady = reader.hasFocus() && reader.onCheckIsTextEditor()
             if (!hasHardwareKeyboard || showImeWithHardware) {
-                inputMethod?.showSoftInput(reader, 0)
-                if (reader.hasFocus() && reader.onCheckIsTextEditor() && model.state.value.readerOverlay) {
-                    WindowCompat.getInsetsController(activity.window, reader).show(WindowInsetsCompat.Type.ime())
-                }
                 val rootInsets = reader.rootWindowInsets
-                val imeShown = rootInsets != null && WindowInsetsCompat.toWindowInsetsCompat(rootInsets).isVisible(WindowInsetsCompat.Type.ime())
-                if (!imeShown && attempt < 12) reader.postDelayed({ syncFindInput(attempt + 1) }, 50L)
+                if (rootInsets != null && WindowInsetsCompat.toWindowInsetsCompat(rootInsets).isVisible(WindowInsetsCompat.Type.ime())) return
+                if (editorReady && (!shownExplicitIme || attempt % 4 == 0)) {
+                    shownExplicitIme = true
+                    inputMethod?.showSoftInput(reader, 0)
+                    WindowCompat.getInsetsController(activity.window, reader).show(WindowInsetsCompat.Type.ime())
+                } else if (attempt == 0) inputMethod?.showSoftInput(reader, 0)
+                if (attempt < 30) reader.postDelayed({ syncFindInput(attempt + 1) }, 60L)
             } else {
-                if (attempt == 0) inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
-                if (!model.state.value.readerOverlay && attempt < 6) reader.postDelayed({ syncFindInput(attempt + 1) }, 25L)
+                if (attempt == 0 || (editorReady && !hidImeAfterEditorReady)) {
+                    if (editorReady) hidImeAfterEditorReady = true
+                    inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
+                }
+                if (!hidImeAfterEditorReady && attempt < 15) reader.postDelayed({ syncFindInput(attempt + 1) }, 40L)
             }
         }
         reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
@@ -1591,12 +1602,15 @@ internal fun buildHighlightedSnippet(
                     }
                 },
         ) {
-            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("Search across notes", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
+                            if (state.query.isNotEmpty()) {
+                                if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
+                                else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files"
+                            } else if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
                             else "No folder open · searching open tabs and accessible recent notes",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1619,24 +1633,15 @@ internal fun buildHighlightedSnippet(
                     },
                     modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
                 )
-                FlowRow(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
                     FilterChip(selected = !isFilesMode, onClick = { if (isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.TEXT) }, label = { Text("Text") })
                     FilterChip(selected = isFilesMode, onClick = { if (!isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.FILES) }, label = { Text("Files") })
                     FilterChip(selected = state.caseSensitive, onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams, state.mode) }, label = { Text("Match case") })
                     FilterChip(selected = state.includeDiagrams, enabled = !isFilesMode, onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams, state.mode) }, label = { Text("Diagrams") })
-                    if (state.query.isNotEmpty()) {
-                        Text(
-                            if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
-                            else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.align(Alignment.CenterVertically),
-                        )
-                    }
                 }
                 if (state.scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
                 if (state.query.isEmpty()) {

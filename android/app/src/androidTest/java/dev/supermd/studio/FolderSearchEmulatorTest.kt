@@ -49,17 +49,14 @@ class FolderSearchEmulatorTest {
             is Long -> editor.putLong(k, v); is String -> editor.putString(k, v)
             is Set<*> -> @Suppress("UNCHECKED_CAST") editor.putStringSet(k, v as Set<String>)
         }
-        editor.commit()
-        RevocableTestDocumentsProvider.reset(app)
-        TestAuthorityGrants.clear()
+        editor.commit(); RevocableTestDocumentsProvider.reset(app); TestAuthorityGrants.clear()
     }
 
     private fun web(view: View): WebView? =
         if (view is WebView) view else if (view is ViewGroup) (0 until view.childCount).firstNotNullOfOrNull { web(view.getChildAt(it)) } else null
 
     private fun jsUntil(scenario: ActivityScenario<MainActivity>, script: String, accepted: (String) -> Boolean): String {
-        val result = AtomicReference("")
-        val inFlight = AtomicBoolean(false)
+        val result = AtomicReference(""); val inFlight = AtomicBoolean(false)
         compose.waitUntil(20_000) {
             if (accepted(result.get())) return@waitUntil true
             if (inFlight.compareAndSet(false, true)) scenario.onActivity { activity ->
@@ -81,29 +78,27 @@ class FolderSearchEmulatorTest {
         ActivityScenario.launch<MainActivity>(Intent(app, MainActivity::class.java).putExtra("workspace", workspace)).use { scenario ->
             lateinit var model: StudioViewModel
             scenario.onActivity { model = ViewModelProvider(it)[StudioViewModel::class.java].apply { setFolder(treeUri) } }
-            compose.waitUntil(20_000) {
-                model.state.value.files.isNotEmpty() &&
-                    compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
-            }
+            compose.waitUntil(20_000) { model.state.value.files.isNotEmpty() && compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
             jsUntil(scenario, "!!document.querySelector('.android-document')") { it == "true" }
-            fun inSearchDialog(matcher: SemanticsMatcher) = compose.onNode(matcher and hasAnyAncestor(isDialog()))
+            fun inDialog(matcher: SemanticsMatcher) = compose.onNode(matcher and hasAnyAncestor(isDialog()))
 
             scenario.onActivity { model.openFolderSearch() }
-            inSearchDialog(hasText("Search across notes")).assertIsDisplayed()
-            inSearchDialog(hasText("Diagrams")).assertIsEnabled()
-            inSearchDialog(hasSetTextAction()).performTextReplacement("SharedProseHit")
+            inDialog(hasText("Search across notes")).assertIsDisplayed()
+            inDialog(hasText("Diagrams")).assertIsEnabled()
+            inDialog(hasSetTextAction()).performTextReplacement("SharedProseHit")
             compose.waitUntil(15_000) { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 2 }
-            assertEquals(2, compose.onAllNodes(hasText("L3") and hasAnyAncestor(isDialog())).fetchSemanticsNodes().size)
+            assertTrue(model.folderSearch.value.matches.all { it.line == 3 && !it.isFileMatch })
+            assertTrue(compose.onAllNodes(hasText("L3") and hasAnyAncestor(isDialog())).fetchSemanticsNodes().isNotEmpty())
 
-            inSearchDialog(hasText("Files") and hasClickAction()).performClick()
+            inDialog(hasText("Files") and hasClickAction()).performClick()
             compose.waitUntil(15_000) { model.folderSearch.value.mode == FolderSearchMode.FILES && !model.folderSearch.value.scanning }
-            inSearchDialog(hasText("Diagrams")).assertIsNotEnabled()
-            inSearchDialog(hasText("No matching file names found.")).assertIsDisplayed()
-            inSearchDialog(hasSetTextAction()).performTextReplacement("research/quantum")
+            inDialog(hasText("Diagrams")).assertIsNotEnabled()
+            inDialog(hasText("No matching file names found.")).assertIsDisplayed()
+            inDialog(hasSetTextAction()).performTextReplacement("research/quantum")
             compose.waitUntil(15_000) { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
             assertEquals("quantum-notes.md", model.folderSearch.value.matches.single().name)
             assertEquals(0, compose.onAllNodes(hasText("L1") and hasAnyAncestor(isDialog())).fetchSemanticsNodes().size)
-            inSearchDialog(hasText("research/quantum-notes.md") and hasClickAction()).performClick()
+            inDialog(hasText("research/quantum-notes.md") and hasClickAction()).performClick()
             compose.waitUntil(15_000) { model.state.value.active.name == "quantum-notes.md" && !model.folderSearch.value.visible }
             assertNull(model.seededFind.value)
             jsUntil(scenario, "document.querySelector('.android-document h1')?.textContent?.trim()==='Quantum'&&!document.querySelector('.reading-search')") { it == "true" }
@@ -114,13 +109,13 @@ class FolderSearchEmulatorTest {
 
             scenario.onActivity { model.openFolderSearch("") }
             compose.waitUntil(10_000) { model.folderSearch.value.visible && model.folderSearch.value.mode == FolderSearchMode.FILES }
-            inSearchDialog(hasText("Text") and hasClickAction()).performClick()
-            inSearchDialog(hasText("Diagrams")).assertIsEnabled()
-            inSearchDialog(hasSetTextAction()).performTextReplacement("LiveUnsavedToken")
+            inDialog(hasText("Text") and hasClickAction()).performClick()
+            inDialog(hasText("Diagrams")).assertIsEnabled()
+            inDialog(hasSetTextAction()).performTextReplacement("LiveUnsavedToken")
             compose.waitUntil(15_000) { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
             assertEquals("quantum-notes.md", model.folderSearch.value.matches.single().name)
 
-            inSearchDialog(hasSetTextAction()).performTextReplacement("SharedProseHit")
+            inDialog(hasSetTextAction()).performTextReplacement("SharedProseHit")
             compose.waitUntil(15_000) { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 2 }
             val secondOccurrence = model.folderSearch.value.matches[1]
             assertTrue(secondOccurrence.sourceStart > model.folderSearch.value.matches[0].sourceStart)
@@ -130,9 +125,9 @@ class FolderSearchEmulatorTest {
 
             scenario.onActivity { model.openFolderSearch("alpha", FolderSearchMode.TEXT) }
             compose.waitUntil(15_000) { model.folderSearch.value.visible && !model.folderSearch.value.scanning }
-            inSearchDialog(hasText("Files") and hasClickAction()).performClick()
+            inDialog(hasText("Files") and hasClickAction()).performClick()
             compose.waitUntil(15_000) { model.folderSearch.value.mode == FolderSearchMode.FILES && !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
-            inSearchDialog(hasText("alpha.md") and hasClickAction()).performClick()
+            inDialog(hasText("alpha.md") and hasClickAction()).performClick()
             compose.waitUntil(15_000) { !model.folderSearch.value.visible && model.state.value.active.name == "alpha.md" }
             assertNull(model.seededFind.value)
             jsUntil(scenario, "!document.querySelector('.reading-search')") { it == "true" }

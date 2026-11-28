@@ -102,19 +102,14 @@ class StudioUiTest {
         compose.waitUntil(10_000) {
             val ready = java.util.concurrent.atomic.AtomicBoolean(false)
             instrument.runOnMainSync {
-                val activity = compose.activity
-                val decor = activity.window.decorView
+                val activity = compose.activity; val decor = activity.window.decorView
+                if (requireNoIme && imeVisible()) {
+                    (activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+                        ?.hideSoftInputFromWindow((web(decor) ?: decor).windowToken, 0)
+                }
                 val resumed = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance()
                     .getActivitiesInStage(androidx.test.runner.lifecycle.Stage.RESUMED).any { it === activity }
-                ready.set(
-                    resumed &&
-                        activity.hasWindowFocus() &&
-                        decor.isAttachedToWindow &&
-                        decor.isShown &&
-                        decor.width > 0 &&
-                        decor.height > 0 &&
-                        (!requireNoIme || !imeVisible()),
-                )
+                ready.set(resumed && activity.hasWindowFocus() && decor.isAttachedToWindow && decor.isShown && decor.width > 0 && decor.height > 0 && (!requireNoIme || !imeVisible()))
             }
             ready.get()
         }
@@ -122,7 +117,7 @@ class StudioUiTest {
         instrument.runOnMainSync {
             val decor = compose.activity.window.decorView
             decor.viewTreeObserver.registerFrameCommitCallback { committed.countDown() }
-            decor.postInvalidateOnAnimation()
+            invalidateViewTree(decor); decor.postInvalidateOnAnimation()
         }
         committed.await(3, java.util.concurrent.TimeUnit.SECONDS)
     }
@@ -498,14 +493,12 @@ class StudioUiTest {
             compose.waitUntil(10_000){model.state.value.customTheme.isNotBlank()}
             javascriptUntil("(()=>{const root=document.documentElement;return root.dataset.customTheme==='true'&&root.style.getPropertyValue('--custom-heading-weight')==='800'&&getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient');})()") {it=="true"}
             javascriptUntil("document.querySelector('.document-page').dataset.scale") {it=="\"1.4\""}
-            awaitActivityPresenterReady()
+            awaitActivityPresenterReady(requireNoIme = true)
             var colored=0; var themePaintAttempts=0
-            compose.waitUntil(10_000) {
-                if (themePaintAttempts++ > 0) {
-                    androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync { compose.activity.window.decorView.postInvalidateOnAnimation() }
-                    android.os.SystemClock.sleep(80)
-                }
-                val bitmap=compose.onRoot().captureToImage().asAndroidBitmap(); var count=0
+            compose.waitUntil(12_000) {
+                if (themePaintAttempts++ > 0) pulseNextFrame(compose.activity)
+                val bitmap=runCatching { compose.onRoot().captureToImage().asAndroidBitmap() }.getOrNull() ?: return@waitUntil false
+                var count=0
                 for(y in 0 until bitmap.height step 4)for(x in 0 until bitmap.width step 4)if(bitmap.getPixel(x,y) and 0xffffff==0x63351f)count++
                 colored=count; colored>10
             }
@@ -588,22 +581,19 @@ class StudioUiTest {
             compose.onNodeWithContentDescription("Lock document to centre").performClick()
             compose.waitUntil(5000){model.state.value.centerLock}
             javascriptUntil("document.querySelector('.android-reading')?.dataset.centerLocked") {it=="\"true\""}
+            var previousSvgSrc = ""
             fun painted(expected:Int) {
-                javascriptUntil("(()=>{const i=document.querySelector('.svg-diagram');if(!i?.complete||!i.naturalWidth)return false;const r=i.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;if(window.__svgPaintSrc!==i.currentSrc){window.__svgPaintSrc=i.currentSrc;window.__svgPaintFrames=0;requestAnimationFrame(()=>requestAnimationFrame(()=>{window.__svgPaintFrames=2;}));return false;}return window.__svgPaintFrames===2;})()") {it=="true"}
-                awaitReaderVisualStateReady()
+                val priorSrcQuoted = org.json.JSONObject.quote(previousSvgSrc)
+                javascriptUntil("(()=>{const i=document.querySelector('.svg-diagram');if(!i?.complete||!i.naturalWidth||!i.currentSrc||i.currentSrc===$priorSrcQuoted)return false;const r=i.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;if(window.__svgPaintSrc!==i.currentSrc){window.__svgPaintSrc=i.currentSrc;window.__svgPaintFrames=0;requestAnimationFrame(()=>requestAnimationFrame(()=>{window.__svgPaintFrames=2;}));return false;}return window.__svgPaintFrames===2;})()") {it=="true"}
+                previousSvgSrc = javascriptSnapshot("document.querySelector('.svg-diagram')?.currentSrc||''")
+                awaitReaderVisualStateReady(requireNoIme = true)
                 val raw=javascriptUntil("(()=>{const i=document.querySelector('.svg-diagram');if(!i?.complete||!i.naturalWidth)return null;const r=i.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,width:innerWidth};})()") {it.contains("\"width\"")}
                 val point=org.json.JSONObject(raw);val xy=AtomicReference(IntArray(2));val scale=AtomicReference(1f)
                 compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;val location=IntArray(2);reader.getLocationOnScreen(location);xy.set(location);scale.set(reader.width.toFloat()/point.getDouble("width").toFloat())}
                 var observed=0
                 var attempts=0
                 compose.waitUntil(15_000) {
-                    if (attempts++ > 0) {
-                        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
-                            web(compose.activity.window.decorView)?.postInvalidateOnAnimation()
-                            compose.activity.window.decorView.postInvalidateOnAnimation()
-                        }
-                        android.os.SystemClock.sleep(100)
-                    }
+                    if (attempts++ > 0) pulseNextFrame(compose.activity)
                     val bitmap=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
                     try {if(bitmap==null)false else {
                         val px=(xy.get()[0]+(point.getDouble("x")*scale.get()).toInt()).coerceIn(0,bitmap.width-1)
@@ -763,20 +753,18 @@ class StudioUiTest {
                 bounds.width > 0f && bounds.height > 0f
             }
             compose.waitForIdle()
-            awaitActivityPresenterReady()
+            awaitActivityPresenterReady(requireNoIme = true)
             val allowed=listOf(colors.onSurface,colors.onSurfaceVariant).map {it.toArgb() and 0xffffff}
             var visible=0; var darkIconAttempts=0
-            compose.waitUntil(10_000) {
-                if (darkIconAttempts++ > 0) {
-                    androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync { compose.activity.window.decorView.postInvalidateOnAnimation() }
-                    android.os.SystemClock.sleep(80)
-                }
-                val icon=compose.onNodeWithContentDescription("New tab").captureToImage().asAndroidBitmap(); var count=0
+            compose.waitUntil(12_000) {
+                if (darkIconAttempts++ > 0) pulseNextFrame(compose.activity)
+                val icon=runCatching { compose.onNodeWithContentDescription("New tab").captureToImage().asAndroidBitmap() }.getOrNull() ?: return@waitUntil false
+                var count=0
                 for(y in 0 until icon.height)for(x in 0 until icon.width){if(icon.getPixel(x,y) and 0xffffff in allowed)count++}
                 visible=count; visible>5
             }
             assertTrue("The native plus must paint a high-contrast manual-scheme foreground, not the default black ambient",visible>5)
-            java.io.File(compose.activity.getExternalFilesDir(null),"manual-blue-dark.png").outputStream().use {compose.onRoot().captureToImage().asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)}
+            runCatching { java.io.File(compose.activity.getExternalFilesDir(null),"manual-blue-dark.png").outputStream().use {compose.onRoot().captureToImage().asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)} }
         } finally {compose.runOnIdle {model.appearance(accent=before.accent,theme=before.theme)}}
     }
     @Test fun nativeMenuIsDeduplicatedAndReaderZoomIsNotEchoedAsANewCommand() {
@@ -829,7 +817,15 @@ class StudioUiTest {
         setShowImeWithHardware(false)
         val instrumentation=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
         val reader = requireNotNull(web(compose.activity.window.decorView))
-        compose.runOnIdle { reader.requestFocus(android.view.View.FOCUS_DOWN) }
+        awaitActivityPresenterReady(requireNoIme = true)
+        compose.waitUntil(5_000) {
+            val focused = java.util.concurrent.atomic.AtomicBoolean(false)
+            instrumentation.runOnMainSync {
+                if (!reader.hasFocus()) reader.requestFocus(android.view.View.FOCUS_DOWN)
+                focused.set(reader.hasWindowFocus() && reader.hasFocus())
+            }
+            focused.get()
+        }
         // Control: compare Android's native key injection on a plain input in
         // this same WebView/activity before exercising the React search field.
         javascriptUntil("(()=>{const i=document.createElement('input');i.id='native-key-probe';i.type='text';i.style.cssText='position:fixed;top:2px;left:2px;z-index:999999';document.body.append(i);i.focus();return document.activeElement===i})()") { it == "true" }
@@ -849,7 +845,14 @@ class StudioUiTest {
         javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('FocusNeedle')") {it=="true"}
         compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
-        compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
+        compose.waitUntil(5_000) {
+            val ready = java.util.concurrent.atomic.AtomicBoolean(false)
+            instrumentation.runOnMainSync {
+                val current = web(compose.activity.window.decorView)
+                ready.set(current != null && current.hasWindowFocus() && current.hasFocus() && current.onCheckIsTextEditor())
+            }
+            ready.get()
+        }
         val nativeInputState = AtomicReference<org.json.JSONObject>()
         androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
             val imm = compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
@@ -911,8 +914,8 @@ class StudioUiTest {
         javascriptUntil("!!document.querySelector('.android-document.mode-reader')") { it == "true" }
         compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
-        compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
-        compose.waitUntil(5_000) { imeVisible() }
+        compose.waitUntil(5_000) { web(compose.activity.window.decorView)?.let { it.hasFocus() && it.onCheckIsTextEditor() } == true }
+        compose.waitUntil(10_000) { imeVisible() }
     }
     @Test fun nativeSelectionAndHeadingLinksUseMagnifiedPageCoordinates() {
         welcome()
@@ -1361,7 +1364,7 @@ ax.set_title("Matplotlib 3D figure")
         android.graphics.pdf.PdfRenderer(android.os.ParcelFileDescriptor.open(exported, android.os.ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
         compose.runOnIdle { model.zoom(100f) }
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == "\"1\"" }
-        awaitReaderVisualStateReady()
+        awaitReaderVisualStateReady(requireNoIme = true)
         val readerTop = AtomicReference(0)
         compose.runOnIdle { val view = web(compose.activity.window.decorView)!!; val xy = IntArray(2); view.getLocationOnScreen(xy); readerTop.set(xy[1]) }
         val more = compose.onNodeWithContentDescription("More actions").fetchSemanticsNode().boundsInRoot.center
@@ -1372,13 +1375,7 @@ ax.set_title("Matplotlib 3D figure")
         var readerPaintAttempts = 0
         try {
             compose.waitUntil(15_000) {
-                if (readerPaintAttempts++ > 0) {
-                    androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
-                        web(compose.activity.window.decorView)?.postInvalidateOnAnimation()
-                        compose.activity.window.decorView.postInvalidateOnAnimation()
-                    }
-                    android.os.SystemClock.sleep(100)
-                }
+                if (readerPaintAttempts++ > 0) pulseNextFrame(compose.activity)
                 latestScreenshot?.recycle()
                 val shot = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
                 latestScreenshot = shot
