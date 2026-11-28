@@ -1,5 +1,7 @@
 //! The same local typesetter is used by desktop and Android. No browser print layout.
 pub mod portable;
+#[doc(hidden)]
+pub mod slug;
 pub mod theme;
 pub mod pdf_assets;
 pub mod frontmatter;
@@ -924,9 +926,7 @@ struct Renderer<'a> {
     link_depth: usize,
 }
 fn heading_slug(value: &str) -> String {
-    let value = value.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_').collect::<String>();
-    let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
-    if slug.is_empty() { "section".into() } else { slug }
+    slug::heading_slug(value)
 }
 fn parse_braced_fence_language(raw_info: &str) -> Option<&'static str> {
     let trimmed = raw_info.trim();
