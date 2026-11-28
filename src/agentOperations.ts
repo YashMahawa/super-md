@@ -346,7 +346,7 @@ export function agentOutlinePage(source:string,offset:unknown=0,limit:unknown=80
   const pageOffset=offset,end=Math.min(headings.length,pageOffset+limit);
   return {headings:headings.slice(pageOffset,end),offset:pageOffset,total:headings.length,nextOffset:end<headings.length?end:null,truncated:end<headings.length,documentLength};
 }
-function headingSlug(title:string){return title.normalize('NFKD').toLowerCase().replace(/[^\p{L}\p{N}]+/gu,'-').replace(/^-+|-+$/g,'');}
+export function agentHeadingSlug(title:string){return title.normalize('NFKD').toLowerCase().replace(/[^\p{L}\p{N}]+/gu,'-').replace(/^-+|-+$/g,'');}
 function headingAmbiguous(selector:string,matches:AgentHeading[]):never{
   const shown=matches.slice(0,5).map(item=>`${item.index}: ${item.title.slice(0,80)} (line ${item.line})`).join('; ');
   throw Error(`Heading selector '${selector.slice(0,80)}' is ambiguous (${matches.length} matches); candidates: ${shown}${matches.length>5?'; …':''}. Use an outline index or a more specific exact title/slug.`);
@@ -356,7 +356,7 @@ export function resolveAgentHeading(headings:AgentHeading[],selector:unknown):Ag
   if(typeof selector!=='string'||!selector.trim()||selector.length>300)throw Error('heading must be an outline index or exact title, slug, or numbered heading prefix');
   const query=selector.trim(),exact=headings.filter(item=>item.title===query);
   if(exact.length===1)return exact[0];if(exact.length>1)return headingAmbiguous(query,exact);
-  const slug=headingSlug(query),slugMatches=headings.filter(item=>headingSlug(item.title)===slug);
+  const slug=agentHeadingSlug(query),slugMatches=headings.filter(item=>agentHeadingSlug(item.title)===slug);
   if(slugMatches.length===1)return slugMatches[0];if(slugMatches.length>1)return headingAmbiguous(query,slugMatches);
   if(/^\d+(?:\.\d+)*$/.test(query)){
     const escaped=query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),numbered=headings.filter(item=>new RegExp(`^${escaped}(?:$|[\\s:)\\-—]|\\.(?=\\s))`).test(item.title));

@@ -42,9 +42,31 @@ test("offline writing assistance checks prose only and keeps corrections undoabl
   const suggestions=page.getByRole('complementary',{name:'Writing suggestions'});
   await expect(suggestions).toBeVisible({timeout:15_000});
   await suggestions.getByRole('button',{name:'sentence',exact:true}).click();
-  await expect(page.getByRole('textbox',{name:'Edit Markdown block'})).toHaveValue(/This sentence/);
-  await page.getByRole('textbox',{name:'Edit Markdown block'}).press('Escape');
+  const liveBox=page.getByRole('textbox',{name:'Edit Markdown block'});
+  await expect(liveBox).toBeFocused();
+  await expect(liveBox).toHaveValue(/This sentence/);
+  await liveBox.press('Escape');
   await page.evaluate(()=>window.supermdHistory?.('undo'));
+  await expect(page.getByText('This sentnce has a apple and the the word.',{exact:true})).toBeVisible();
+  await page.evaluate(()=>window.supermdHistory?.('redo'));
+  await expect(page.getByText('This sentence has a apple and the the word.',{exact:true})).toBeVisible();
+  // Also verify undoing/redoing immediately inside the focused textarea after accepting
+  // a writing suggestion, leaving the block, and redoing from document history.
+  await page.evaluate(()=>window.supermdHistory?.('undo'));
+  await page.getByText('This sentnce has a apple and the the word.',{exact:true}).dblclick();
+  await expect(suggestions).toBeVisible({timeout:15_000});
+  await suggestions.getByRole('button',{name:'sentence',exact:true}).click();
+  await expect(liveBox).toBeFocused();
+  await expect(liveBox).toHaveValue('This sentence has a apple and the the word.');
+  await liveBox.press('Control+z');
+  await expect(liveBox).toBeFocused();
+  await expect(liveBox).toHaveValue('This sentnce has a apple and the the word.');
+  await liveBox.press('Control+y');
+  await expect(liveBox).toBeFocused();
+  await expect(liveBox).toHaveValue('This sentence has a apple and the the word.');
+  await liveBox.press('Control+z');
+  await expect(liveBox).toHaveValue('This sentnce has a apple and the the word.');
+  await liveBox.press('Escape');
   await expect(page.getByText('This sentnce has a apple and the the word.',{exact:true})).toBeVisible();
   await page.evaluate(()=>window.supermdHistory?.('redo'));
   await expect(page.getByText('This sentence has a apple and the the word.',{exact:true})).toBeVisible();

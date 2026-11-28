@@ -421,8 +421,6 @@ internal class ReaderFolderIndex(private val maxCachedFolders: Int = 256) {
         }
     }
 
-    internal fun cachedFolderCount(): Int = synchronized(lock) { cached.size }
-
     internal fun hasNoteEntries(noteId: String): Boolean = synchronized(lock) {
         cached.keys.any { it.noteId == noteId }
     }
