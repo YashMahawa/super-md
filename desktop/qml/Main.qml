@@ -9,22 +9,15 @@ import QtWebChannel
 ApplicationWindow {
     id: window
     signal readerViewChanged(var readerView)
-    onReaderViewChanged: function(view) {
-        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view)
-    }
+    onReaderViewChanged: function(view) { if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view) }
     property bool readerActivated: !Boolean(studio.deferReaderActivation)
     function activateReaderIfNeeded() {
         if (typeof studio.ensureReaderProfile === "function") studio.ensureReaderProfile()
         if (!readerActivated) readerActivated = true
         if (!readerLoader.active) readerLoader.active = true
     }
-    Component.onCompleted: {
-        if (visible || !Boolean(studio.deferReaderActivation)) activateReaderIfNeeded()
-        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader)
-    }
-    onVisibleChanged: {
-        if (visible) activateReaderIfNeeded()
-    }
+    Component.onCompleted: { if (visible || !Boolean(studio.deferReaderActivation)) activateReaderIfNeeded(); if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader) }
+    onVisibleChanged: if (visible) activateReaderIfNeeded()
     width: 1320
     height: 880
     minimumWidth: 760
@@ -33,6 +26,8 @@ ApplicationWindow {
     flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var reader: readerLoader.item
     property bool sidebar: true
@@ -60,31 +55,8 @@ ApplicationWindow {
     // Deliberate desktop reveal target; ordinary pointer movement in a note
     // does not summon controls. Scrolling only hides; clicks may toggle them.
     HoverHandler { onPointChanged: { if(window.viewState.fullscreen && point.position.y < 56) window.chromeAwake = true; if(window.chromeAwake) chromeIdle.restart() } }
-    WindowModes {
-        id: windowModes
-        host: window
-        onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
-    }
-    Repeater {
-        parent: Overlay.overlay
-        model: studio.fedoraWindowFrame && window.visibility === Window.Windowed
-            ? [Qt.LeftEdge, Qt.RightEdge, Qt.TopEdge, Qt.BottomEdge,
-               Qt.LeftEdge | Qt.TopEdge, Qt.RightEdge | Qt.TopEdge,
-               Qt.LeftEdge | Qt.BottomEdge, Qt.RightEdge | Qt.BottomEdge] : []
-        delegate: MouseArea {
-            required property int modelData
-            readonly property int horizontalEdge: modelData & (Qt.LeftEdge | Qt.RightEdge)
-            readonly property int verticalEdge: modelData & (Qt.TopEdge | Qt.BottomEdge)
-            width: horizontalEdge ? 5 : parent.width
-            height: verticalEdge ? 5 : parent.height
-            x: modelData & Qt.RightEdge ? parent.width - width : 0
-            y: modelData & Qt.BottomEdge ? parent.height - height : 0
-            z: -1
-            cursorShape: !horizontalEdge ? Qt.SizeVerCursor : !verticalEdge ? Qt.SizeHorCursor
-                : (horizontalEdge === Qt.LeftEdge) === (verticalEdge === Qt.TopEdge) ? Qt.SizeFDiagCursor : Qt.SizeBDiagCursor
-            onPressed: window.startSystemResize(modelData)
-        }
-    }
+    WindowModes { id: windowModes; host: window; onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) } }
+    WindowResizeEdges { host: window }
     function runDocumentScript(script) {
         if (!reader) return
         reader.runJavaScript(script)
@@ -244,8 +216,9 @@ ApplicationWindow {
         case "replace": window.openFind(true); break
         case "find_next": window.focusReader(); studio.command("find_next"); break
         case "find_previous": window.focusReader(); studio.command("find_previous"); break
+        case "quick_switcher": studio.openQuickSwitcher(); break
         case "search_folder": studio.openFolderSearch(); break
-        case "close_tab": studio.closeTabSafely(viewState.active); break
+        case "close_tab": studio.closeTabSafely(window.activeTabId || viewState.active); break
         case "next_tab": studio.cycleTab(1); break
         case "previous_tab": studio.cycleTab(-1); break
         case "move_tab_left": studio.moveActiveTab(-1); break
@@ -360,14 +333,9 @@ ApplicationWindow {
         function onReaderReloadRequested() { if (window.reader) window.reader.reload() }
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
         function onAgentRequest(payload) { window.routeAgentRequest(payload) }
-        function onWorkspaceSearchChanged() {
-            if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
-            else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
-        }
-        function onWorkspaceFolderDropped() {
-            window.sidebar = true
-            window.sidebarSection = "folder"
-        }
+        function onWorkspaceSearchChanged() { if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open(); else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close() }
+        function onQuickSwitcherChanged() { if (studio.quickSwitcherState.open && !quickSwitcherDialog.visible) quickSwitcherDialog.openWithFocusCapture(); else if (!studio.quickSwitcherState.open && quickSwitcherDialog.visible) quickSwitcherDialog.close() }
+        function onWorkspaceFolderDropped() { window.sidebar = true; window.sidebarSection = "folder" }
     }
     onViewStateChanged: {
         if (!viewState.readerReady) readerStableTimer.stop()
@@ -412,14 +380,8 @@ ApplicationWindow {
     Repeater {
         model: JSON.parse(studio.shortcutActions)
         delegate: Item {
-            required property var modelData
-            width: 0; height: 0
-            Shortcut {
-                sequences: window.shortcutBindings[modelData.id]
-                enabled: !window.capturingShortcut && window.shortcutEnabled(modelData.id)
-                context: Qt.WindowShortcut
-                onActivated: window.activateShortcut(modelData.id)
-            }
+            required property var modelData; width: 0; height: 0
+            Shortcut { sequences: window.shortcutBindings[modelData.id]; enabled: !window.capturingShortcut && window.shortcutEnabled(modelData.id); context: Qt.WindowShortcut; onActivated: window.activateShortcut(modelData.id) }
         }
     }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
@@ -445,19 +407,11 @@ ApplicationWindow {
                 ActionButton { glyph: "Undo"; ToolTip.text: window.hintWithShortcut("Undo", "undo"); onClicked: studio.command("undo") }
                 ActionButton { glyph: "Redo"; ToolTip.text: window.hintWithShortcut("Redo", "redo"); onClicked: studio.command("redo") }
                 Item {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    DragHandler {
-                        enabled: studio.fedoraWindowFrame
-                        target: null
-                        onActiveChanged: if (active) window.startSystemMove()
-                    }
-                    TapHandler {
-                        enabled: studio.fedoraWindowFrame
-                        onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
-                    }
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                    DragHandler { enabled: studio.fedoraWindowFrame; target: null; onActiveChanged: if (active) window.startSystemMove() }
+                    TapHandler { enabled: studio.fedoraWindowFrame; onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized() }
                 }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
+                ActionButton { objectName: "findInNoteButton"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -469,6 +423,7 @@ ApplicationWindow {
                         implicitWidth: 250
                         NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.reopen_tab || "") : ""; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
                         NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.save_as || "") : ""; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
+                        NoteMenuItem { objectName: "quickSwitcherAction"; text: "Quick switcher"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.quick_switcher || "") : ""; icon.source: "../icons/File.svg"; onTriggered: studio.openQuickSwitcher() }
                         NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; actionVisible: window.width < 1060; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
@@ -480,9 +435,7 @@ ApplicationWindow {
             }
         }
         TabStrip {
-            width: parent.width
-            viewState: window.viewState
-            shortcutLabels: window.shortcutLabels
+            width: parent.width; viewState: window.viewState; tabs: window.tabsState; activeTabId: window.activeTabId; shortcutLabels: window.shortcutLabels
         }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
     }
@@ -490,81 +443,19 @@ ApplicationWindow {
         anchors.fill: parent
         orientation: Qt.Horizontal
         handle: Rectangle { implicitWidth: 6; color: window.viewState.colors["surface-low"]; Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: SplitHandle.pressed || SplitHandle.hovered ? 3 : 1; height: parent.height; color: SplitHandle.pressed || SplitHandle.hovered ? window.Material.primary : window.viewState.colors.outline } }
-        Pane {
-            visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay
-            SplitView.preferredWidth: 260
-            SplitView.minimumWidth: 200
-            SplitView.maximumWidth: 500
-            padding: 16
-            background: ThemeSurface { area:"sidebar" }
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: 12
-                Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
-                ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
-                FolderSidebar {
-                    id: folderSidebar
-                    visible: sidebarSection === "folder"
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    viewState: window.viewState
-                    sidebarState: window.sidebarState
-                    shortcutLabels: window.shortcutLabels
-                }
-                OutlineList { objectName: "sidebarOutlineList"; visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebarState.outline || []; noteId: sidebarState.active }
-                Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
-                Label { text: "Recent notes"; font.weight: Font.DemiBold; color: viewState.colors.text }
-                RecentNotes {
-                    objectName: "sidebarRecentNotes"
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(240, sidebarState.recent.length * 40)
-                    clip: true
-                    model: sidebarState.recent
-                    pinned: sidebarState.pinned
-                    onOpenRequested: path => studio.openNote(path)
-                    onPinRequested: path => studio.pinRecent(path)
-                }
-                Label { visible: !sidebarState.folder && !sidebarState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
-                Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
-                ActionButton { objectName: "newWindowButton"; text: "New window"; tonal: true; Layout.fillWidth: true; ToolTip.text: window.hintWithShortcut("New window", "new_window"); onClicked: studio.command("window") }
-            }
+        WorkspaceSidebar {
+            id: folderSidebar; visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay
+            viewState: window.viewState; tabsState: window.tabsState; activeTabId: window.activeTabId; sidebarState: window.sidebarState; shortcutLabels: window.shortcutLabels
+            section: window.sidebarSection; onSectionEdited: value => window.sidebarSection = value
         }
         Item {
             SplitView.fillWidth: true
             ColumnLayout {
                 anchors.fill: parent
                 spacing: 0
-                Pane {
-                    visible: !viewState.fullscreen && !viewState.imageOverlay
-                    Layout.fillWidth: true
-                    padding: 12
-                    background: ThemeSurface { area:"toolbar"; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .4 } }
-                    RowLayout {
-                    anchors.fill: parent
-                    ModeGroup { objectName: "documentModeGroup"; choices: window.modeChoices(window.width >= 1000); selected: viewState.mode; onChosen: key => studio.setMode(key) }
-                    Item { Layout.fillWidth: true }
-                    ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 40; to: 300; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
-                    TextField {
-                        objectName: "zoomPercentage"
-                        Layout.preferredWidth: 76
-                        Layout.preferredHeight: 36
-                        Layout.alignment: Qt.AlignVCenter
-                        text: Math.round(viewState.zoom).toString() + "%"
-                        font.family: "Noto Sans"
-                        font.pixelSize: 13
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        selectByMouse: true
-                        color: viewState.colors.text
-                        padding: 6
-                        validator: RegularExpressionValidator { regularExpression: /[0-9]{1,3}%?/ }
-                        onEditingFinished: { const value = Number(text.replace("%","")); if (value >= 40 && value <= 300) studio.setZoom(value); else text = Math.round(viewState.zoom) + "%" }
-                        background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
-                        Accessible.name: "Zoom percentage"
-                    }
-                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: window.fullscreenHint(); onClicked: windowModes.setFullscreen(true) }
-                    ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
-                    }
+                ModeZoomBar {
+                    visible: !viewState.fullscreen && !viewState.imageOverlay; Layout.fillWidth: true
+                    viewState: window.viewState; wide: window.width >= 1000; modeChoices: window.modeChoices(window.width >= 1000); fullscreenHintText: window.fullscreenHint(); onEnterFullscreen: windowModes.setFullscreen(true)
                 }
                 Pane {
                     id: conflictBanner
@@ -749,30 +640,16 @@ ApplicationWindow {
                 }
             }
             StudyControls {
-                id: studyToolbar
-                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
-                visible: viewState.fullscreen && !viewState.readerOverlay
-                awake: window.chromeAwake
-                noteName: viewState.name
-                shortcutLabels: window.shortcutLabels
-                ready: viewState.readerReady && !viewState.busy
-                centerLocked: viewState.settings.centerLock
+                id: studyToolbar; anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                visible: viewState.fullscreen && !viewState.readerOverlay; awake: window.chromeAwake; noteName: viewState.name; shortcutLabels: window.shortcutLabels
+                ready: viewState.readerReady && !viewState.busy; centerLocked: viewState.settings.centerLock
                 onCenterLockRequested: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock))
-                onContentsRequested: contentsPopup.open()
-                onExitRequested: windowModes.setFullscreen(false)
-                onSaveRequested: studio.saveSafely()
-                onExportRequested: window.showExport(false)
+                onContentsRequested: contentsPopup.open(); onExitRequested: windowModes.setFullscreen(false); onSaveRequested: studio.saveSafely(); onExportRequested: window.showExport(false)
             }
             FullscreenStatusBanner {
-                id: fullscreenStatusBanner
-                anchors.horizontalCenter: parent.horizontalCenter
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: 20
-                maxWidth: Math.min(680, Math.max(180, parent.width - 48))
-                footerHidden: (viewState.fullscreen || viewState.imageOverlay) && viewState.readerReady
-                busy: Boolean(viewState.busy)
-                message: viewState.message || ""
-                messageRevision: viewState.messageRevision || 0
+                id: fullscreenStatusBanner; anchors.horizontalCenter: parent.horizontalCenter; anchors.bottom: parent.bottom; anchors.bottomMargin: 20
+                maxWidth: Math.min(680, Math.max(180, parent.width - 48)); footerHidden: (viewState.fullscreen || viewState.imageOverlay) && viewState.readerReady
+                busy: Boolean(viewState.busy); message: viewState.message || ""; messageRevision: viewState.messageRevision || 0
             }
             Rectangle {
                 objectName: "readerLoadingOverlay"
@@ -788,29 +665,13 @@ ApplicationWindow {
             }
         }
     }
-    Popup {
-        id: contentsPopup
-        objectName: "contentsOverlay"
-        parent: Overlay.overlay
-        x: 16
-        y: viewState.fullscreen ? 64 : Math.min(180, window.height / 4)
-        width: Math.min(340,window.width-32)
-        height: Math.min(480,window.height-y-24)
-        padding: 16
-        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-        background: Rectangle { radius: 24; color: viewState.colors["surface-high"]; border.color: viewState.colors.outline; border.width: 1; antialiasing: true }
-        ColumnLayout {
-            anchors.fill: parent
-            RowLayout { Label { text: "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.fillWidth: true } ActionButton { glyph: "X"; compact: true; ToolTip.text: "Close contents"; onClicked: contentsPopup.close() } }
-            OutlineList { objectName: "popupOutlineList"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebarState.outline || []; noteId: sidebarState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; window.focusReader() } }
-        }
+    ContentsPopup {
+        id: contentsPopup; windowWidth: window.width; windowHeight: window.height; viewState: window.viewState; sidebarState: window.sidebarState
+        onHeadingChosen: { window.chromeAwake = false; window.focusReader() }
     }
     AppDialog {
         id: settingsDialog
-        objectName: "settingsDialog"
-        width: Math.min(840, window.width - 48)
-        height: Math.min(760, window.height - 48)
-        padding: 0
+        objectName: "settingsDialog"; width: Math.min(840, window.width - 48); height: Math.min(760, window.height - 48); padding: 0
         onClosed: settingsOpen = false
         SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
     }
@@ -931,37 +792,10 @@ ApplicationWindow {
             }
         }
     }
-    // A dedicated welcome surface rather than a stack of modal setup steps.
-    Pane {
-        visible: !viewState.settings.welcomed
-        anchors.fill: parent
-        padding: 40
-        background: Rectangle { color: window.color }
-        WindowControls {
-            visible: studio.fedoraWindowFrame
-            anchors.right: parent.right
-            anchors.top: parent.top
-            host: window
-            colors: viewState.colors
-            onCloseRequested: studio.closeWindowSafely()
-        }
-        ColumnLayout {
-            anchors.centerIn: parent
-            width: Math.min(600, parent.width - 40)
-            spacing: 24
-            Image { source: studio.brand; sourceSize.width: 64; sourceSize.height: 64; Layout.preferredWidth: 64; Layout.preferredHeight: 64 }
-            Label { text: "Your notes. More room to think."; font.pixelSize: 32; font.weight: Font.DemiBold; Layout.fillWidth: true; wrapMode: Text.WordWrap }
-            Label { text: "Open a Markdown note, or keep images together in a portable .smd. No vault or import process."; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 17; opacity: .8 }
-            ModeGroup { Layout.fillWidth: true; choices: [{key:"system",label:"System"},{key:"light",label:"Light"},{key:"dark",label:"Dark"},{key:"black",label:"Pure black"}]; selected: viewState.settings.theme; onChosen: key => studio.setting("theme", JSON.stringify(key)) }
-            Switch { text: "Expressive motion"; checked: viewState.settings.motion; onToggled: studio.setting("motion", JSON.stringify(checked)) }
-            Switch { text: "Add to Applications (experimental)"; visible: studio.desktopIntegrationAvailable; checked: viewState.settings.desktopIntegration; enabled: !studio.updateBusy; onToggled: studio.setDesktopIntegration(checked) }
-            Label { text: "Optional per-user launcher and Open With support. Your default apps are unchanged."; visible: studio.desktopIntegrationAvailable; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
-            RowLayout {
-                ActionButton { text: "Open note"; prominent: true; onClicked: { studio.setting("welcomed", "true"); openDialog.open() } }
-                ActionButton { text: "Explore a sample"; onClicked: studio.setting("welcomed", "true") }
-            }
-            Label { text: "PDFs are typeset locally. Python runs only when you choose Run."; Layout.fillWidth: true; wrapMode: Text.WordWrap; opacity: .7 }
-        }
+    WelcomePane {
+        visible: !viewState.settings.welcomed; host: window; backgroundColor: window.color; viewState: window.viewState
+        onOpenNoteRequested: openDialog.open()
     }
     FolderSearchDialog { id: folderSearchDialog }
+    QuickSwitcherDialog { id: quickSwitcherDialog }
 }

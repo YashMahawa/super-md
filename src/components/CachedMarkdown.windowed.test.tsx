@@ -560,4 +560,136 @@ describe("fast windowed Markdown preview rendering", () => {
     expect(stats.retained).toBeLessThanOrEqual(24_000_000);
     expect(hasCachedBlockOutput(byteMathNode)).toBe(false);
   });
+
+  it("renders unchanged DOM output across real windowed preview blocks with and without supplied source analysis", async () => {
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+
+    const safePng = "data:image/png;base64,iVBORw0KGgo=";
+    const richWindowedMarkdown = [
+      "---",
+      "title: Windowed Pipeline Verification",
+      "tags: [preview, ast]",
+      "---",
+      "",
+      "# Windowed Pipeline Heading",
+      "",
+      "> [!tip] **Callout** with $a^2 + b^2 = c^2$",
+      "> Study ==highlight==, H~2~O, x^2^, <kbd onclick=\"alert(1)\">Ctrl</kbd>+<mark style=\"color:red\">K</mark><br/>next line.",
+      "",
+      "| Syntax | Expression |",
+      "| :--- | ---: |",
+      "| Conditional | $P(A | B)$ |",
+      "",
+      "- [ ] Task item with [reference][doc-ref] and footnote[^wfn]",
+      "",
+      "<script>window.unwanted = true;</script>",
+      "",
+      `![Embedded PNG](${safePng}) and [Blocked](javascript:alert(1))`,
+      "",
+      "$$\\int_0^1 x^3 \\, dx = \\frac{1}{4}$$",
+      "",
+      "```{.python}",
+      "result = 6 * 7",
+      "```",
+      "",
+      "```smd-steps",
+      '{"title":"Transform","steps":[{"label":"Analyze","description":"Parse Markdown once."},{"label":"Render","description":"Transform pre-parsed tree."}]}',
+      "```",
+      "",
+      ...Array.from(
+        { length: 420 },
+        (_, i) => `## Chapter ${i}\n\n${"Windowed preview paragraph preserving pre-parsed document semantics. ".repeat(3)}`,
+      ),
+      "",
+      "[doc-ref]: https://example.org/windowed",
+      "[^wfn]: Windowed footnote body.",
+    ].join("\n");
+    expect(richWindowedMarkdown.length).toBeGreaterThan(80_000);
+
+    const suppliedAnalysis = {
+      source: richWindowedMarkdown,
+      analysis: analyzeDocument(richWindowedMarkdown),
+    };
+    const analyzeSpy = vi.spyOn(documentAnalysisModule, "analyzeDocument");
+
+    const renderWindowed = async (withSuppliedAnalysis: boolean) => {
+      const container = document.createElement("div");
+      container.className = "android-reading";
+      document.body.append(container);
+      const localRoot = createRoot(container, { identifierPrefix: "windowed-parity-" });
+      await act(async () => {
+        localRoot.render(
+          <MarkdownPreview
+            markdown={richWindowedMarkdown}
+            documentPath="/tmp/windowed-note.md"
+            python="python3"
+            dark={false}
+            onChange={() => {}}
+            sourceAnalysis={withSuppliedAnalysis ? suppliedAnalysis : undefined}
+          />,
+        );
+      });
+      const observer = FakeIntersectionObserver.instances.at(-1)!;
+      const blocks = Array.from(container.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      expect(blocks.length).toBeGreaterThan(420);
+      // Reveal the rich technical header blocks and the final footnote section
+      await act(async () => {
+        observer.emitMany([...blocks.slice(0, 12), ...blocks.slice(-3)], true);
+      });
+      const html = container.innerHTML.replace(/data-step-deck-id="[^"]*"/g, 'data-step-deck-id="deck"');
+      act(() => localRoot.unmount());
+      container.remove();
+      return html;
+    };
+
+    const suppliedHtml = await renderWindowed(true);
+    expect(analyzeSpy).not.toHaveBeenCalledWith(richWindowedMarkdown);
+
+    const unsuppliedNote = richWindowedMarkdown.replace("result = 6 * 7", "result = 6 * 7 # fresh");
+    const freshContainer = document.createElement("div");
+    freshContainer.className = "android-reading";
+    document.body.append(freshContainer);
+    root = createRoot(freshContainer);
+    await act(async () => {
+      root?.render(
+        <MarkdownPreview
+          markdown={unsuppliedNote}
+          documentPath="/tmp/windowed-note.md"
+          python="python3"
+          dark={false}
+          onChange={() => {}}
+        />,
+      );
+    });
+    expect(analyzeSpy).toHaveBeenCalledWith(unsuppliedNote);
+    const freshObserver = FakeIntersectionObserver.instances.at(-1)!;
+    const freshBlocks = Array.from(freshContainer.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+    await act(async () => {
+      freshObserver.emitMany([...freshBlocks.slice(0, 12), ...freshBlocks.slice(-3)], true);
+    });
+
+    const baselineHtml = await renderWindowed(false);
+    expect(suppliedHtml).toBe(baselineHtml);
+    expect(suppliedHtml).toContain("Windowed Pipeline Verification");
+    expect(suppliedHtml).toContain('id="windowed-pipeline-heading"');
+    expect(suppliedHtml).toContain('class="callout callout-tip"');
+    expect(suppliedHtml).toContain("<mark>highlight</mark>");
+    expect(suppliedHtml).toContain("H<sub>2</sub>O");
+    expect(suppliedHtml).toContain("x<sup>2</sup>");
+    expect(suppliedHtml).toContain("<kbd>Ctrl</kbd>+<mark>K</mark><br>");
+    expect(suppliedHtml).not.toContain("onclick");
+    expect(suppliedHtml).not.toContain("color:red");
+    expect(suppliedHtml).toContain("<table");
+    expect(suppliedHtml).toContain('class="katex-display"');
+    expect(suppliedHtml).toContain('class="python-cell"');
+    expect(suppliedHtml).toContain("Transform");
+    expect(suppliedHtml).toContain('href="https://example.org/windowed"');
+    expect(suppliedHtml).toContain("Windowed footnote body.");
+    expect(suppliedHtml).toContain(`src="${safePng}"`);
+    expect(suppliedHtml).not.toContain("javascript:");
+    expect(suppliedHtml).not.toContain("<script");
+    expect(suppliedHtml).toContain("&lt;script&gt;window.unwanted = true;&lt;/script&gt;");
+    expect(freshContainer.querySelector(".python-cell")?.textContent).toContain("# fresh");
+  });
 });
