@@ -190,9 +190,21 @@ test('extends Qt native scroll indicators to visibly overflowing table and code 
           ready({
             objects: {
               studio: {
-                post: (id: string) => {
+                post: (id: string, command?: string) => {
                   queueMicrotask(() => {
-                    for (const cb of listeners) cb(id, 'null', '');
+                    const reply =
+                      command === 'run_python'
+                        ? JSON.stringify({
+                            ok: true,
+                            stdout:
+                              'py_output_digest_' +
+                              Array.from({ length: 32 }, (_, i) => `segment_${String(i).padStart(2, '0')}`).join('_') +
+                              '\n',
+                            stderr: '',
+                            images: [],
+                          })
+                        : 'null';
+                    for (const cb of listeners) cb(id, reply, '');
                   });
                 },
                 replied: {
@@ -251,7 +263,7 @@ test('extends Qt native scroll indicators to visibly overflowing table and code 
       await page.evaluate(
         ({ mode, content }) => {
           window.supermdLoad?.({
-            id: `nested-indicators-${mode}`,
+            id: 'nested-indicators',
             path: null,
             content,
             mode,
@@ -273,20 +285,36 @@ test('extends Qt native scroll indicators to visibly overflowing table and code 
       const reading = page.locator('.android-reading');
       const compactTb = reading.locator('.markdown-body table').nth(0);
       const wideTb = reading.locator('.markdown-body table').nth(1);
-      const shortPre = reading.locator('.markdown-body pre:not(.python-source)').nth(0);
-      const widePre = reading.locator('.markdown-body pre:not(.python-source)').nth(1);
+      const shortPre = reading.locator('.markdown-body pre:not(.python-source):not(.cell-output pre)').nth(0);
+      const widePre = reading.locator('.markdown-body pre:not(.python-source):not(.cell-output pre)').nth(1);
       const pySource = reading.locator('.python-cell .python-source').first();
+      const pyOutput = reading.locator('.python-cell .cell-output pre').first();
 
       await expect(wideTb).toBeVisible();
       await expect(widePre).toBeVisible();
       await expect(pySource).toBeVisible();
+      if (mode === 'reader') {
+        await reading.locator('.python-cell button.python-run').first().click();
+      }
+      await expect(pyOutput).toBeVisible();
 
       // Confirm actual visible overflow + 16px custom Qt scrollbar lane on overflowing regions vs zero extra lane on compact regions.
       const dims = await page.evaluate(() => {
         const r = document.querySelector<HTMLElement>('.android-reading')!;
         const [cTb, wTb] = Array.from(r.querySelectorAll<HTMLElement>('.markdown-body table'));
-        const [sPre, wPre] = Array.from(r.querySelectorAll<HTMLElement>('.markdown-body pre:not(.python-source)'));
+        const [sPre, wPre] = Array.from(
+          r.querySelectorAll<HTMLElement>('.markdown-body pre:not(.python-source):not(.cell-output pre)'),
+        );
         const py = r.querySelector<HTMLElement>('.python-cell .python-source')!;
+        const pyOut = r.querySelector<HTMLElement>('.python-cell .cell-output pre')!;
+        wTb.scrollLeft = 0;
+        wPre.scrollLeft = 0;
+        py.scrollTop = 0;
+        py.scrollLeft = 0;
+        pyOut.scrollLeft = 0;
+        [cTb, wTb, sPre, wPre, py, pyOut].forEach(el =>
+          el.classList.remove('scroll-indicator-active', 'scroll-indicator-hover'),
+        );
         return {
           compactTbOverflow: cTb.scrollWidth - cTb.clientWidth,
           compactTbScrollbarH: cTb.offsetHeight - cTb.clientHeight,
@@ -303,6 +331,9 @@ test('extends Qt native scroll indicators to visibly overflowing table and code 
           pyScrollbarW: py.offsetWidth - py.clientWidth,
           pyScrollbarH: py.offsetHeight - py.clientHeight,
           pyClientWidth: py.clientWidth,
+          pyOutOverflowX: pyOut.scrollWidth - pyOut.clientWidth,
+          pyOutScrollbarH: pyOut.offsetHeight - pyOut.clientHeight,
+          pyOutClientHeight: pyOut.clientHeight,
         };
       });
       expect(dims.compactTbOverflow).toBeLessThanOrEqual(1);
@@ -317,6 +348,8 @@ test('extends Qt native scroll indicators to visibly overflowing table and code 
       expect(dims.pyOverflowY).toBeGreaterThan(100);
       expect(dims.pyScrollbarW).toBe(16);
       expect(dims.pyScrollbarH).toBe(16);
+      expect(dims.pyOutOverflowX).toBeGreaterThan(140);
+      expect(dims.pyOutScrollbarH).toBe(16);
 
       // 1. Wide table: diagonal native wheel scroll routes dx to table & chains dy to .android-reading,
       // reveals the scrollbar thumb while active, and fades back to clean transparent lane when idle.
@@ -427,6 +460,44 @@ test('extends Qt native scroll indicators to visibly overflowing table and code 
       expect(countDistinctPixels(pyHoverShot, pyIdleShot)).toBeGreaterThan(40);
       await page.mouse.move(10, 10);
       await expect(pySource).not.toHaveClass(/scroll-indicator-hover/);
+
+      // 4. Wide .cell-output pre (Python output): diagonal native wheel scroll moves output horizontally,
+      // chains dy to .android-reading, reveals indicator thumb while active, and reveals on bottom-lane hover.
+      await pyOutput.scrollIntoViewIfNeeded();
+      await expect(pyOutput).not.toHaveClass(/scroll-indicator-active|scroll-indicator-hover/);
+      const pyOutInitialBox = (await pyOutput.boundingBox())!;
+      const readingBeforePyOut = await reading.evaluate(el => el.scrollTop);
+      await page.evaluate(
+        point => window.supermdNativeWheel?.(110, 65, point, false),
+        { x: pyOutInitialBox.x + 60, y: pyOutInitialBox.y + 12 },
+      );
+      await expect(pyOutput).toHaveClass(/scroll-indicator-active/);
+      expect(await pyOutput.evaluate(el => el.scrollLeft)).toBeGreaterThan(75);
+      expect(await reading.evaluate(el => el.scrollTop)).toBeGreaterThan(readingBeforePyOut + 35);
+
+      await pyOutput.scrollIntoViewIfNeeded();
+      const pyOutBox = (await pyOutput.boundingBox())!;
+      const pyOutLaneClip = {
+        x: Math.round(pyOutBox.x + 12),
+        y: Math.round(pyOutBox.y + pyOutBox.height - 14),
+        width: Math.max(40, Math.round(pyOutBox.width - 24)),
+        height: 12,
+      };
+      await pyOutput.evaluate(el => { el.scrollLeft = 95; });
+      await expect(pyOutput).toHaveClass(/scroll-indicator-active/);
+      const pyOutActiveShot = await page.screenshot({ clip: pyOutLaneClip });
+
+      await expect(pyOutput).not.toHaveClass(/scroll-indicator-active/, { timeout: 2000 });
+      expect(await pyOutput.evaluate(el => el.clientHeight)).toBe(dims.pyOutClientHeight);
+      const pyOutIdleShot = await page.screenshot({ clip: pyOutLaneClip });
+      expect(countDistinctPixels(pyOutActiveShot, pyOutIdleShot)).toBeGreaterThan(40);
+
+      await page.mouse.move(pyOutBox.x + 60, pyOutBox.y + pyOutBox.height - 6);
+      await expect(pyOutput).toHaveClass(/scroll-indicator-hover/);
+      const pyOutHoverShot = await page.screenshot({ clip: pyOutLaneClip });
+      expect(countDistinctPixels(pyOutHoverShot, pyOutIdleShot)).toBeGreaterThan(40);
+      await page.mouse.move(10, 10);
+      await expect(pyOutput).not.toHaveClass(/scroll-indicator-hover/);
     }
 
     // Verify Ctrl+wheel note zoom over wide table and .python-source remains unchanged.

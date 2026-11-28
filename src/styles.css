@@ -466,7 +466,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .cell-output.failed { color: var(--error); }
 .cell-output.stale { opacity: .48; }
 .stale-badge { display: inline-block; margin-left: 8px; padding: 3px 7px; border-radius: 99px; color: var(--on-primary); background: var(--primary); font-size: .68em; font-weight: 750; }
-.cell-output pre { background: transparent; color: inherit; padding: 5px; white-space: pre-wrap; }
+.cell-output pre { background: transparent; color: inherit; padding: 5px; white-space: pre-wrap; overflow-wrap: normal; }
 .cell-output img { background: white; }
 .focus-mode .editor-pane .cm-gutters { visibility: hidden; }
 .focus-mode .markdown-body { width: min(760px, calc(100% - 48px)); }
