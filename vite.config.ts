@@ -225,7 +225,6 @@ export default defineConfig(({mode}) => ({
       ignored: [
         "**/dist/**",
         "**/coverage/**",
-        "**/test-results/**",
         "**/playwright-report/**",
         "**/*.tsbuildinfo",
         "**/smd-core/target/**",
@@ -240,6 +239,7 @@ export default defineConfig(({mode}) => ({
       input: buildHtmlEntries(mode),
       output: {
         manualChunks(id) {
+          if (id.includes("vite/preload-helper")) return "preload-helper";
           if (/[\\/]node_modules[\\/]pele[\\/]/.test(id)) return "pele";
           return undefined;
         },
