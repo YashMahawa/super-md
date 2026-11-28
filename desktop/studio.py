@@ -56,6 +56,10 @@ except ImportError:
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
+if __package__:
+    from . import studio_saves
+else:
+    import studio_saves
 from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import ExactWriteAborted, LatestWriteExecutor
 if __package__:
@@ -204,8 +208,7 @@ DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackgro
 DEFAULTS.update(hideNonNoteFolders=True)
 
 def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
-    """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
-    return {k: old_assets[k] if old_assets.get(k) == v else v for k, v in new_assets.items()}
+    return studio_saves.preserve_unchanged_assets(old_assets, new_assets)
 
 
 def _is_windows() -> bool:
@@ -4154,138 +4157,16 @@ class Studio(QObject):
         self._emit()
 
     @Slot()
-    def save(self):
-        if not self.tabs:
-            return
-        self._save_current(False)
+    def save(self): studio_saves.save(self)
 
-    def _save_current(self, force_overwrite: bool = False):
-        if not self.tabs:
-            return
-        tab = self._current()
-        if not tab["path"]:
-            self.saveRequested.emit(tab["name"])
-        elif not force_overwrite and tab.get("conflict"):
-            self.saveConflictRequested.emit(tab["name"])
-        elif tab["portable"] and self.ready:
-            if force_overwrite:
-                self._force_overwrite_ids.add(tab["id"])
-            else:
-                self._force_overwrite_ids.discard(tab["id"])
-            self.readerCall.emit("window.supermdPortable?.(true)")
-        else:
-            self._save_text(tab, Path(tab["path"]), automatic=False, force_overwrite=force_overwrite, force_portable=bool(tab["portable"]))
-
-    def _after_flush(self,operation):
-        if operation["action"] == "save": self.save()
-        elif operation["action"] == "save_as":
-            if self.tabs:
-                self.saveAsRequested.emit(self._current()["name"])
-        elif operation["action"] == "overwrite_conflict": self._save_current(True)
-        elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
-        elif operation["action"] == "sync_for_search":
-            if self._folder_search_open and self._folder_search_query.strip():
-                if self._folder_search_pending:
-                    self.workspaceSearchChanged.emit()
-                else:
-                    current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
-                    if current_sig != self._folder_search_tabs_sig:
-                        self._start_folder_search()
-                    else:
-                        self.workspaceSearchChanged.emit()
-        elif operation["action"] == "open_search_match":
-            request = json.loads(operation["target"])
-            tab_id = request.get("tabId") or ""
-            path = request.get("path") or ""
-            query = request.get("query") or ""
-            case_sensitive = bool(request.get("caseSensitive", False))
-            bounds = self._seeded_find_bounds(request)
-            existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
-            if existing is None and path:
-                resolved = os.path.normcase(str(Path(path).resolve(strict=False)))
-                existing = next((t for t in self.tabs if t.get("path") and os.path.normcase(str(Path(t["path"]).resolve(strict=False))) == resolved), None)
-            if existing is not None:
-                if existing["id"] == self.active and self.ready:
-                    self._pending_seeded_find = None
-                    if query:
-                        find_opts = {"caseSensitive": case_sensitive, **bounds}
-                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps(find_opts)})")
-                    self._focus_open_target(self._activation_generation)
-                else:
-                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
-                    self.selectTab(existing["id"])
-                    if existing["id"] == self.active and not self.ready:
-                        pass
-                    self._focus_open_target(self._activation_generation)
-            elif path:
-                local = str(local_path(path))
-                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
-                def opened(_note, error):
-                    if error and self._pending_seeded_find and self._pending_seeded_find.get("path") == local:
-                        self._pending_seeded_find = None
-                self._open_note(local, explicit=True, completion_callback=opened)
-        elif operation["action"] == "reload_reader":
-            # The renderer has acknowledged all edits. Reopen it from native
-            # state and the just-captured view snapshot in document_flushed.
-            self._python_jobs.cancel_tab(self.active)
-            self.ready=False
-            self._last_reader_text=None
-            self._last_reader_agent_seq.clear()
-            self.reader_overlay=False
-            self.image_overlay=False
-            self._emit(False)
-            self.readerReloadRequested.emit()
-        elif operation["action"] == "mode": self._apply_mode(operation["target"])
-        elif operation["action"] == "move_tab":
-            request = json.loads(operation["target"])
-            target = self.session.windows.get(request["window"])
-            if target: self._move_tab(target, request["tab"], request["index"])
-        elif operation["action"] == "detach_tab":
-            if self._can_move(): self.detachedWindowRequested.emit(self.window_id, operation["target"])
-        elif operation["action"] == "close_tab": self.closeTab(operation["target"])
-        elif operation["action"] == "close_window" and self.requestWindowClose():
-            self._recover()
-            QTimer.singleShot(0,self.allowClose.emit)
-
-    def _on_flush_timeout(self):
-        if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
-            self.flush_operation = None
-            self.workspaceSearchChanged.emit()
-            return
-        bg = getattr(self.session, "background", None)
-        if (
-            self.flush_operation
-            and self.flush_operation["action"] == "close_window"
-            and bg is not None
-            and getattr(bg, "_stopping_from_cli", False)
-            and getattr(self, "host_window", None) is not None
-            and not self.host_window.isVisible()
-        ):
-            self.resolveFlush("recover_close")
-            return
-        self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window"))
-
-    def _flush(self,action,target=""):
-        if self.retired or action=="close_window" and self.pending_close:return
-        operation = {"action":action,"target":target,"token":uuid.uuid4().hex}
-        if not self.ready or not self.tabs:
-            self._after_flush(operation)
-            return
-        bg = getattr(self.session, "background", None)
-        hidden_cli_close = (
-            action == "close_window"
-            and bg is not None
-            and getattr(bg, "_stopping_from_cli", False)
-            and getattr(self, "host_window", None) is not None
-            and not self.host_window.isVisible()
-        )
-        if self.flush_operation and not hidden_cli_close and (self.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"): return
-        self.flush_operation = operation
-        self.flush_timer.start(250 if hidden_cli_close else 5000)
-        self.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
+    def _save_current(self, force_overwrite: bool = False): studio_saves.save_current(self, force_overwrite)
+    def _after_flush(self, operation):
+        studio_saves.after_flush(self, operation, local_path_fn=local_path, single_shot_fn=QTimer.singleShot, seeded_find_bounds_fn=getattr(self, "_seeded_find_bounds", Studio._seeded_find_bounds), is_dirty_fn=getattr(self, "_is_dirty", None))
+    def _on_flush_timeout(self): studio_saves.on_flush_timeout(self)
+    def _flush(self, action, target=""): studio_saves.flush(self, action, target)
 
     @Slot()
-    def saveSafely(self): self._flush("save")
+    def saveSafely(self): studio_saves.save_safely(self)
 
     @Slot()
     def ensureReaderProfile(self):
@@ -4296,257 +4177,33 @@ class Studio(QObject):
             callback()
 
     @Slot()
-    def saveAsSafely(self): self._flush("save_as")
+    def saveAsSafely(self): studio_saves.save_as_safely(self)
 
     @Slot()
-    def reloadReaderSafely(self):
-        if not self.ready or self.retired or self.busy or self.flush_operation: return
-        self._flush("reload_reader")
+    def reloadReaderSafely(self): studio_saves.reload_reader_safely(self)
 
     @Slot(str)
-    def closeTabSafely(self,id): self._flush("close_tab",id)
+    def closeTabSafely(self, id): studio_saves.close_tab_safely(self, id)
 
     @Slot()
-    def closeWindowSafely(self): self._flush("close_window")
+    def closeWindowSafely(self): studio_saves.close_window_safely(self)
 
     @Slot(str)
-    def resolveFlush(self,choice):
-        operation,self.flush_operation = self.flush_operation,None
-        self.flush_timer.stop()
-        if not operation: return
-        if choice == "cancel" and operation["action"] == "close_window":
-            service = getattr(self.session, "background", None)
-            if service is not None: service.cancel_quit()
-        elif choice == "retry": self._flush(operation["action"],operation["target"])
-        elif choice == "recover_close" and operation["action"] == "close_window":
-            # Explicit emergency action: preserve the latest received drafts, not
-            # a silent discard or a claim we can recover an unresponsive renderer.
-            self._recover()
-            self.allowClose.emit()
+    def resolveFlush(self, choice): studio_saves.resolve_flush(self, choice)
 
     @Slot(str)
-    def saveAs(self, value):
-        path = local_path(value)
-        tab = self._current()
-        if path.suffix.lower() == ".smd" and self.ready:
-            self.pending_export = str(path)
-            self.pending_save_as = str(path)
-            self.pending_save_as_tab = tab["id"]
-            self.readerCall.emit("window.supermdPortable?.(false)")
-        else:
-            self._save_text(tab, path, automatic=False, force_overwrite=True, force_portable=path.suffix.lower() == ".smd")
+    def saveAs(self, value): studio_saves.save_as(self, value, local_path_fn=local_path)
 
     @Slot(str)
-    def resolveConflict(self, choice):
-        if choice == "cancel":
-            was_window = self.pending_close == "window"
-            self.pending_close = ""
-            if was_window:
-                service = getattr(self.session, "background", None)
-                if service is not None: service.cancel_quit()
-            return
-        if choice == "save_as":
-            self.saveAsSafely()
-            return
-        if choice == "overwrite":
-            self._flush("overwrite_conflict")
-            return
-        if choice == "reload":
-            self._flush("reload_conflict")
-            return
+    def resolveConflict(self, choice): studio_saves.resolve_conflict(self, choice)
 
     def _reload_current_from_disk(self):
-        tab = self._current()
-        if not tab.get("path"):
-            return
-        tab_id = tab["id"]
-        path = Path(tab["path"])
-        was_dirty = self._is_dirty(tab)
-        captured = _snapshot_tab_state(tab)
-        archived_draft = None
-        if was_dirty:
-            archived_assets = dict(captured.get("assets", {}))
-            raw_name = str(captured.get("name") or "Untitled.md")
-            archived_draft = dict(captured)
-            archived_draft.update(
-                id=uuid.uuid4().hex,
-                name=raw_name if raw_name.startswith("Recovered ") else f"Recovered {raw_name}",
-                path="",
-                saved="",
-                assets=archived_assets,
-                saved_assets={},
-                assets_dirty=bool(archived_assets),
-                portable=bool(captured.get("portable")),
-                conflict=False,
-                agent_staged=False,
-                agent_unreviewed=False,
-                agent_edits=[],
-            )
-
-        def work():
-            loaded = open_note(path)
-            reference = None
-            if archived_draft is not None:
-                try:
-                    reference = self.session.closed_note_store.save(archived_draft)
-                except Exception as failure:
-                    raise RuntimeError(f"ARCHIVE_FAILED:{failure}") from failure
-            return loaded, reference
-
-        def done(outcome, error):
-            if error:
-                if str(error).startswith("ARCHIVE_FAILED:"):
-                    detail = str(error)[len("ARCHIVE_FAILED:"):]
-                    self.message = f"Could not archive draft before reloading: {detail}"
-                else:
-                    self.message = f"Could not reload note from disk: {error}"
-                self._recover()
-                self._emit(False)
-                return
-            target = next((t for t in self.tabs if t["id"] == tab_id), None)
-            if not target:
-                return
-            if (
-                target.get("content") != captured.get("content")
-                or target.get("saved") != captured.get("saved")
-                or target.get("assets") != captured.get("assets")
-                or target.get("assets_dirty") != captured.get("assets_dirty")
-                or target.get("path") != captured.get("path")
-            ):
-                self.message = "The note changed while reloading from disk. It remains open with the latest draft."
-                self._recover()
-                self._emit(False)
-                return
-            loaded, reference = outcome
-            if reference is not None:
-                next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
-                try:
-                    self.session.closed_note_store.save_index(next_refs)
-                except Exception as failure:
-                    self.message = f"Could not update closed-note recovery before reloading: {failure}"
-                    self._recover()
-                    self._emit(False)
-                    return
-                self.closed_tabs[:] = next_refs
-            content, assets, portable = loaded
-            try:
-                st = path.stat()
-                self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
-            except OSError:
-                pass
-            self.reader_edits.clear(tab_id)
-            self.session.reader_assets.revoke_tab(self.window_id, tab_id)
-            if tab_id == self.active:
-                self._last_reader_text = None
-            target.update(
-                content=content,
-                saved=content,
-                assets=assets,
-                saved_assets=dict(assets),
-                assets_dirty=False,
-                portable=portable,
-                conflict=False,
-            )
-            self._clear_agent_staging(target)
-            self.message = "Reloaded note from disk"
-            self._recover()
-            self._emit(load=tab_id == self.active)
-
-        self._submit(work, done, True, self.writes)
+        studio_saves.reload_current_from_disk(self, open_note_fn=open_note, snapshot_tab_state_fn=_snapshot_tab_state, clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None), is_dirty_fn=getattr(self, "_is_dirty", None))
 
     def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
-        id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
-        expected, original_path = tab["saved"], tab["path"]
-        expected_assets = dict(tab.get("saved_assets", {}))
-        try:
-            same_path = bool(original_path) and Path(path).resolve() == Path(original_path).resolve()
-        except OSError:
-            same_path = str(path) == original_path
-        portable = bool(force_portable or path.suffix.lower() == ".smd" or (tab["portable"] and same_path))
-        if id in self.saving or id in self._staging_tabs: return
-        self.saving.add(id)
-        def finished(outcome, error):
-            self.saving.discard(id)
-            if error: return
-            target = next((t for t in self.tabs if t["id"] == id), None)
-            if isinstance(outcome, dict) and outcome.get("_conflict"):
-                if target:
-                    target["conflict"] = True
-                if automatic:
-                    self.message = outcome["message"]
-                    self._emit(False)
-                else:
-                    self.message = "This file changed on disk since you opened or last saved it."
-                    self._emit(False)
-                    if target:
-                        self.saveConflictRequested.emit(target["name"])
-                return
-            if isinstance(outcome, dict) and outcome.get("stamp"):
-                self.note_file_stamps[str(path)] = outcome["stamp"]
-            if target:
-                target.update(
-                    path=str(path),
-                    name=path.name,
-                    saved=content,
-                    saved_assets=dict(assets),
-                    assets_dirty=False,
-                    portable=portable,
-                    conflict=False,
-                )
-                if not automatic:
-                    self._clear_agent_staging(target)
-                if not automatic or str(path) != original_path:
-                    self._invalidate_folder_index(path)
-                    if original_path and str(path) != original_path:
-                        self._invalidate_folder_index(original_path)
-                try:
-                    self._agent_open_paths.add(str(Path(path).resolve()))
-                except OSError:
-                    pass
-                if str(path) != original_path:
-                    self.session.workspace_links.invalidate(path.parent)
-                    self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
-                    self._preferences()
-                if automatic and self._is_dirty(target) and not target.get("agent_staged"): self.autosave_timer.start(900)
-            self.message = "Autosaved" if automatic else "Saved"
-            self._recover()
-            self._emit()
-            if str(path) != original_path:
-                self._refresh_open_folder_trees(path, original_path)
-            if self.pending_close:
-                self._finish_close()
-        def write():
-            if automatic or (not force_overwrite and same_path):
-                changed_on_disk = False
-                if not path.exists():
-                    changed_on_disk = bool(automatic)
-                else:
-                    try:
-                        disk_content, disk_assets, _ = open_note(path, decode_assets=False)
-                        changed_on_disk = disk_content != expected or (portable and disk_assets != expected_assets)
-                    except Exception:
-                        changed_on_disk = True
-                if changed_on_disk:
-                    return {
-                        "_conflict": True,
-                        "message": "Autosave paused: this file changed outside Super MD. Your edits remain in draft recovery; use Save as to keep both versions.",
-                    }
-            if portable: write_portable(path,content,assets,validated_assets=expected_assets)
-            else:
-                materialize_assets(path.parent,assets)
-                atomic_write(path,content.encode())
-            try:
-                st = path.stat()
-                return {"stamp": (st.st_mtime_ns, st.st_size)}
-            except OSError:
-                return {}
-        self._submit(write, finished,busy=not automatic,executor=self.writes)
+        studio_saves.save_text(self, tab, path, automatic=automatic, force_overwrite=force_overwrite, force_portable=force_portable, open_note_fn=open_note, write_portable_fn=write_portable, materialize_assets_fn=materialize_assets, atomic_write_fn=atomic_write, clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None), is_dirty_fn=getattr(self, "_is_dirty", None), invalidate_folder_index_fn=getattr(self, "_invalidate_folder_index", None), refresh_open_folder_trees_fn=getattr(self, "_refresh_open_folder_trees", None))
 
-    def _autosave(self):
-        if not self.settings["autosave"]: return
-        for tab in self.tabs:
-            if tab["path"] and self._is_dirty(tab) and not tab.get("agent_staged") and not tab.get("conflict") and tab["id"] not in self.saving and tab["id"] not in self._staging_tabs:
-                self._save_text(tab,Path(tab["path"]),automatic=True)
+    def _autosave(self): studio_saves.autosave(self, is_dirty_fn=getattr(self, "_is_dirty", None))
 
     def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = "", on_rebound=None):
         parent_str = folder_ops.canonical_path_str(Path(old_path).parent)
@@ -5004,80 +4661,31 @@ class Studio(QObject):
 
     @staticmethod
     def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
-        raw = os.fspath(raw_path) if isinstance(raw_path, os.PathLike) else str(raw_path or "")
-        cleaned = folder_ops.strip_extended_length_prefix(raw)
-        if not cleaned or not cleaned.strip():
-            return None
-        try:
-            candidate = Path(cleaned).expanduser()
-            if reject_links and folder_ops._is_link_or_junction(candidate):
-                return None
-            if reject_links:
-                resolved = Path(folder_ops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
-                return Path(folder_ops.canonical_path_str(resolved)) if resolved.is_dir() else None
-            return candidate if candidate.is_dir() else None
-        except OSError:
-            return None
+        return studio_saves.existing_save_directory(raw_path, reject_links=reject_links)
 
     @classmethod
     def _downloads_fallback_directory(cls) -> Path:
-        raw_downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
-        downloads = cls._existing_save_directory(raw_downloads)
-        if downloads is not None:
-            return downloads
-        home = cls._existing_save_directory(Path.home())
-        if home is not None:
-            return home
-        raw = str(raw_downloads or "")
-        cleaned = folder_ops.strip_extended_length_prefix(raw) if raw.strip() else str(Path.home())
-        return Path(cleaned).expanduser()
+        return studio_saves.downloads_fallback_directory(cls, writable_location_fn=QStandardPaths.writableLocation)
 
     def _default_output_directory(self) -> Path:
-        raw = (
-            self.settings.get("newNoteLocation")
-            or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
-            or str(Path.home())
-        )
-        raw_str = str(raw or "")
-        cleaned = folder_ops.strip_extended_length_prefix(raw_str) if raw_str.strip() else str(Path.home())
-        return Path(cleaned).expanduser()
+        return studio_saves.default_output_directory(self, writable_location_fn=QStandardPaths.writableLocation)
 
     def _note_save_directory(self) -> Path:
-        configured = self._existing_save_directory(self.settings.get("newNoteLocation"))
-        if configured is not None:
-            return configured
-        open_folder = self._existing_save_directory(self.folder, reject_links=True)
-        if open_folder is not None:
-            return open_folder
-        return self._downloads_fallback_directory()
-
+        return studio_saves.note_save_directory(self, writable_location_fn=QStandardPaths.writableLocation)
     def _save_as_directory(self) -> Path:
-        current_path = self._current().get("path") if self.tabs else ""
-        if current_path:
-            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path))
-            if cleaned_current.strip():
-                parent = self._existing_save_directory(Path(cleaned_current).expanduser().parent)
-                if parent is not None:
-                    return parent
-        return self._note_save_directory()
+        return studio_saves.save_as_directory(self, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(result=QUrl)
-    def defaultSaveFolder(self):
-        return QUrl.fromLocalFile(str(self._note_save_directory()))
+    def defaultSaveFolder(self): return studio_saves.default_save_folder(self, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(str, result=QUrl)
-    def defaultSaveLocation(self, name):
-        leaf = folder_ops._pure_path(str(name or "")).name or "Untitled.md"
-        return QUrl.fromLocalFile(str(self._note_save_directory() / leaf))
+    def defaultSaveLocation(self, name): return studio_saves.default_save_location(self, name, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(result=QUrl)
-    def defaultSaveAsFolder(self):
-        return QUrl.fromLocalFile(str(self._save_as_directory()))
+    def defaultSaveAsFolder(self): return studio_saves.default_save_as_folder(self, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(str, result=QUrl)
-    def defaultSaveAsLocation(self, name):
-        leaf = folder_ops._pure_path(str(name or "")).name or "Untitled.md"
-        return QUrl.fromLocalFile(str(self._save_as_directory() / leaf))
+    def defaultSaveAsLocation(self, name): return studio_saves.default_save_as_location(self, name, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
@@ -5966,205 +5574,25 @@ class Studio(QObject):
         return False
 
     @staticmethod
-    def _run_prepared_write_sync(studio, prepared):
-        tab_id, work, finalize, _abort = prepared
-        saving = getattr(studio, "saving", None)
-        if saving is not None:
-            saving.add(tab_id)
-        try:
-            value = work()
-        except Exception as error:
-            if saving is not None:
-                saving.discard(tab_id)
-            finalize(None, str(error))
-            raise
-        if saving is not None:
-            saving.discard(tab_id)
-        return finalize(value, None)
+    def _run_prepared_write_sync(studio, prepared): return studio_saves.run_prepared_write_sync(studio, prepared)
 
     def _agent_document_action_async(self, args, on_complete, *, register_cancel=None, is_cancelled=None):
-        action = args.get("action")
-        if action == "patch_tab":
-            self._stage_inactive_patch_tab_async(
-                args,
-                on_complete,
-                register_cancel=register_cancel,
-                is_cancelled=is_cancelled,
-            )
-            return
-        if action == "save_document":
-            prepared = Studio._prepare_save_document(self, args)
-        elif action == "replace_tab_asset":
-            prepared = Studio._prepare_replace_tab_asset(self, args)
-        elif action == "asset_action" and args.get("assetAction") == "attach":
-            prepared = Studio._prepare_attach_tab_asset(self, args)
-        else:
-            result = self._agent_document_action(args)
-            on_complete(result, None)
-            return
-
-        tab_id, work, finalize, abort = prepared
-        if self.retired or getattr(self.writes, "_shutdown", False):
-            abort()
-            raise ValueError("The target desktop window was closed")
-
-        self.saving.add(tab_id)
-
-        def handle_done(value, error):
-            self.saving.discard(tab_id)
-            if error is not None:
-                finalize(None, error)
-                on_complete(None, error)
-                return
-            try:
-                result = finalize(value, None)
-            except Exception as failure:
-                on_complete(None, str(failure))
-                return
-            on_complete(result, None)
-
-        def handle_retired():
-            self.saving.discard(tab_id)
-            finalize(None, "The target desktop window was closed")
-            on_complete(None, "The target desktop window was closed")
-
-        if not self._submit_write(work, handle_done, on_retired=handle_retired):
-            abort()
+        studio_saves.agent_document_action_async(
+            self, args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled,
+            prepare_save_document_fn=Studio._prepare_save_document,
+            prepare_replace_tab_asset_fn=Studio._prepare_replace_tab_asset,
+            prepare_attach_tab_asset_fn=Studio._prepare_attach_tab_asset,
+        )
 
     def _prepare_save_document(self, args):
-        tab_id = args.get("tabId")
-        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-        if not tab:
-            raise ValueError("Save requires a target tab that is still open")
-        staging = getattr(self, "_staging_tabs", None)
-        if staging is not None and tab_id in staging:
-            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
-        saving = getattr(self, "saving", None)
-        if saving is not None and tab_id in saving:
-            raise ValueError("A save is already in progress for this tab; retry after it finishes")
-        content_snapshot = tab["content"]
-        revision = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
-        if args.get("expectedRevision") != revision:
-            raise ValueError("Live tab revision changed; inspect it again before saving")
-        requested_format = args.get("format")
-        current_format = "smd" if tab.get("portable") or Path(tab.get("path") or tab["name"]).suffix.lower() == ".smd" else "md"
-        filename_suffix = Path(args.get("filename", "")).suffix.lower() if isinstance(args.get("filename", ""), str) else ""
-        filename_format = "smd" if filename_suffix == ".smd" else "md" if filename_suffix in (".md", ".markdown") else None
-        fmt = requested_format or (filename_format if args.get("saveAs") or args.get("filename") else None) or current_format
-        if fmt not in ("md", "smd"):
-            raise ValueError("Save format must be md or smd")
-        old_path = tab["path"]
-        try:
-            old_canonical_path = str(Path(old_path).resolve(strict=True)) if old_path else ""
-        except (OSError, RuntimeError):
-            old_canonical_path = ""
-        save_as = bool(args.get("saveAs", False)) or bool(args.get("filename"))
-        if not isinstance(args.get("saveAs", False), bool):
-            raise ValueError("saveAs must be a boolean")
-        same_format = tab.get("path") and current_format == fmt
-        saved_snapshot = tab["saved"]
-        assets_snapshot = dict(tab.get("assets", {}))
-        saved_assets_snapshot = dict(tab.get("saved_assets", assets_snapshot))
-        portable_snapshot = bool(tab.get("portable"))
-        created_new_path = False
-        reservation_identity = None
-        if old_path and not save_as and same_format and fmt == current_format:
-            path = Path(old_path)
-            if not path.is_file():
-                raise ValueError("The saved file is no longer available; use save-as to create a new copy")
-        else:
-            if old_path and not save_as:
-                raise ValueError("Saving in another format requires saveAs:true and a new filename")
-            path = self._agent_export_path(args.get("filename", ""), fmt, tab)
-            self._agent_owned_files.add(str(path.resolve()))
-            created_new_path = True
-            reservation_stat = path.stat(follow_symlinks=False)
-            reservation_identity = (reservation_stat.st_dev, reservation_stat.st_ino)
-        resolved_path = path.resolve()
-
-        def unlink_reserved():
-            if not created_new_path:
-                return
-            try:
-                current_stat = resolved_path.stat(follow_symlinks=False)
-                if (reservation_identity == (current_stat.st_dev, current_stat.st_ino)
-                        and current_stat.st_size == 0 and not resolved_path.is_symlink()):
-                    resolved_path.unlink()
-            except OSError:
-                pass
-
-        def abort():
-            unlink_reserved()
-            if created_new_path:
-                self._agent_owned_files.discard(str(resolved_path))
-
-        def work():
-            try:
-                if not created_new_path:
-                    # Compare the full decoded note, including portable assets, with
-                    # the tab's saved snapshot before replacing the existing file.
-                    if not path.is_file():
-                        raise ValueError("The saved file is no longer available; use save-as to create a new copy")
-                    disk_content, disk_assets, disk_portable = open_note(path)
-                    if (disk_content != saved_snapshot or disk_assets != saved_assets_snapshot or
-                            disk_portable != portable_snapshot):
-                        raise ValueError("This file changed outside Super MD. Your edits remain in draft recovery; use save-as to keep both versions.")
-                if fmt == "smd":
-                    write_portable(resolved_path, content_snapshot, assets_snapshot)
-                else:
-                    # Converting a portable note to Markdown must keep its
-                    # relative image references valid on disk. The helper
-                    # refuses to replace an unrelated image at that path.
-                    materialize_assets(resolved_path.parent, assets_snapshot)
-                    atomic_write(resolved_path, content_snapshot.encode("utf-8"))
-                try:
-                    st = resolved_path.stat()
-                    return (st.st_mtime_ns, st.st_size)
-                except OSError:
-                    return None
-            except Exception:
-                unlink_reserved()
-                raise
-
-        def finalize(stamp, error):
-            if error is not None:
-                unlink_reserved()
-                if created_new_path:
-                    self._agent_owned_files.discard(str(resolved_path))
-                return None
-            if stamp and hasattr(self, "note_file_stamps"):
-                self.note_file_stamps[str(resolved_path)] = stamp
-            path_changed = not old_canonical_path or str(resolved_path) != old_canonical_path
-            target = next((item for item in self.tabs if item["id"] == tab_id), None)
-            is_dirty = False
-            if target is not None:
-                target.update(
-                    path=str(resolved_path),
-                    name=resolved_path.name,
-                    saved=content_snapshot,
-                    saved_assets=dict(assets_snapshot),
-                    assets_dirty=False,
-                    portable=fmt == "smd",
-                    conflict=False,
-                )
-                Studio._clear_agent_staging(self, target)
-                is_dirty = Studio._is_dirty(self, target)
-                if is_dirty and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
-                    self.autosave_timer.start(900)
-            self._agent_open_paths.add(str(resolved_path))
-            self._recover()
-            self._emit()
-            if path_changed:
-                Studio._invalidate_folder_index(self, resolved_path)
-                if old_canonical_path or old_path:
-                    Studio._invalidate_folder_index(self, old_canonical_path or old_path)
-                Studio._refresh_open_folder_trees(self, resolved_path, old_canonical_path or old_path)
-            return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
-                    "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
-                    "pathChanged": path_changed, "oldPath": old_canonical_path or old_path,
-                    "newPath": str(resolved_path)}
-
-        return tab_id, work, finalize, abort
+        return studio_saves.prepare_save_document(
+            self, args, open_note_fn=open_note, write_portable_fn=write_portable,
+            materialize_assets_fn=materialize_assets, atomic_write_fn=atomic_write,
+            clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None),
+            is_dirty_fn=getattr(self, "_is_dirty", None),
+            invalidate_folder_index_fn=getattr(self, "_invalidate_folder_index", None),
+            refresh_open_folder_trees_fn=getattr(self, "_refresh_open_folder_trees", None),
+        )
 
     def _extra_asset_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -7043,22 +6471,10 @@ class Studio(QObject):
                 if command == "export_fmd_native" and not args.get("save") and not save_as:
                     return studio_exports.execute_export_smd_native(output, args, export_result)
                 if command == "export_fmd_native":
-                    target_path = Path(captured["path"]) if args.get("save") else Path(output)
-                    if args.get("save") and not force_portable_overwrite and target_path.exists():
-                        try:
-                            disk_content, disk_assets, _ = open_note(target_path, decode_assets=False)
-                            if disk_content != captured["saved"] or disk_assets != captured.get("saved_assets", {}):
-                                return {"_conflict": True}
-                        except Exception:
-                            return {"_conflict": True}
-                    write_portable(target_path,args["content"],args["assets"],validated_assets=captured.get("saved_assets") if args.get("save") else None)
-                    result_data = export_result(target_path)
-                    try:
-                        st = target_path.stat()
-                        result_data["_stamp"] = (st.st_mtime_ns, st.st_size)
-                    except OSError:
-                        pass
-                    return result_data
+                    return studio_saves.execute_portable_tab_save(
+                        output, args, captured, force_portable_overwrite=force_portable_overwrite,
+                        export_result=export_result, open_note_fn=open_note, write_portable_fn=write_portable,
+                    )
                 if command == "export_pdf_native":
                     return studio_exports.execute_export_pdf_native(self, output, args, export_job, export_result)
                 raise ValueError(f"Unsupported command: {command}")
@@ -7079,13 +6495,7 @@ class Studio(QObject):
                     self.replied.emit(id, "null", "Python cell cancelled")
                     return
                 if command == "export_fmd_native" and isinstance(result, dict) and result.get("_conflict"):
-                    target_tab = next((t for t in self.tabs if t["id"] == captured["id"]), None)
-                    if target_tab:
-                        target_tab["conflict"] = True
-                        self.message = "This file changed on disk since you opened or last saved it."
-                        self._emit(False)
-                        self.saveConflictRequested.emit(target_tab["name"])
-                    self.replied.emit(id, json.dumps({"saved": False, "conflict": True}), "")
+                    studio_saves.handle_portable_save_conflict(self, id, captured)
                     return
                 stamp = result.pop("_stamp", None) if isinstance(result, dict) else None
                 if stamp and isinstance(result, dict) and result.get("path"):
@@ -7097,64 +6507,15 @@ class Studio(QObject):
                     self.recovery_timer.start(800)
                     self.autosave_timer.start(900)
                     self._emit(False)
-                if command == "export_fmd_native" and args.get("save") and target:
-                    old_assets = target.get("assets", {})
-                    if old_assets != args["assets"]:
-                        self.session.reader_assets.revoke_tab(self.window_id, target["id"])
-                    merged_assets = _preserve_unchanged_assets(old_assets, args["assets"])
-                    target.update(
-                        saved=args["originalContent"],
-                        assets=merged_assets,
-                        saved_assets=dict(merged_assets),
-                        assets_dirty=False,
-                        conflict=False,
+                if command == "export_fmd_native" and ((args.get("save") and target) or save_as):
+                    studio_saves.finalize_portable_tab_save(
+                        self, args, captured, target, save_as=save_as, save_as_tab=save_as_tab,
+                        preserve_unchanged_assets_fn=_preserve_unchanged_assets,
+                        clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None),
+                        is_dirty_fn=getattr(self, "_is_dirty", None),
+                        invalidate_folder_index_fn=getattr(self, "_invalidate_folder_index", None),
+                        refresh_open_folder_trees_fn=getattr(self, "_refresh_open_folder_trees", None),
                     )
-                    self._clear_agent_staging(target)
-                    if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
-                    self.message = "Saved"
-                    self._recover()
-                    self._emit()
-                    if self.pending_close: self._finish_close()
-                elif command == "export_fmd_native" and save_as:
-                    save_target = next((t for t in self.tabs if t["id"] == (save_as_tab or captured["id"])), target)
-                    if save_target:
-                        old_save_path = save_target.get("path", "")
-                        old_assets = save_target.get("assets", {})
-                        path_changed = not old_save_path or not folder_ops.same_path(old_save_path, save_as)
-                        if old_assets != args["assets"] or path_changed:
-                            self.session.reader_assets.revoke_tab(self.window_id, save_target["id"])
-                        merged_assets = args["assets"] if path_changed else _preserve_unchanged_assets(old_assets, args["assets"])
-                        new_content = args["content"] if save_target["content"] == args.get("originalContent", save_target["content"]) else save_target["content"]
-                        save_target.update(
-                            path=save_as,
-                            name=Path(save_as).name,
-                            content=new_content,
-                            saved=args["content"],
-                            assets=merged_assets,
-                            saved_assets=dict(merged_assets),
-                            assets_dirty=False,
-                            portable=True,
-                            conflict=False,
-                        )
-                        self._clear_agent_staging(save_target)
-                        self._invalidate_folder_index(save_as)
-                        if old_save_path and path_changed:
-                            self._invalidate_folder_index(old_save_path)
-                        try:
-                            self._agent_open_paths.add(str(Path(save_as).resolve()))
-                        except OSError:
-                            pass
-                        if path_changed:
-                            self.session.workspace_links.invalidate(Path(save_as).parent)
-                        self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
-                        self._preferences()
-                        self.message = "Saved"
-                        self._recover()
-                        self._emit()
-                        self._refresh_open_folder_trees(save_as, old_save_path)
-                        if self.pending_close: self._finish_close()
-                    self.pending_save_as = ""
-                    self.pending_save_as_tab = ""
                 elif command.startswith("export_"):
                     studio_exports.finalize_standalone_export(self, result["path"])
                     if is_searchable_note_name(Path(result["path"]).name):
