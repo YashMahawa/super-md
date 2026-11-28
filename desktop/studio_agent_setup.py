@@ -1,6 +1,6 @@
 """Agent MCP setup, skill packaging, local bridge toggles, and cloud pairing helpers for Studio."""
 from __future__ import annotations
-import io, json, os, sys, threading, zipfile
+import io, json, os, stat, sys, threading, zipfile
 from pathlib import Path
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QGuiApplication
@@ -15,6 +15,59 @@ else:
     from documents import atomic_write
 
 ROOT = resource_root()
+
+_SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
+    (("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc"))
+    if sys.platform == "darwin"
+    else ()
+)
+
+
+def _rewrite_system_path_alias(path: Path) -> Path:
+    for raw_alias, raw_canonical in _SYSTEM_PATH_ALIASES:
+        alias = Path(raw_alias)
+        canonical = Path(raw_canonical)
+        try:
+            if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
+                    and (path == alias or alias in path.parents)):
+                return canonical / path.relative_to(alias)
+        except (OSError, RuntimeError):
+            continue
+    return path
+
+
+def _has_link_or_junction_component(path: Path) -> bool:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            if folder_ops._is_link_or_junction(current):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _canonical_mcp_root_directory(candidate) -> Path | None:
+    if candidate is None or not isinstance(candidate, (str, os.PathLike)):
+        return None
+    raw = folder_ops.strip_extended_length_prefix(
+        os.fspath(candidate) if isinstance(candidate, os.PathLike) else candidate
+    )
+    if not raw or not raw.strip() or "\0" in raw or len(raw) > 4096:
+        return None
+    try:
+        expanded = Path(os.path.expanduser(raw))
+        if folder_ops._is_link_or_junction(expanded):
+            return None
+        supplied = Path(os.path.abspath(expanded))
+        aliased = _rewrite_system_path_alias(supplied)
+        if _has_link_or_junction_component(aliased):
+            return None
+        resolved = Path(folder_ops.strip_extended_length_prefix(str(aliased.resolve(strict=True))))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved if resolved.is_dir() else None
 
 
 def local_path(value: str) -> Path:
@@ -38,19 +91,15 @@ def _agent_bridge(studio_obj):
 def _default_normalize_mcp_roots(roots) -> list[str]:
     if not roots:
         return []
-    normalized, seen = [], set()
+    normalized: list[str] = []
+    seen: set[str] = set()
     for candidate in roots:
-        if candidate is None:
+        resolved = _canonical_mcp_root_directory(candidate)
+        if resolved is None:
             continue
-        raw = str(candidate).strip()
-        if not raw or "\0" in raw:
-            continue
-        try:
-            resolved = Path(raw).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        if resolved.is_dir() and str(resolved) not in seen:
-            seen.add(str(resolved))
+        key = folder_ops.normalize_path_key(resolved)
+        if key and key not in seen:
+            seen.add(key)
             normalized.append(str(resolved))
     return normalized
 
@@ -199,11 +248,6 @@ def agent_mcp_roots(studio_obj, *, normalize_roots_fn=_default_normalize_mcp_roo
     location = studio_obj.settings.get("newNoteLocation") if isinstance(getattr(studio_obj, "settings", None), dict) else None
     if location:
         candidates.append(location)
-    for window in windows:
-        for tab in getattr(window, "tabs", ()):
-            tab_path = tab.get("path") if isinstance(tab, dict) else None
-            if isinstance(tab_path, str) and tab_path:
-                candidates.append(Path(tab_path).parent)
     return normalize_roots_fn(candidates)
 
 

@@ -269,9 +269,9 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                     str(workspace_dir.resolve()),
                     str(other_window_dir.resolve()),
                     str(new_notes_dir.resolve()),
-                    str(note_dir.resolve()),
                 ],
             )
+            self.assertNotIn(str(note_dir.resolve()), root_values)
             self.assertNotIn(str(retired_dir.resolve()), root_values)
 
             Studio.copyAgentSetupInstructions(studio_proxy)
