@@ -705,6 +705,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 .copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         }
     }
+    private val observedUrisLock = Any()
     private var observedUris=emptySet<String>()
     private var themeJob:Job?=null
     private var themeReloadPending=false
@@ -994,7 +995,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (uri == null || matchesOpenTab) refreshExternal(uri)
         }
     }
-    private fun observeActive() {
+    private fun observeActive() = synchronized(observedUrisLock) {
         val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}+listOfNotNull(mutable.value.folder)).toSet()
         if(uris==observedUris)return
         resolver.unregisterContentObserver(documentObserver);observedUris=uris
@@ -1198,62 +1199,74 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
             ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.lastPathSegment?.takeIf(String::isNotBlank)
 
+    private val autosaveLock = Any()
     private var autosaveJob: Job? = null
-    private val autosavePending = mutableSetOf<String>()
+    private val autosavePending: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     private fun scheduleAutosave(id: String) {
         if (!mutable.value.autosave || id in mutable.value.conflictedTabIds) return
         val scheduledNote = mutable.value.tabs.firstOrNull { it.id == id }
         if (scheduledNote?.agentStaged == true) return
         if (scheduledNote?.uri?.let(::writeIsBlocked) == true) return
         autosavePending.add(id)
-        if (autosaveJob?.isActive == true) return
-        autosaveJob = viewModelScope.launch {
-            while (autosavePending.isNotEmpty()) {
-                delay(900)
-                val next = autosavePending.firstOrNull() ?: break
-                autosavePending.remove(next)
-                var note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty && !it.agentStaged } ?: continue
-                if (note.id in mutable.value.conflictedTabIds) continue
-                if (writeIsBlocked(note.uri!!)) continue
-                if (!mutable.value.autosave) continue
-                try {
-                    if (mutable.value.active.id == note.id) {
-                        if (!performReaderBarrier(note.id) { }) {
-                            mutable.value = mutable.value.copy(message = "Autosave paused because the reader could not confirm its latest edits.")
-                            continue
-                        }
-                        note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty && !it.agentStaged } ?: continue
-                        if (note.id in mutable.value.conflictedTabIds) continue
-                    }
-                    // Do not cancel an in-flight write when another keystroke or
-                    // window transition arrives. Recovery remains an independent stream.
-                    withContext(kotlinx.coroutines.NonCancellable) {
-                        documentWrites.withLock {
-                        if (closingNoteIds.contains(note.id) || mutable.value.tabs.none {
-                                it.id == note.id && it.uri == note.uri && it.content == note.content && it.assetsDirty == note.assetsDirty && !it.agentStaged
-                            }) return@withLock
-                        val writtenTarget = withContext(Dispatchers.IO) {
-                            val target = resolveVerifiedWriteDestination(Uri.parse(note.uri))
-                            if (!diskMatchesBaseline(target, note)) throw ExternalConflictDetectedException()
-                            val staged=File(getApplication<Application>().cacheDir,"autosave-${UUID.randomUUID()}.tmp")
-                            try {
-                                staged.outputStream().use { if(note.portable) media.writeLocalPortable(it,note.content,note.assetDirectory) else it.write(note.content.toByteArray()) }
-                                if (!note.portable) copyAttachments(note,target)
-                                resolver.openOutputStream(target,"wt")?.use { staged.inputStream().use { input->input.copyTo(it) } } ?: error("Cannot write this document")
-                            } finally {staged.delete()}
-                            target
-                        }
-                        if (note.portable) recordPortableBaseline(note.id, note.assetDirectory)
-                        clearDocumentAccessFailure(writtenTarget.toString())
-                        change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,assetsDirty=false,uri=writtenTarget.toString()) else it }, conflictedTabIds=s.conflictedTabIds-note.id) }
-                        mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
-                        if(mutable.value.tabs.any {it.id==note.id && it.dirty && !it.agentStaged && it.id !in mutable.value.conflictedTabIds})autosavePending.add(note.id)
+        synchronized(autosaveLock) {
+            if (autosaveJob?.isActive == true) return
+            autosaveJob = viewModelScope.launch {
+                while (true) {
+                    val empty = synchronized(autosaveLock) {
+                        if (autosavePending.isEmpty()) {
+                            autosaveJob = null
+                            true
+                        } else {
+                            false
                         }
                     }
-                } catch (_: ExternalConflictDetectedException) {
-                    autosavePending.remove(note.id)
-                    change { s -> s.copy(conflictedTabIds = s.conflictedTabIds + note.id, message = "This file changed on disk. Autosave is paused for this tab.") }
-                } catch(error:Exception) {if(isDocumentAccessFailure(error))requestDocumentAccess(note.uri!!,note,writing=true) else fail("Autosave paused: ${error.message}")}
+                    if (empty) break
+                    delay(900)
+                    val next = autosavePending.firstOrNull() ?: continue
+                    autosavePending.remove(next)
+                    var note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty && !it.agentStaged } ?: continue
+                    if (note.id in mutable.value.conflictedTabIds) continue
+                    if (writeIsBlocked(note.uri!!)) continue
+                    if (!mutable.value.autosave) continue
+                    try {
+                        if (mutable.value.active.id == note.id) {
+                            if (!performReaderBarrier(note.id) { }) {
+                                mutable.value = mutable.value.copy(message = "Autosave paused because the reader could not confirm its latest edits.")
+                                continue
+                            }
+                            note = mutable.value.tabs.find { it.id == next && it.uri != null && it.dirty && !it.agentStaged } ?: continue
+                            if (note.id in mutable.value.conflictedTabIds) continue
+                        }
+                        // Do not cancel an in-flight write when another keystroke or
+                        // window transition arrives. Recovery remains an independent stream.
+                        withContext(kotlinx.coroutines.NonCancellable) {
+                            documentWrites.withLock {
+                            if (closingNoteIds.contains(note.id) || mutable.value.tabs.none {
+                                    it.id == note.id && it.uri == note.uri && it.content == note.content && it.assetsDirty == note.assetsDirty && !it.agentStaged
+                                }) return@withLock
+                            val writtenTarget = withContext(Dispatchers.IO) {
+                                val target = resolveVerifiedWriteDestination(Uri.parse(note.uri))
+                                if (!diskMatchesBaseline(target, note)) throw ExternalConflictDetectedException()
+                                val staged=File(getApplication<Application>().cacheDir,"autosave-${UUID.randomUUID()}.tmp")
+                                try {
+                                    staged.outputStream().use { if(note.portable) media.writeLocalPortable(it,note.content,note.assetDirectory) else it.write(note.content.toByteArray()) }
+                                    if (!note.portable) copyAttachments(note,target)
+                                    resolver.openOutputStream(target,"wt")?.use { staged.inputStream().use { input->input.copyTo(it) } } ?: error("Cannot write this document")
+                                } finally {staged.delete()}
+                                target
+                            }
+                            if (note.portable) recordPortableBaseline(note.id, note.assetDirectory)
+                            clearDocumentAccessFailure(writtenTarget.toString())
+                            change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,assetsDirty=false,uri=writtenTarget.toString()) else it }, conflictedTabIds=s.conflictedTabIds-note.id) }
+                            mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
+                            if(mutable.value.tabs.any {it.id==note.id && it.dirty && !it.agentStaged && it.id !in mutable.value.conflictedTabIds})autosavePending.add(note.id)
+                            }
+                        }
+                    } catch (_: ExternalConflictDetectedException) {
+                        autosavePending.remove(note.id)
+                        change { s -> s.copy(conflictedTabIds = s.conflictedTabIds + note.id, message = "This file changed on disk. Autosave is paused for this tab.") }
+                    } catch(error:Exception) {if(isDocumentAccessFailure(error))requestDocumentAccess(note.uri!!,note,writing=true) else fail("Autosave paused: ${error.message}")}
+                }
             }
         }
     }
