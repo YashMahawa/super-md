@@ -401,6 +401,52 @@ test('section export prepares MD, SMD and PDF with only selected text and needed
   expect(await page.evaluate(()=>(window as any).__agentNative.fetches.length)).toBe(2);
 });
 
+test('section export without reader consent performs zero remote fetches and preserves clear unapproved outcomes',async({page})=>{
+  const image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a44kAAAAASUVORK5CYII=';
+  const content='[photo]: https://example.test/photo.png\n[spec]: https://example.test/spec\n[unused]: https://example.test/unused.png\n\n# Selected Section\n\nThis text belongs in the export.\n\n![selected photo][photo]\n\n<img src="https://example.test/diagram.png" alt="raw diagram">\n\n[Read the specification][spec].\n\n# Following Section\n\nThis text must stay out.\n';
+  await page.addInitScript(({initial,imageData})=>{
+    const native={content:initial,revision:0,exports:[] as any[],fetches:[] as any[]};(window as any).__agentNative=native;
+    window.SuperMD={post:(id:string,command:string,raw:string)=>{
+      const args=JSON.parse(raw);let result:any=true;
+      if(command==='document_sync')result={accepted:args.content===native.content,revision:native.revision};
+      else if(command==='document_resync'){native.content=args.content;native.revision=0;result={accepted:true,revision:0};}
+      else if(command==='fetch_resource'){native.fetches.push(args);result={body:imageData};}
+      else if(command==='load_asset')result=imageData;
+      else if(command==='agent_export_native'){native.exports.push(args);result={accepted:true,jobId:String(args.requestId)};}
+      window.setTimeout(()=>window.supermdReply?.(id,result,null),0);
+    }};
+  },{initial:content,imageData:image});
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  await page.evaluate(value=>window.supermdLoad?.(value),{id:'agent-section-unapproved-e2e',path:'/tmp/section-unapproved.md',content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
+  await expect(page.getByRole('heading',{name:'Selected Section',exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Load image'})).toHaveCount(1);
+  expect(await page.evaluate(()=>(window as any).__agentNative.fetches.length)).toBe(0);
+
+  for(const format of ['md','smd'] as const){
+    const result:any=await agent(page,{action:'export_document',tabId:'agent-section-unapproved-e2e',format,filename:`unapproved.${format}`,requestId:`unapproved-${format}`,
+      options:{section:'Selected Section',pageSize:'a4',fontSize:12,margin:10}});
+    expect(result).toMatchObject({accepted:true,jobId:`unapproved-${format}`,sectionStart:Array.from(content.slice(0,content.indexOf('# Selected Section'))).length,documentLength:Array.from(content).length});
+    const call=await page.evaluate(format=>(window as any).__agentNative.exports.find((entry:any)=>entry.format===format),format);
+    expect(call.content).toContain('This text belongs in the export.');
+    expect(call.content).toContain('Read the specification');
+    expect(call.content).toContain('[spec]: https://example.test/spec');
+    expect(call.content).not.toContain('This text must stay out.');
+    expect(call.content).not.toContain('[unused]:');
+    expect(call.content).toContain('![selected photo][photo]');
+    expect(call.content).toContain('[photo]: https://example.test/photo.png');
+    expect(call.content).toContain('<img src="https://example.test/diagram.png" alt="raw diagram">');
+    expect(Object.keys(call.assets||{})).toHaveLength(0);
+  }
+  expect(await page.evaluate(()=>(window as any).__agentNative.fetches.length)).toBe(0);
+
+  await expect(agent(page,{action:'export_document',tabId:'agent-section-unapproved-e2e',format:'pdf',filename:'unapproved.pdf',requestId:'unapproved-pdf',
+    options:{section:'Selected Section',pageSize:'a4',fontSize:12,margin:10}})).rejects.toThrow(/Remote image from example\.test requires explicit consent in the reader before exporting PDF\./);
+  expect(await page.evaluate(()=>(window as any).__agentNative.fetches.length)).toBe(0);
+  expect(await page.evaluate(()=>(window as any).__agentNative.exports.some((entry:any)=>entry.format==='pdf'))).toBe(false);
+  expect(await page.evaluate(()=>(window as any).__agentNative.content)).toBe(content);
+  await expect(page.getByRole('button',{name:'Load image'})).toHaveCount(1);
+});
+
 test('FIFO reader queue resolves 8 concurrent agent requests in order and rejects beyond 16 queued items',async({page})=>{
   const content='# Queue concurrency\n\nParagraph zero.\n\n## Section One\n\nParagraph one.\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="8"/></svg>\n```\n';
   await page.addInitScript(initial=>{
